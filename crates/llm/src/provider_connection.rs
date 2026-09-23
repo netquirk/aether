@@ -14,6 +14,12 @@ pub struct ProviderConnectionConfig {
     pub auth_mode: ProviderAuthMode,
     pub request_model: Option<String>,
     pub inference_profile_arn: Option<String>,
+    /// Credential supplied inline rather than through the provider's catalog
+    /// env var. The `custom` provider has no catalog entry to name an env var,
+    /// so this is how a settings-driven endpoint carries its key.
+    pub api_key: Option<String>,
+    /// Extra request headers, for endpoints that need more than a bearer token.
+    pub headers: BTreeMap<String, String>,
 }
 
 #[doc = include_str!("docs/provider_connection_override.md")]
@@ -33,6 +39,14 @@ pub struct ProviderConnectionOverride {
     /// AWS Bedrock application inference profile ARN to route requests through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_profile_arn: Option<String>,
+    /// API key for a provider with no catalog env var (the `custom` provider).
+    /// When omitted, `custom` falls back to the `CUSTOM_API_KEY` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Extra request headers, for endpoints that need more than a bearer token
+    /// (opencode-go's `x-opencode-session`, for one).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
@@ -48,6 +62,8 @@ impl ProviderConnectionConfig {
             auth_mode: value.auth_mode.unwrap_or_default(),
             request_model: value.request_model,
             inference_profile_arn: value.inference_profile_arn,
+            api_key: value.api_key,
+            headers: value.headers,
         }
     }
 }
@@ -82,6 +98,10 @@ impl ProviderConnectionOverride {
         if override_value.inference_profile_arn.is_some() {
             self.inference_profile_arn = override_value.inference_profile_arn;
         }
+        if override_value.api_key.is_some() {
+            self.api_key = override_value.api_key;
+        }
+        self.headers.extend(override_value.headers);
     }
 }
 

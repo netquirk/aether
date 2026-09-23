@@ -91,6 +91,23 @@ pub const FIREWORKS: ProviderConfig = ProviderConfig {
     extra_headers: None,
 };
 
+/// A settings-driven OpenAI-compatible provider. `api_base` is None because the
+/// URL is REQUIRED from `providers.custom.url`; the model id is whatever the
+/// caller writes (`custom:<anything>`), so there is no catalog to validate
+/// against. This is what makes a new endpoint a config edit, not a rebuild.
+pub const CUSTOM: ProviderConfig = ProviderConfig {
+    provider: Provider::Custom,
+    api_base: None,
+    default_model: "",
+    tool_schema_transform: None,
+    prompt_cache_key: PromptCacheKeySource::Omit,
+    extra_headers: None,
+};
+
+/// The env var the `custom` provider reads when `providers.custom.apiKey` is
+/// absent. A catalog provider names its own env var; `custom` has none.
+const CUSTOM_KEY_ENV: &str = "CUSTOM_API_KEY";
+
 pub(crate) const BUILT_INS: &[&ProviderConfig] =
     &[&DEEPSEEK, &OPENCODE_GO, &MOONSHOT, &ZAI, &AZURE_FOUNDRY, &FIREWORKS];
 
@@ -113,8 +130,17 @@ impl GenericOpenAiProvider {
     ) -> Result<Self> {
         let api_key = match connection.auth_mode {
             ProviderAuthMode::Default => {
-                let env_var = config.provider.required_env_var().expect("generic providers require an API key");
-                std::env::var(env_var).map_err(|_| LlmError::MissingApiKey(env_var.to_string()))?
+                // An inline key wins: it is how a settings-driven provider
+                // (`custom`), which has no catalog env var to name, carries
+                // its credential. A catalog provider keeps using its env var.
+                if let Some(key) = connection.api_key.clone() {
+                    key
+                } else if let Some(env_var) = config.provider.required_env_var() {
+                    std::env::var(env_var).map_err(|_| LlmError::MissingApiKey(env_var.to_string()))?
+                } else {
+                    std::env::var(CUSTOM_KEY_ENV)
+                        .map_err(|_| LlmError::MissingApiKey(CUSTOM_KEY_ENV.to_string()))?
+                }
             }
             ProviderAuthMode::None => String::new(),
         };
@@ -138,8 +164,15 @@ impl GenericOpenAiProvider {
             .to_string();
         let openai_config = OpenAIConfig::new().with_api_key(api_key).with_api_base(api_base);
         let mut openai_config = AetherOpenAiConfig::new(openai_config, connection.auth_mode);
-        if let Some(extra_headers) = config.extra_headers {
-            openai_config = openai_config.with_extra_headers(extra_headers());
+        // Built-in provider headers (opencode-go's routing session id) and
+        // settings-supplied ones both ride here.
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
+        if let Some(built_in) = config.extra_headers {
+            extra_headers.extend(built_in().into_iter().map(|(name, value)| (name.to_string(), value)));
+        }
+        extra_headers.extend(connection.headers.iter().map(|(name, value)| (name.clone(), value.clone())));
+        if !extra_headers.is_empty() {
+            openai_config = openai_config.with_extra_headers(extra_headers);
         }
 
         Ok(Self {

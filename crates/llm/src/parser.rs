@@ -50,6 +50,10 @@ impl Default for ModelProviderParser {
         for config in generic::BUILT_INS {
             parser = parser.with_openai_provider(config);
         }
+        // The settings-driven generic provider: `providers.custom` supplies the
+        // URL, the key and any extra headers, and the model id is free-form.
+        // Registered separately from BUILT_INS because it has no catalog entry.
+        parser = parser.with_openai_provider(&generic::CUSTOM);
 
         #[cfg(feature = "bedrock")]
         {

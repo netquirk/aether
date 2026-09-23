@@ -294,6 +294,16 @@ const DYNAMIC_PROVIDERS: &[DynamicProviderConfig] = &[
         genai_provider_name: "llama.cpp",
         display_name: "LlamaCpp",
     },
+    // A settings-driven OpenAI-compatible provider: the URL, the key and any
+    // extra headers come from `providers.custom`, and the model id is
+    // whatever the caller writes (`custom:<anything>`). This is the escape
+    // hatch that means adding an endpoint does NOT require a rebuild.
+    DynamicProviderConfig {
+        enum_name: "Custom",
+        parser_name: "custom",
+        genai_provider_name: "custom",
+        display_name: "Custom (OpenAI-compatible)",
+    },
 ];
 
 const CODEX_SUBSCRIPTION_CONTEXT_WINDOW: u32 = 272_000;
@@ -1086,6 +1096,10 @@ fn emit_llm_model_impl() -> TokenStream {
         .filter(|cfg| cfg.uses_openai_compatible_api)
         .map(|cfg| format_ident!("{}", cfg.enum_name))
         .collect();
+    let dynamic_variants: Vec<_> = DYNAMIC_PROVIDERS
+        .iter()
+        .map(|cfg| format_ident!("{}", cfg.enum_name))
+        .collect();
 
     quote! {
         impl LlmModel {
@@ -1119,7 +1133,7 @@ fn emit_llm_model_impl() -> TokenStream {
                     #(Provider::#openai_compatible_variants)|* => {
                         self.reasoning_disabled_support() == crate::reasoning::ReasoningDisabledSupport::Effort
                     }
-                    Provider::Ollama | Provider::LlamaCpp => false,
+                    #(Provider::#dynamic_variants)|* => false,
                 }
             }
 

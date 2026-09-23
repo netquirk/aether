@@ -20,11 +20,8 @@ impl AetherOpenAiConfig {
     /// key — opencode-go's routing session id, for one. Applied AFTER the
     /// credential so a provider can never shadow the Authorization header.
     #[must_use]
-    pub fn with_extra_headers(mut self, extra_headers: Vec<(&'static str, String)>) -> Self {
-        self.extra_headers = extra_headers
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect();
+    pub fn with_extra_headers(mut self, extra_headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = extra_headers;
         self
     }
 }
