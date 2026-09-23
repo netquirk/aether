@@ -77,6 +77,7 @@ pub(crate) fn recommended_for_provider(provider: Provider) -> Option<ProviderRec
         | Provider::Fireworks
         | Provider::Gemini
         | Provider::Moonshot
+        | Provider::OpencodeGo
         | Provider::Ollama
         | Provider::LlamaCpp => None,
     }

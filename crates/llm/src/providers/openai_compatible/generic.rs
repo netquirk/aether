@@ -22,6 +22,13 @@ pub struct ProviderConfig {
     pub default_model: &'static str,
     pub tool_schema_transform: Option<fn(&mut Schema)>,
     pub prompt_cache_key: PromptCacheKeySource,
+    /// Headers this provider needs on every request in addition to the API key.
+    ///
+    /// A function rather than a constant because some values must be fresh per
+    /// provider instance — opencode-go rejects a request without
+    /// `x-opencode-session` (it uses the value for upstream routing), and a
+    /// value shared by every run would defeat that routing.
+    pub extra_headers: Option<fn() -> Vec<(&'static str, String)>>,
 }
 
 pub const DEEPSEEK: ProviderConfig = ProviderConfig {
@@ -30,7 +37,23 @@ pub const DEEPSEEK: ProviderConfig = ProviderConfig {
     default_model: "deepseek-v4-flash",
     tool_schema_transform: None,
     prompt_cache_key: PromptCacheKeySource::Omit,
+    extra_headers: None,
 };
+
+pub const OPENCODE_GO: ProviderConfig = ProviderConfig {
+    provider: Provider::OpencodeGo,
+    api_base: Some("https://opencode.ai/zen/go/v1"),
+    default_model: "deepseek-v4.1-flash",
+    tool_schema_transform: None,
+    prompt_cache_key: PromptCacheKeySource::Omit,
+    extra_headers: Some(opencode_go_headers),
+};
+
+/// The routing session id opencode-go requires. One per provider instance, so
+/// concurrent runs are not collapsed onto one upstream session.
+fn opencode_go_headers() -> Vec<(&'static str, String)> {
+    vec![("x-opencode-session", uuid::Uuid::new_v4().to_string())]
+}
 
 pub const MOONSHOT: ProviderConfig = ProviderConfig {
     provider: Provider::Moonshot,
@@ -38,6 +61,7 @@ pub const MOONSHOT: ProviderConfig = ProviderConfig {
     default_model: "moonshot-v1-8k",
     tool_schema_transform: Some(normalize_for_moonshot),
     prompt_cache_key: PromptCacheKeySource::Omit,
+    extra_headers: None,
 };
 
 pub const ZAI: ProviderConfig = ProviderConfig {
@@ -46,6 +70,7 @@ pub const ZAI: ProviderConfig = ProviderConfig {
     default_model: "GLM-4.6",
     tool_schema_transform: None,
     prompt_cache_key: PromptCacheKeySource::Omit,
+    extra_headers: None,
 };
 
 pub const AZURE_FOUNDRY: ProviderConfig = ProviderConfig {
@@ -54,6 +79,7 @@ pub const AZURE_FOUNDRY: ProviderConfig = ProviderConfig {
     default_model: "gpt-5.5",
     tool_schema_transform: None,
     prompt_cache_key: PromptCacheKeySource::Prefix,
+    extra_headers: None,
 };
 
 pub const FIREWORKS: ProviderConfig = ProviderConfig {
@@ -62,9 +88,11 @@ pub const FIREWORKS: ProviderConfig = ProviderConfig {
     default_model: "accounts/fireworks/models/glm-5p1",
     tool_schema_transform: None,
     prompt_cache_key: PromptCacheKeySource::SessionAffinity,
+    extra_headers: None,
 };
 
-pub(crate) const BUILT_INS: &[&ProviderConfig] = &[&DEEPSEEK, &MOONSHOT, &ZAI, &AZURE_FOUNDRY, &FIREWORKS];
+pub(crate) const BUILT_INS: &[&ProviderConfig] =
+    &[&DEEPSEEK, &OPENCODE_GO, &MOONSHOT, &ZAI, &AZURE_FOUNDRY, &FIREWORKS];
 
 /// A generic provider for APIs that are fully OpenAI-compatible.
 pub struct GenericOpenAiProvider {
@@ -109,7 +137,10 @@ impl GenericOpenAiProvider {
             .trim_end_matches('/')
             .to_string();
         let openai_config = OpenAIConfig::new().with_api_key(api_key).with_api_base(api_base);
-        let openai_config = AetherOpenAiConfig::new(openai_config, connection.auth_mode);
+        let mut openai_config = AetherOpenAiConfig::new(openai_config, connection.auth_mode);
+        if let Some(extra_headers) = config.extra_headers {
+            openai_config = openai_config.with_extra_headers(extra_headers());
+        }
 
         Ok(Self {
             client: openai_client(openai_config, reqwest::Client::new()),

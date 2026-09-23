@@ -248,6 +248,13 @@ const PROVIDERS: &[ProviderConfig] = &[
         is_hybrid_dynamic: false,
     },
     ProviderConfig::openai_compatible("deepseek", "DeepSeek", "deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
+    ProviderConfig::openai_compatible(
+        "opencode-go",
+        "OpencodeGo",
+        "opencode-go",
+        "OpenCode Go",
+        "OPENCODE_API_KEY",
+    ),
     ProviderConfig {
         source_dev_id: Some("fireworks-ai"),
         ..ProviderConfig::openai_compatible("fireworks", "Fireworks", "fireworks", "Fireworks AI", "FIREWORKS_API_KEY")
@@ -1070,6 +1077,15 @@ fn emit_llm_model_impl() -> TokenStream {
     let modality_methods = ["image", "audio"].iter().map(|m| emit_llm_supports_modality(m));
     let transport = emit_llm_transport();
     let all = emit_llm_all();
+    // The OpenAI-compatible transport group, DERIVED from the provider table
+    // rather than hand-listed. The hand-listed form is why adding a provider
+    // (opencode-go) failed the build with a non-exhaustive match: the list and
+    // the table had to be edited together, and nothing said so.
+    let openai_compatible_variants: Vec<_> = PROVIDERS
+        .iter()
+        .filter(|cfg| cfg.uses_openai_compatible_api)
+        .map(|cfg| format_ident!("{}", cfg.enum_name))
+        .collect();
 
     quote! {
         impl LlmModel {
@@ -1100,7 +1116,7 @@ fn emit_llm_model_impl() -> TokenStream {
                 match self.provider_enum() {
                     Provider::Anthropic | Provider::OpenRouter | Provider::Openai | Provider::Codex | Provider::Gemini => true,
                     Provider::Bedrock => self.transport().is_some(),
-                    Provider::DeepSeek | Provider::Moonshot | Provider::ZAi | Provider::AzureFoundry | Provider::Fireworks => {
+                    #(Provider::#openai_compatible_variants)|* => {
                         self.reasoning_disabled_support() == crate::reasoning::ReasoningDisabledSupport::Effort
                     }
                     Provider::Ollama | Provider::LlamaCpp => false,
