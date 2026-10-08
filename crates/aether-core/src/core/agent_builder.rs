@@ -1,4 +1,5 @@
 use super::agent::{AgentConfig, AutoContinue, RetryConfig};
+use super::repetition_config::RepetitionConfig;
 use crate::agent_spec::AgentSpec;
 use crate::context::{CompactionConfig, SessionUsageTracker};
 use crate::core::{Agent, AgentDeps, Prompt, PromptCache, Result};
@@ -44,6 +45,7 @@ pub struct AgentBuilder {
     compaction_config: Option<CompactionConfig>,
     max_auto_continues: u32,
     retry_config: RetryConfig,
+    repetition_config: RepetitionConfig,
     context_window: Option<u32>,
     model_settings: ModelSettings,
     observers: Vec<Box<dyn AgentObserver>>,
@@ -64,6 +66,7 @@ impl AgentBuilder {
             compaction_config: Some(CompactionConfig::default()),
             max_auto_continues: 3,
             retry_config: RetryConfig::default(),
+            repetition_config: RepetitionConfig::default(),
             context_window: None,
             model_settings: ModelSettings::default(),
             observers: Vec::new(),
@@ -194,6 +197,25 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure the repetition detector.
+    ///
+    /// When the same assistant output (text and/or tool calls) is observed
+    /// `config.max_repeats` times in a row within one turn, the turn is
+    /// ended with [`TurnEvent::Ended`](crate::events::TurnEvent::Ended)
+    /// carrying a `TurnOutcome::Failed` error that names the repetition.
+    /// Setting the threshold to `0` (or using [`RepetitionConfig::disabled`])
+    /// turns the detector off. Default: 3.
+    pub fn repetition_config(mut self, config: RepetitionConfig) -> Self {
+        self.repetition_config = config;
+        self
+    }
+
+    /// Convenience for `repetition_config(RepetitionConfig { max_repeats })`.
+    pub fn repetition_limit(mut self, max_repeats: u32) -> Self {
+        self.repetition_config = RepetitionConfig { max_repeats };
+        self
+    }
+
     /// Override the effective model context window in tokens.
     pub fn context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
@@ -263,6 +285,7 @@ impl AgentBuilder {
             compaction_config: self.compaction_config,
             auto_continue: AutoContinue::new(self.max_auto_continues),
             retry_config: self.retry_config,
+            repetition: self.repetition_config,
             context_window: self.context_window,
             prompt_cache,
             observers: self.observers,

@@ -9,6 +9,7 @@ mod agent {
     mod model_switch_tests;
     mod prompt_cache_tests;
     mod queued_message_tests;
+    mod repetition_tests;
     mod replace_conversation_tests;
     mod retry_tests;
     mod trace_tests;

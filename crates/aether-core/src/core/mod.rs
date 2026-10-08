@@ -6,6 +6,7 @@ mod error;
 mod prompt;
 mod prompt_cache_key;
 mod queued_input;
+mod repetition_config;
 mod retry_config;
 mod tool_execution;
 
@@ -16,6 +17,7 @@ pub use agent_deps::*;
 pub use agent_registry::*;
 pub use error::*;
 pub use prompt::*;
+pub use repetition_config::RepetitionConfig;
 pub use retry_config::RetryConfig;
 
 use llm::StreamingModelProvider;

@@ -4,6 +4,7 @@ use crate::context::{
 use crate::core::PromptCache;
 use crate::core::prompt_cache_key::derive_prompt_cache_key;
 use crate::core::queued_input::QueuedInput;
+use crate::core::repetition_config::{RepetitionConfig, RepetitionTracker, iteration_signature};
 pub use crate::core::retry_config::RetryConfig;
 use crate::core::tool_execution::{ToolAbortPolicy, ToolExecutionUpdate, ToolExecutions};
 use crate::events::{
@@ -60,6 +61,7 @@ pub(crate) struct AgentConfig {
     pub compaction_config: Option<CompactionConfig>,
     pub auto_continue: AutoContinue,
     pub retry_config: RetryConfig,
+    pub repetition: RepetitionConfig,
     pub context_window: Option<u32>,
     pub prompt_cache: PromptCache,
     pub observers: Vec<Box<dyn AgentObserver>>,
@@ -78,6 +80,7 @@ pub struct Agent {
     compaction_config: Option<CompactionConfig>,
     auto_continue: AutoContinue,
     retry_config: RetryConfig,
+    repetition: RepetitionTracker,
     tool_executions: ToolExecutions,
     pending_inputs: VecDeque<QueuedInput>,
     queued_inputs: VecDeque<QueuedInput>,
@@ -116,6 +119,7 @@ impl Agent {
             compaction_config: config.compaction_config,
             auto_continue: config.auto_continue,
             retry_config: config.retry_config,
+            repetition: RepetitionTracker::new(config.repetition),
             tool_executions: ToolExecutions::default(),
             pending_inputs: VecDeque::new(),
             queued_inputs: VecDeque::new(),
@@ -229,6 +233,7 @@ impl Agent {
             message_content,
             reasoning_summary_text,
             encrypted_reasoning,
+            tool_calls,
             completed_tool_calls,
             stop_reason,
             ..
@@ -249,6 +254,23 @@ impl Agent {
         }
 
         let has_queued_input = !self.queued_inputs.is_empty();
+        let signature = iteration_signature(&message_content, &reasoning_summary_text, &tool_calls);
+
+        // A queued user input is progress: the model has been told something
+        // new, so any previous repetition streak is moot.
+        if has_queued_input {
+            self.repetition.reset();
+        } else if self.repetition.observe(signature.as_deref()) {
+            let observed = self.repetition.count();
+            tracing::warn!(observed, "repetition loop detected; ending turn");
+            let error = format!(
+                "repetition loop detected: the model emitted identical assistant output/tool call {observed} times in a row; stopped the turn"
+            );
+            self.auto_continue.reset();
+            self.finish_turn(TurnOutcome::Failed { error }).await;
+            return;
+        }
+
         if has_queued_input || has_tool_calls {
             self.auto_continue.reset();
             self.start_next_turn().await;
@@ -299,6 +321,7 @@ impl Agent {
         self.pending_inputs.clear();
         self.queued_inputs.clear();
         self.auto_continue.reset();
+        self.repetition.reset();
         *state = IterationState::default();
     }
 
@@ -320,6 +343,7 @@ impl Agent {
     async fn begin_turn(&mut self, input: QueuedInput, state: &mut IterationState) {
         *state = IterationState::default();
         self.auto_continue.reset();
+        self.repetition.reset();
         self.turn_active = true;
         let content = input.content_blocks();
         self.emit(AgentEvent::Turn(TurnEvent::Started { content })).await;
@@ -503,7 +527,7 @@ impl Agent {
             }
 
             ToolRequestComplete { tool_call } => {
-                self.handle_tool_completion(tool_call).await;
+                self.handle_tool_completion(tool_call, state).await;
             }
 
             Done { stop_reason } => {
@@ -535,7 +559,8 @@ impl Agent {
         }
     }
 
-    async fn handle_tool_completion(&mut self, tool_call: ToolCallRequest) {
+    async fn handle_tool_completion(&mut self, tool_call: ToolCallRequest, state: &mut IterationState) {
+        state.record_tool_call(&tool_call);
         let cancel = self.tool_executions.start(tool_call.clone());
 
         let tool_id = tool_call.id.clone();
@@ -807,6 +832,11 @@ struct IterationState {
     message_content: String,
     reasoning_summary_text: String,
     encrypted_reasoning: Option<EncryptedReasoningContent>,
+    /// Requested tool calls for this iteration, captured in the order the
+    /// model emitted them. Used by the repetition detector to fingerprint
+    /// re-issued tool calls across iterations; the `id` is intentionally
+    /// excluded from the signature since providers assign fresh ids per call.
+    tool_calls: Vec<ToolCallRequest>,
     completed_tool_calls: Vec<Result<ToolCallResult, ToolCallError>>,
     llm_done: bool,
     stop_reason: Option<StopReason>,
@@ -822,9 +852,14 @@ impl IterationState {
         self.encrypted_reasoning = None;
         self.stop_reason = None;
         self.call_usage = None;
+        self.tool_calls.clear();
     }
 
     fn is_complete(&self, has_foreground_tools: bool) -> bool {
         self.llm_done && !has_foreground_tools
+    }
+
+    fn record_tool_call(&mut self, request: &ToolCallRequest) {
+        self.tool_calls.push(request.clone());
     }
 }

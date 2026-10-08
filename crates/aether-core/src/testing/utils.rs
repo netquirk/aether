@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
 use crate::context::CompactionConfig;
-use crate::core::{AgentError, Prompt, RetryConfig, agent};
+use crate::core::{AgentError, Prompt, RepetitionConfig, RetryConfig, agent};
 use crate::events::{
     AgentCommand, AgentEvent, AgentObserver, Command, ContextEvent, ToolEvent, TurnEvent, UserCommand,
 };
@@ -208,6 +208,7 @@ struct AgentTestConfig {
     timeout: Option<Duration>,
     max_auto_continues: Option<u32>,
     retry_config: Option<RetryConfig>,
+    repetition: Option<RepetitionConfig>,
     observers: Vec<Box<dyn AgentObserver>>,
     mcp_server: Option<(String, FakeMcpServer)>,
     initial_messages: Vec<ChatMessage>,
@@ -243,6 +244,7 @@ impl TestAgentBuilder {
                 timeout: None,
                 max_auto_continues: None,
                 retry_config: None,
+                repetition: None,
                 observers: Vec::new(),
                 mcp_server: Some(("test".to_string(), FakeMcpServer::new())),
                 initial_messages: Vec::new(),
@@ -304,6 +306,18 @@ impl TestAgentBuilder {
 
     pub fn retry_config(mut self, config: RetryConfig) -> Self {
         self.agent.retry_config = Some(config);
+        self
+    }
+
+    /// Configure the repetition detector (defaults to `RepetitionConfig::default()`).
+    pub fn repetition_config(mut self, config: RepetitionConfig) -> Self {
+        self.agent.repetition = Some(config);
+        self
+    }
+
+    /// Convenience for `repetition_config(RepetitionConfig { max_repeats })`.
+    pub fn repetition_limit(mut self, max_repeats: u32) -> Self {
+        self.agent.repetition = Some(RepetitionConfig { max_repeats });
         self
     }
 
@@ -416,6 +430,7 @@ impl TestAgentBuilder {
         } else {
             builder = builder.retry(RetryConfig::disabled());
         }
+        builder = builder.repetition_config(config.repetition.unwrap_or_default());
         for prompt in config.system_prompts {
             builder = builder.system_prompt(prompt);
         }
