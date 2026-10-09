@@ -84,14 +84,24 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
 }
 
-/// Print a `TurnTimings` summary at the end of a run. Returns without
-/// printing when the format is not `Text` (preserving `json`/`pretty`
-/// output) or when no turn duration has been recorded.
-pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings) {
+/// Build the end-of-run turn summary. When `run_total` is `Some`, its formatted
+/// duration is appended to the last line so the summary carries the whole-run
+/// elapsed time (TASK-23-395) alongside the per-turn total (TASK-23-337).
+pub(crate) fn turn_summary_body(timings: &TurnTimings, run_total: Option<Duration>) -> String {
+    let mut body = timings.summary();
+    if let Some(total) = run_total {
+        use std::fmt::Write as _;
+        let _ = write!(body, ", run took {}", format_duration(total));
+    }
+    body
+}
+
+/// Print the end-of-run turn summary. No-op when format is not `Text`.
+pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings, run_total: Option<Duration>) {
     if !matches!(format, OutputFormat::Text) || timings.is_empty() {
         return;
     }
-    println!("{}", timings.summary());
+    println!("{}", turn_summary_body(timings, run_total));
 }
 
 /// Print a single agent event using the chosen format.
@@ -507,6 +517,25 @@ mod tests {
         timings.end(base + Duration::from_millis(500));
         assert!(timings.is_empty());
         assert_eq!(timings.total(), Duration::ZERO);
+    }
+
+    #[test]
+    fn turn_summary_body_appends_run_total_to_last_line() {
+        let base = Instant::now();
+        let mut timings = TurnTimings::default();
+        timings.begin(base);
+        timings.end(base + Duration::from_millis(1_250));
+        timings.begin(base + Duration::from_millis(1_250));
+        timings.end(base + Duration::from_millis(3_750));
+        // Run total (5s) intentionally differs from per-turn (3.75s) so a swap regression is caught.
+        let run_total = Duration::from_millis(5_000);
+        let body = turn_summary_body(&timings, Some(run_total));
+        let run_total_str = format_duration(run_total);
+        let last_line = body.lines().last().unwrap_or("");
+        assert!(last_line.contains("2 turns, total"), "per-turn total missing: {last_line:?}");
+        assert!(last_line.contains(&run_total_str), "whole-run total missing: {last_line:?}");
+        assert!(last_line.ends_with(&run_total_str), "last line should end with whole-run total: {last_line:?}");
+        assert!(last_line.contains("run took"), "whole-run label missing: {last_line:?}");
     }
 
     #[test]
