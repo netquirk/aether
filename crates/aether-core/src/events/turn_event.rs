@@ -8,7 +8,15 @@ use serde::{Deserialize, Serialize};
 pub enum TurnOutcome {
     Completed,
     Cancelled,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
+    /// The configured per-run turn cap was reached. The run ends cleanly
+    /// (no failure) and the cap is reported in the outcome payload so callers
+    /// can surface it.
+    MaxTurnsReached {
+        max_turns: u32,
+    },
 }
 
 /// How a single LLM call ended.

@@ -264,6 +264,9 @@ impl AgentExecutor {
                         TurnOutcome::Completed => return Ok(final_output),
                         TurnOutcome::Failed { error } => return Err(format!("Agent error: {error}")),
                         TurnOutcome::Cancelled => return Err("Agent cancelled".to_string()),
+                        TurnOutcome::MaxTurnsReached { max_turns } => {
+                            return Err(format!("Agent stopped: reached maxTurns={max_turns}"));
+                        }
                     },
 
                     _ => {}

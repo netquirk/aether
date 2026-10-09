@@ -141,7 +141,13 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
         AgentEvent::Context(ContextEvent::Cleared)
         | AgentEvent::Turn(
             TurnEvent::Started { .. }
-            | TurnEvent::Ended { outcome: TurnOutcome::Completed | TurnOutcome::Cancelled | TurnOutcome::Failed { .. } }
+            | TurnEvent::Ended {
+                outcome:
+                    TurnOutcome::Completed
+                    | TurnOutcome::Cancelled
+                    | TurnOutcome::Failed { .. }
+                    | TurnOutcome::MaxTurnsReached { .. },
+            }
             | TurnEvent::RetryScheduled { .. }
             | TurnEvent::LlmCallStarted { .. }
             | TurnEvent::LlmCallEnded { .. }

@@ -29,6 +29,13 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub context_window: Option<u32>,
+    /// Optional cap on the number of LLM chat turns a single run may take.
+    /// When the cap is reached, the run ends cleanly without failing and
+    /// reports the value back through `TurnOutcome::MaxTurnsReached`. When
+    /// omitted, runs are unbounded (current behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_turns: Option<u32>,
     /// Exposes the agent as a user-selectable mode.
     #[serde(default)]
     pub user_invocable: bool,

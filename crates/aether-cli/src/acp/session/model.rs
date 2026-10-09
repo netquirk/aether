@@ -275,6 +275,7 @@ mod tests {
             reasoning_effort: effort,
             model_settings: llm::ModelSettings::default(),
             context_window: None,
+            max_turns: None,
             prompts: vec![],
             provider_connections: llm::ProviderConnectionOverrides::default(),
             mcp_config_sources: Vec::new(),

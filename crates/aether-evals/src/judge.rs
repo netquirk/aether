@@ -449,6 +449,9 @@ fn get_transcript_line(message: &AgentEvent, max_payload_chars: usize) -> Option
         }
         AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Cancelled }) => Some("[cancelled]".to_string()),
         AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Completed }) => Some("[done]".to_string()),
+        AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::MaxTurnsReached { max_turns } }) => {
+            Some(format!("[max-turns-reached] {max_turns}"))
+        }
         _ => None,
     }
 }

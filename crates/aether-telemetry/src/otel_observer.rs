@@ -213,6 +213,10 @@ impl TurnState {
             }
             TurnOutcome::Failed { error } => span.end_error(None, error.clone()),
             TurnOutcome::Cancelled => span.end_error(Some(ErrorKind::Cancelled), TURN_CANCEL_MESSAGE),
+            TurnOutcome::MaxTurnsReached { max_turns } => {
+                span.set_attribute(KeyValue::new("aether.turn.max_turns", i64::from(*max_turns)));
+                span.end_ok();
+            }
         }
     }
 

@@ -173,6 +173,7 @@ fn format_text(message: &AgentEvent, retry_note: Option<&str>) -> Option<String>
                 Some(note) => format!("Error: {error} ({note})"),
                 None => format!("Error: {error}"),
             },
+            TurnOutcome::MaxTurnsReached { max_turns } => format!("Reached turn cap ({max_turns}); ending run"),
         }),
         AgentEvent::Turn(TurnEvent::AutoContinue { attempt, max_attempts, .. }) => {
             Some(format!("Continuing ({attempt}/{max_attempts})..."))

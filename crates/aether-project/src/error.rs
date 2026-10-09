@@ -30,6 +30,10 @@ pub enum SettingsError {
     #[error("Agent '{agent}' has invalid contextWindow {context_window}; expected a positive integer")]
     InvalidContextWindow { agent: String, context_window: u32 },
 
+    /// An agent entry has an invalid max-turns cap.
+    #[error("Agent '{agent}' has invalid maxTurns {max_turns}; expected a positive integer")]
+    InvalidMaxTurns { agent: String, max_turns: u32 },
+
     /// An agent entry has an empty name.
     #[error("Agent at index {index} has an empty name")]
     EmptyAgentName { index: usize },

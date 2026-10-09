@@ -207,6 +207,7 @@ struct AgentTestConfig {
     context_window_override: Option<u32>,
     timeout: Option<Duration>,
     max_auto_continues: Option<u32>,
+    max_turns: Option<u32>,
     retry_config: Option<RetryConfig>,
     repetition: Option<RepetitionConfig>,
     observers: Vec<Box<dyn AgentObserver>>,
@@ -243,6 +244,7 @@ impl TestAgentBuilder {
                 context_window_override: None,
                 timeout: None,
                 max_auto_continues: None,
+                max_turns: None,
                 retry_config: None,
                 repetition: None,
                 observers: Vec::new(),
@@ -301,6 +303,12 @@ impl TestAgentBuilder {
 
     pub fn max_auto_continues(mut self, max: u32) -> Self {
         self.agent.max_auto_continues = Some(max);
+        self
+    }
+
+    /// Cap the number of LLM chat turns in a run for this test agent.
+    pub fn max_turns(mut self, max: u32) -> Self {
+        self.agent.max_turns = Some(max);
         self
     }
 
@@ -424,6 +432,9 @@ impl TestAgentBuilder {
         }
         if let Some(max) = config.max_auto_continues {
             builder = builder.max_auto_continues(max);
+        }
+        if let Some(max) = config.max_turns {
+            builder = builder.max_turns(Some(max));
         }
         if let Some(retry) = config.retry_config {
             builder = builder.retry(retry);

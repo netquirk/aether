@@ -51,6 +51,9 @@ pub struct AgentSpec {
     pub model_settings: ModelSettings,
     /// Effective context window in tokens for this agent.
     pub context_window: Option<u32>,
+    /// Optional cap on the number of LLM chat turns a run may take.
+    /// `None` leaves the run unbounded.
+    pub max_turns: Option<u32>,
     /// The prompt stack for this agent.
     pub prompts: Vec<Prompt>,
     /// Provider connection overrides keyed by model provider name.
@@ -77,6 +80,7 @@ impl AgentSpec {
             reasoning_effort,
             model_settings: ModelSettings::default(),
             context_window: None,
+            max_turns: None,
             prompts,
             provider_connections: ProviderConnectionOverrides::default(),
             mcp_config_sources: Vec::new(),

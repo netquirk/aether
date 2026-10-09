@@ -66,6 +66,7 @@ pub fn map_event_names(events: &[AgentEvent]) -> Vec<String> {
                     TurnOutcome::Completed => "completed",
                     TurnOutcome::Cancelled => "cancelled",
                     TurnOutcome::Failed { .. } => "failed",
+                    TurnOutcome::MaxTurnsReached { .. } => "max_turns_reached",
                 };
                 Some(format!("turn_ended:{outcome}"))
             }

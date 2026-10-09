@@ -496,3 +496,94 @@ async fn test_reasoning_chunks_emit_thought_messages() -> Result<(), Box<dyn Err
 
     Ok(())
 }
+
+fn count_chat_call_started(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::Turn(TurnEvent::LlmCallStarted { purpose: llm::LlmCallPurpose::Chat, .. }))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn run_ends_cleanly_when_max_turns_is_reached() -> Result<(), Box<dyn Error>> {
+    // LLM always responds with a tool call, so the agent would otherwise loop
+    // forever. The cap should stop the run cleanly on the 2nd LLM call.
+    let tool_request = json!({ "a": 1, "b": 2 });
+    let llm_responses = [
+        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().tool_call("call_2", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().tool_call("call_3", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().tool_call("call_4", "test__add_numbers", &[&tool_request.to_string()]).build(),
+    ];
+
+    let messages = test_agent().llm_responses(&llm_responses).user_text("loop until cap").max_turns(2).run().await?;
+
+    // Exactly two chat LLM calls started (the third is short-circuited by the
+    // cap before the request goes out).
+    assert_eq!(
+        count_chat_call_started(&messages),
+        2,
+        "Expected exactly 2 chat LLM calls before the cap, got: {messages:?}"
+    );
+
+    // The terminal event reports the cap, not a failure.
+    let last = messages.last().expect("at least one event");
+    match last.turn_outcome() {
+        Some(TurnOutcome::MaxTurnsReached { max_turns }) => assert_eq!(*max_turns, 2),
+        other => panic!("Expected MaxTurnsReached, got {other:?}"),
+    }
+    assert!(
+        !messages.iter().any(|m| matches!(m.turn_outcome(), Some(TurnOutcome::Failed { .. }))),
+        "Run ended with a failure instead of MaxTurnsReached: {messages:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn max_turns_none_keeps_run_unbounded() -> Result<(), Box<dyn Error>> {
+    // No cap configured: the agent should reach a normal completion even if
+    // the LLM keeps calling tools, eventually answering with text.
+    let tool_request = json!({ "a": 1, "b": 2 });
+    let llm_responses = [
+        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().text(&["done"]).build(),
+    ];
+
+    let messages = test_agent().llm_responses(&llm_responses).user_text("do something").run().await?;
+
+    assert!(matches!(messages.last().and_then(AgentEvent::turn_outcome), Some(TurnOutcome::Completed)));
+    Ok(())
+}
+
+#[test]
+fn max_turns_outcome_serializes_with_snake_case_tag() {
+    let outcome = TurnOutcome::MaxTurnsReached { max_turns: 17 };
+    let json = serde_json::to_value(&outcome).expect("serializes");
+    assert_eq!(json, serde_json::json!({ "status": "max_turns_reached", "max_turns": 17 }));
+}
+
+#[tokio::test]
+async fn max_turns_one_caps_at_the_first_llm_call() -> Result<(), Box<dyn Error>> {
+    // cap=1 means the very first chat call counts as the cap; the run ends
+    // after the LLM has answered once, without a follow-up turn.
+    let tool_request = json!({ "a": 1, "b": 2 });
+    let llm_responses = [
+        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().text(&["would have been a second turn"]).build(),
+    ];
+
+    let messages = test_agent().llm_responses(&llm_responses).user_text("single turn").max_turns(1).run().await?;
+
+    // First turn completes (one chat LLM call started); the follow-up chat
+    // turn requested by the tool call is suppressed by the cap.
+    assert_eq!(count_chat_call_started(&messages), 1);
+    let last = messages.last().expect("at least one event");
+    match last.turn_outcome() {
+        Some(TurnOutcome::MaxTurnsReached { max_turns }) => assert_eq!(*max_turns, 1),
+        other => panic!("Expected MaxTurnsReached, got {other:?}"),
+    }
+    Ok(())
+}

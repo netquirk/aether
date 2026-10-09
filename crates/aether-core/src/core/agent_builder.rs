@@ -47,6 +47,7 @@ pub struct AgentBuilder {
     retry_config: RetryConfig,
     repetition_config: RepetitionConfig,
     context_window: Option<u32>,
+    max_turns: Option<u32>,
     model_settings: ModelSettings,
     observers: Vec<Box<dyn AgentObserver>>,
     session_usage: SessionUsageTracker,
@@ -68,6 +69,7 @@ impl AgentBuilder {
             retry_config: RetryConfig::default(),
             repetition_config: RepetitionConfig::default(),
             context_window: None,
+            max_turns: None,
             model_settings: ModelSettings::default(),
             observers: Vec::new(),
             session_usage: SessionUsageTracker::new("agent"),
@@ -88,6 +90,7 @@ impl AgentBuilder {
         let (provider, _) = parser.parse(&spec.model).await?;
         let mut builder = Self::new(Arc::from(provider))
             .context_window(spec.context_window)
+            .max_turns(spec.max_turns)
             .model_settings(spec.model_settings.clone())
             .session_usage(SessionUsageTracker::new(&spec.name));
 
@@ -222,6 +225,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Cap the number of LLM chat turns in a single run.
+    ///
+    /// When `Some(n)`, the agent ends the run cleanly with
+    /// [`TurnOutcome::MaxTurnsReached`](crate::events::TurnOutcome::MaxTurnsReached)
+    /// once `n` chat turns have been started. `None` (the default) leaves the
+    /// run unbounded.
+    pub fn max_turns(mut self, max: Option<u32>) -> Self {
+        self.max_turns = max;
+        self
+    }
+
     /// Set the sampling controls (`temperature`, `top_p`, `max_tokens`) applied to
     /// every model call this agent makes.
     pub fn model_settings(mut self, model_settings: ModelSettings) -> Self {
@@ -287,6 +301,7 @@ impl AgentBuilder {
             retry_config: self.retry_config,
             repetition: self.repetition_config,
             context_window: self.context_window,
+            max_turns: self.max_turns,
             prompt_cache,
             observers: self.observers,
             session_usage: self.session_usage,
@@ -344,6 +359,7 @@ mod tests {
             reasoning_effort: None,
             model_settings: settings.clone(),
             context_window: Some(200_000),
+            max_turns: Some(7),
             prompts: vec![],
             provider_connections: ProviderConnectionOverrides::default(),
             mcp_config_sources: Vec::new(),
@@ -355,6 +371,7 @@ mod tests {
         let builder = AgentBuilder::from_spec(&spec, vec![], &dependencies).await.unwrap();
 
         assert_eq!(builder.context_window, Some(200_000));
+        assert_eq!(builder.max_turns, Some(7));
         assert_eq!(builder.model_settings, settings);
         assert_eq!(builder.session_affinity_key, "conversation-123");
     }
@@ -368,6 +385,7 @@ mod tests {
             reasoning_effort: None,
             model_settings: ModelSettings::default(),
             context_window: None,
+            max_turns: None,
             prompts: vec![],
             provider_connections: ProviderConnectionOverrides::default(),
             mcp_config_sources: Vec::new(),

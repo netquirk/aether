@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     TurnOutcome::Completed => println!("Agent finished processing"),
                     TurnOutcome::Failed { error } => eprintln!("Error: {error}"),
                     TurnOutcome::Cancelled => println!("Processing cancelled"),
+                    TurnOutcome::MaxTurnsReached { max_turns } => {
+                        println!("Agent stopped after reaching maxTurns={max_turns}");
+                    }
                 }
                 break;
             }

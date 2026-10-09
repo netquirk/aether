@@ -74,6 +74,7 @@ pub fn fake_spec(name: &str, exposure: AgentSpecExposure) -> AgentSpec {
         reasoning_effort: None,
         model_settings: ModelSettings::default(),
         context_window: None,
+        max_turns: None,
         prompts: vec![],
         provider_connections: ProviderConnectionOverrides::default(),
         mcp_config_sources: Vec::new(),

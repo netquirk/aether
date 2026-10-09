@@ -41,3 +41,18 @@ A sub-agent (callable by other agents) that pins a Bedrock inference profile:
   }
 }
 ```
+
+An agent that caps how many LLM turns a single run may take. When the cap is
+reached, the run ends cleanly (no failure) and reports the cap through
+`TurnEvent::Ended` with `outcome.status == "max_turns_reached"`. Use this to
+prevent a runaway tool-call loop from running unbounded.
+
+```json
+{
+  "name": "Search",
+  "description": "Answers questions about the codebase",
+  "model": "anthropic:claude-sonnet-4-5-20250929",
+  "userInvocable": true,
+  "maxTurns": 25
+}
+```

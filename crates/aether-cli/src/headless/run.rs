@@ -153,7 +153,9 @@ async fn stream_output(
         if let Some(outcome) = msg.turn_outcome() {
             exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
-                TurnOutcome::Completed | TurnOutcome::Cancelled => ExitCode::SUCCESS,
+                TurnOutcome::Completed | TurnOutcome::Cancelled | TurnOutcome::MaxTurnsReached { .. } => {
+                    ExitCode::SUCCESS
+                }
             };
             break;
         }

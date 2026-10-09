@@ -226,6 +226,7 @@ impl EventProjection {
                     TurnOutcome::Completed => "completed",
                     TurnOutcome::Cancelled => "cancelled",
                     TurnOutcome::Failed { .. } => "failed",
+                    TurnOutcome::MaxTurnsReached { .. } => "max_turns_reached",
                 }),
                 ..Self::new("agent", "turn_ended")
             },

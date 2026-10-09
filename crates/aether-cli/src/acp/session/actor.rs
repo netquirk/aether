@@ -676,7 +676,7 @@ async fn run_idle_command(cwd: PathBuf, command: String) {
 
 fn turn_result(outcome: &TurnOutcome) -> Result<acp::StopReason, SessionError> {
     match outcome {
-        TurnOutcome::Completed => Ok(acp::StopReason::EndTurn),
+        TurnOutcome::Completed | TurnOutcome::MaxTurnsReached { .. } => Ok(acp::StopReason::EndTurn),
         TurnOutcome::Cancelled => Ok(acp::StopReason::Cancelled),
         TurnOutcome::Failed { error } => Err(SessionError::TurnFailed(error.clone())),
     }

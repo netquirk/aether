@@ -203,6 +203,9 @@ fn resolve_agent_entry(
     if entry.context_window == Some(0) {
         return Err(SettingsError::InvalidContextWindow { agent: name.clone(), context_window: 0 });
     }
+    if entry.max_turns == Some(0) {
+        return Err(SettingsError::InvalidMaxTurns { agent: name.clone(), max_turns: 0 });
+    }
     if !entry.user_invocable && !entry.agent_invocable {
         return Err(SettingsError::NoInvocationSurface { agent: name.clone() });
     }
@@ -228,6 +231,7 @@ fn resolve_agent_entry(
         reasoning_effort: entry.reasoning_effort,
         model_settings: entry.model_settings,
         context_window: entry.context_window,
+        max_turns: entry.max_turns,
         prompts,
         provider_connections,
         mcp_config_sources,
@@ -671,5 +675,39 @@ mod tests {
 
         let spec = catalog.resolve("planner").unwrap();
         assert!(spec.mcp_config_sources.is_empty());
+    }
+
+    #[test]
+    fn agent_max_turns_is_resolved_into_spec() {
+        let dir = project().file("BASE.md", "Base instructions");
+
+        let config = AetherSettings {
+            agents: vec![AgentConfig {
+                max_turns: Some(42),
+                prompts: vec![crate::PromptSource::file("BASE.md")],
+                ..settings_agent("planner", "Planner agent")
+            }],
+            ..AetherSettings::default()
+        };
+
+        let catalog = AgentCatalog::from_settings(dir.root(), config).unwrap();
+        let spec = catalog.resolve("planner").unwrap();
+
+        assert_eq!(spec.max_turns, Some(42));
+    }
+
+    #[test]
+    fn agent_max_turns_rejects_zero() {
+        let config = AetherSettings {
+            agents: vec![AgentConfig { max_turns: Some(0), ..settings_agent("planner", "Planner agent") }],
+            ..AetherSettings::default()
+        };
+
+        let err = AgentCatalog::from_settings(Path::new("/tmp"), config).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SettingsError::InvalidMaxTurns { agent, max_turns: 0 } if agent == "planner"
+        ));
     }
 }

@@ -63,6 +63,11 @@ pub(crate) struct AgentConfig {
     pub retry_config: RetryConfig,
     pub repetition: RepetitionConfig,
     pub context_window: Option<u32>,
+    /// Optional cap on the number of LLM chat turns in a single run. When
+    /// `Some(n)`, the run ends cleanly with
+    /// [`TurnOutcome::MaxTurnsReached`](crate::events::TurnOutcome::MaxTurnsReached)
+    /// once `n` chat turns have started. `None` means unbounded.
+    pub max_turns: Option<u32>,
     pub prompt_cache: PromptCache,
     pub observers: Vec<Box<dyn AgentObserver>>,
     pub session_usage: SessionUsageTracker,
@@ -85,6 +90,11 @@ pub struct Agent {
     pending_inputs: VecDeque<QueuedInput>,
     queued_inputs: VecDeque<QueuedInput>,
     context_window: Option<u32>,
+    /// Optional cap on the number of LLM chat turns in a single run.
+    max_turns: Option<u32>,
+    /// Number of LLM chat turns already started in the current run. Reset on
+    /// every `begin_turn`.
+    turns_started: u32,
     prompt_cache: PromptCache,
     turn_active: bool,
     llm_call_active: bool,
@@ -124,6 +134,8 @@ impl Agent {
             pending_inputs: VecDeque::new(),
             queued_inputs: VecDeque::new(),
             context_window: config.context_window,
+            max_turns: config.max_turns,
+            turns_started: 0,
             prompt_cache: config.prompt_cache,
             turn_active: false,
             llm_call_active: false,
@@ -303,6 +315,22 @@ impl Agent {
     }
 
     async fn start_chat_turn(&mut self) {
+        // Enforce the per-run turn cap before issuing the LLM call so the
+        // tool-call loop cannot run unbounded. Abort any in-flight work
+        // (foreground tools would have retired before this method is reached
+        // from `on_iteration_complete`; this guards the compaction path too).
+        if let Some(max) = self.max_turns
+            && self.turns_started >= max
+        {
+            tracing::info!(max_turns = max, "Turn cap reached; ending run");
+            self.abort_in_flight_work(ToolAbortPolicy::CancelAll).await;
+            self.pending_inputs.clear();
+            self.queued_inputs.clear();
+            self.auto_continue.reset();
+            self.finish_turn(TurnOutcome::MaxTurnsReached { max_turns: max }).await;
+            return;
+        }
+        self.turns_started += 1;
         self.commit_pending_inputs().await;
         self.start_llm_stream(None, 0).await;
     }
@@ -344,6 +372,7 @@ impl Agent {
         *state = IterationState::default();
         self.auto_continue.reset();
         self.repetition.reset();
+        self.turns_started = 0;
         self.turn_active = true;
         let content = input.content_blocks();
         self.emit(AgentEvent::Turn(TurnEvent::Started { content })).await;
