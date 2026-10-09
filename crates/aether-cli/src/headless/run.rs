@@ -149,17 +149,17 @@ fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     }
 }
 
-fn setup_tracing(verbose: bool) {
+pub(crate) fn setup_tracing(verbose: bool) {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let filter = if verbose { EnvFilter::new("debug,agent=off") } else { EnvFilter::new("error,agent=off") };
+    let filter = if verbose { EnvFilter::new("debug,agent=off") } else { EnvFilter::new("warn,agent=off") };
     let layer = fmt::layer().with_writer(io::stderr).with_filter(filter);
 
-    tracing_subscriber::registry().with(layer).init();
+    let _ = tracing_subscriber::registry().with(layer).try_init();
 }
 
 #[cfg(test)]

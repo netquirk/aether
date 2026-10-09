@@ -103,6 +103,22 @@ pub struct AetherSettings {
     pub agents: Vec<AgentConfig>,
 }
 
+/// Top-level keys that the [`AetherSettings`] deserialiser recognises. Every
+/// other key in the root JSON object is treated as a user-authored typo or
+/// forward-compat slot and produces a one-line `tracing::warn!` rather than a
+/// hard parse error. Keep this list in sync with the
+/// `#[derive(schemars::JsonSchema)]` definition of [`AetherSettings`]; the
+/// `known_top_level_keys_match_schema` test in this module will fail the build
+/// if they ever drift.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] =
+    &["agent", "prompts", "mcps", "providers", "credentialsStore", "telemetry", "agents"];
+
+/// Returns the keys present in `value` that [`AetherSettings`] does not
+/// declare, preserving their original ordering for stable, testable output.
+fn unrecognized_settings_keys(value: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    value.keys().filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())).cloned().collect()
+}
+
 /// One settings layer's OpenTelemetry configuration. Every field is optional:
 /// a field left unset inherits the value from lower-precedence settings layers
 /// and falls back to its documented default when no layer sets it. Read
@@ -489,7 +505,25 @@ impl TryFrom<&str> for AetherSettings {
     type Error = SettingsError;
 
     fn try_from(content: &str) -> Result<Self, Self::Error> {
-        serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))
+        // Parse once into a generic `Value` so we can warn about unknown
+        // top-level keys and drop them before serde's `deny_unknown_fields`
+        // turns them into a hard error. This keeps the contract that
+        // "an unrecognised key prints a warning naming it and the run
+        // still starts" true even when the field policy is strict.
+        let mut value: serde_json::Value =
+            serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))?;
+
+        if let serde_json::Value::Object(ref mut map) = value {
+            let unknown = unrecognized_settings_keys(map);
+            for key in &unknown {
+                tracing::warn!("Unrecognised key '{key}' in Aether settings; ignoring it");
+            }
+            for key in &unknown {
+                map.remove(key);
+            }
+        }
+
+        serde_json::from_value(value).map_err(|e| SettingsError::ParseError(e.to_string()))
     }
 }
 
@@ -1088,18 +1122,118 @@ mod tests {
     }
 
     #[test]
-    fn rejects_old_top_level_mcp_servers_field() {
-        let err = AetherSettings::try_from(
-            json!({
-                "mcpServers": ["mcp.json"],
-                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap_err();
+    fn unknown_top_level_key_warns_and_still_loads() {
+        let value = json!({
+            "mcpServers": ["mcp.json"],
+            "typoField": 42,
+            "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
+        });
 
-        assert!(matches!(err, SettingsError::ParseError(message) if message.contains("mcpServers")));
+        let unknown = {
+            let parsed: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_value(value.clone()).expect("object parses");
+            unrecognized_settings_keys(&parsed)
+        };
+        assert_eq!(unknown, vec!["mcpServers".to_string(), "typoField".to_string()]);
+
+        let observed = capture_warnings(|| {
+            AetherSettings::try_from(value.to_string().as_str()).expect("unknown keys are warned, not rejected");
+        });
+        assert_eq!(observed.len(), 2, "one warning per unknown key: {observed:?}");
+        assert!(observed.iter().any(|line| line.contains("'mcpServers'")), "{observed:?}");
+        assert!(observed.iter().any(|line| line.contains("'typoField'")), "{observed:?}");
+    }
+
+    #[test]
+    fn valid_config_warns_nothing() {
+        let value = json!({
+            "agent": "alpha",
+            "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
+        });
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(value.clone()).expect("object parses");
+        assert!(unrecognized_settings_keys(&parsed).is_empty());
+
+        let observed = capture_warnings(|| {
+            AetherSettings::try_from(value.to_string().as_str()).expect("valid config parses");
+        });
+        assert!(observed.is_empty(), "valid config should not warn: {observed:?}");
+    }
+
+    #[test]
+    fn unknown_top_level_key_does_not_abort_load_default() {
+        let project = project();
+        project.write(
+            ".aether/settings.json",
+            &json!({
+                "totallyMadeUp": true,
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string(),
+        );
+
+        let home = home();
+        let aether_home = home.aether();
+        let config =
+            load_default_from_home(project.root(), &aether_home).expect("an unknown key is warned, not rejected");
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "alpha");
+    }
+
+    #[test]
+    fn known_top_level_keys_match_schema() {
+        use schemars::schema_for;
+        let schema = schema_for!(AetherSettings);
+        let mut schema_keys: Vec<String> = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema has a properties object")
+            .keys()
+            .cloned()
+            .collect();
+        schema_keys.sort();
+        let mut const_keys: Vec<String> = KNOWN_TOP_LEVEL_KEYS.iter().map(ToString::to_string).collect();
+        const_keys.sort();
+        assert_eq!(
+            const_keys, schema_keys,
+            "KNOWN_TOP_LEVEL_KEYS drifted from the AetherSettings schema; keep them in lock-step so unknown-key detection never silently drops a real field"
+        );
+    }
+
+    fn capture_warnings<F: FnOnce()>(body: F) -> Vec<String> {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture mutex poisoned").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let buf = Arc::clone(&buf);
+            move || CaptureWriter(Arc::clone(&buf))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+
+        String::from_utf8(buf.lock().expect("capture mutex poisoned").clone())
+            .expect("warning output is utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]

@@ -42,3 +42,4 @@ aether-project = { package = "aether-project", path = ".", features = ["testing"
 aether-doctest = { path = "../doctest" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing-subscriber = { workspace = true }

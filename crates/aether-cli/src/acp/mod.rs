@@ -260,12 +260,12 @@ fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result
 
 fn setup_logging(log_dir: &Path) {
     create_dir_all(log_dir).ok();
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_writer(daily(log_dir, "aether-acp.log"))
         .with_ansi(false) // No ANSI colors in log files
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .pretty()
-        .init();
+        .try_init();
 }
 
 fn default_log_dir() -> PathBuf {

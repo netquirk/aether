@@ -97,6 +97,10 @@ pub struct HeadlessOptions {
 }
 
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
+    // Settings loading can emit `tracing::warn!` for unrecognised keys, so
+    // initialise the tracing subscriber before the load (the subscriber is
+    // re-installed at the proper verbosity inside `run::run`).
+    run::setup_tracing(args.verbose);
     run::run(RunConfig::from_args(args)?).await
 }
 
