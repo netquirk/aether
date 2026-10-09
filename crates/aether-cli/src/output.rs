@@ -147,6 +147,9 @@ fn format_text(message: &AgentEvent, retry_note: Option<&str>) -> Option<String>
         AgentEvent::Tool(ToolEvent::Error { error, .. }) => {
             Some(format!("Tool error [{}]: {}", error.name, error.error))
         }
+        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => {
+            Some(format!("Tool refused [{}]: {reason}", request.name))
+        }
         AgentEvent::Tool(ToolEvent::TaskStatus { request, task_id, status, status_message }) => Some(format!(
             "Task status [{}]: {} {}{}",
             request.name,

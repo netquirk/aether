@@ -40,6 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(AgentEvent::Tool(ToolEvent::Error { error, .. })) => {
                 eprintln!("Tool '{}' failed: {}", error.name, error.error);
             }
+            Some(AgentEvent::Tool(ToolEvent::Refused { request, reason })) => {
+                eprintln!("Tool '{}' was refused: {reason}", request.name);
+            }
             Some(AgentEvent::Tool(ToolEvent::Progress { request, progress, total, message })) => {
                 let msg = message.as_ref().map(|m| format!("{m} ")).unwrap_or_default();
                 let total_str = total.map(|t| format!("/{t}")).unwrap_or_default();

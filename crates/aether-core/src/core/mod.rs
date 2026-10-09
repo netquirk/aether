@@ -9,6 +9,7 @@ mod queued_input;
 mod repetition_config;
 mod retry_config;
 mod tool_execution;
+mod tool_policy;
 
 pub use crate::events::{AgentCommand, AgentEvent, Command, UserCommand};
 pub use agent::*;
@@ -19,6 +20,7 @@ pub use error::*;
 pub use prompt::*;
 pub use repetition_config::RepetitionConfig;
 pub use retry_config::RetryConfig;
+pub use tool_policy::{AllowAllTools, ToolPolicy};
 
 use llm::StreamingModelProvider;
 use std::sync::Arc;

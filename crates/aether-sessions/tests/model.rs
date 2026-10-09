@@ -60,6 +60,17 @@ fn persisted_event_policy_covers_representative_variants() {
 }
 
 #[test]
+fn refused_tool_event_is_persisted_with_reason() {
+    let refused = SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Refused {
+        request: llm::ToolCallRequest { id: "call_1".into(), name: "bash".into(), arguments: "{}".into() },
+        reason: "no shell access".into(),
+    }));
+
+    assert!(refused.is_persisted());
+    assert_eq!(refused.content().as_deref(), Some("no shell access"));
+}
+
+#[test]
 fn last_session_usage_picks_the_latest_sample_from_a_partial_log() {
     let events = vec![
         SessionEvent::Agent(AgentEvent::SessionUsage(session_usage(1, 5))),

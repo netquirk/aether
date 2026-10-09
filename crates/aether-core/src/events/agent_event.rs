@@ -47,6 +47,7 @@ impl AgentEvent {
                 Some(result.result.clone())
             }
             Self::Tool(ToolEvent::Error { error } | ToolEvent::TaskFailed { error, .. }) => Some(error.error.clone()),
+            Self::Tool(ToolEvent::Refused { reason, .. }) => Some(reason.clone()),
             Self::Tool(ToolEvent::TaskCreated { task_id, .. }) => Some(task_id.clone()),
             Self::Tool(ToolEvent::TaskStatus { task_id, status, status_message, .. }) => {
                 Some(status_message.as_ref().map_or_else(

@@ -1,6 +1,11 @@
 use crate::model::{SessionEvent, UserEvent};
-use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, ToolEvent, TurnEvent, TurnOutcome, task_created_result};
-use llm::{AssistantReasoning, ChatMessage, Context, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallResult};
+use aether_core::events::{
+    AgentEvent, ContextEvent, MessageEvent, ToolEvent, TurnEvent, TurnOutcome, refusal_context_message,
+    task_created_result,
+};
+use llm::{
+    AssistantReasoning, ChatMessage, Context, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallResult,
+};
 use serde::{Deserialize, Serialize};
 
 /// One turn in a run transcript, recording the model that served it.
@@ -145,6 +150,10 @@ fn apply_agent_event(ctx: &mut Context, event: &AgentEvent, acc: &mut MessageAcc
             acc.tool_results.push(Ok(task_created_result(request, task_id)));
         }
         AgentEvent::Tool(ToolEvent::Error { error }) => acc.tool_results.push(Err(error.clone())),
+        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => {
+            acc.flush(ctx);
+            ctx.add_message(refusal_context_message(request, reason));
+        }
         AgentEvent::Turn(TurnEvent::AutoContinue { message_id, content, .. }) => {
             acc.flush(ctx);
             ctx.add_message(ChatMessage::user_with_id(message_id.clone(), content.clone()));

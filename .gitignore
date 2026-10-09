@@ -17,3 +17,6 @@ packages/website/dist/
 packages/website/.astro/
 packages/website/*.log
 .DS_Store
+.prairie/
+.prairie-conflicts/
+.prairie-conflicts-NOTE.md

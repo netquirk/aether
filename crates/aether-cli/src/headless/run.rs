@@ -231,6 +231,7 @@ fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
         AgentEvent::Tool(ToolEvent::Error { .. } | ToolEvent::TaskFailed { .. } | ToolEvent::TaskCancelled { .. }) => {
             Some(CliEventKind::ToolError)
         }
+        AgentEvent::Tool(ToolEvent::Refused { .. }) => Some(CliEventKind::ToolRefused),
         AgentEvent::Turn(TurnEvent::AutoContinue { .. }) => Some(CliEventKind::AutoContinue),
         AgentEvent::Model(ModelEvent::Switched { .. }) => Some(CliEventKind::ModelSwitched),
         AgentEvent::Tool(
@@ -417,6 +418,17 @@ mod tests {
                 CliEventKind::ToolExecutionStarted,
             ),
             (AgentEvent::Tool(ToolEvent::DefinitionsUpdated { tools: vec![] }), CliEventKind::ToolDefinitionsUpdated),
+            (
+                AgentEvent::Tool(ToolEvent::Refused {
+                    request: llm::ToolCallRequest {
+                        id: "tc1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    reason: "no shell access".to_string(),
+                }),
+                CliEventKind::ToolRefused,
+            ),
         ];
 
         for kind in CliEventKind::value_variants() {

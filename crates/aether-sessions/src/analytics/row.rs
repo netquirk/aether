@@ -185,6 +185,7 @@ impl EventProjection {
                 ..Self::new("agent", "tool_error")
             },
             ToolEvent::TaskCreated { request, .. } => Self::for_tool_request("tool_deferred", request, None),
+            ToolEvent::Refused { request, .. } => Self::for_tool_request("tool_refused", request, Some("refused")),
             ToolEvent::TaskStatus { request, .. } => Self::for_tool_request("tool_task_status", request, None),
             ToolEvent::TaskCompleted { request, .. } => {
                 Self::for_tool_request("tool_task_completed", request, Some("completed"))

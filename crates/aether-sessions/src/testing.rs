@@ -7,9 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, StreamState, ToolEvent, TurnEvent, TurnOutcome};
-use llm::{
-    ContentBlock, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallRequest, ToolCallResult,
-};
+use llm::{ContentBlock, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallRequest, ToolCallResult};
 use tempfile::TempDir;
 
 use crate::model::{SessionControlEvent, SessionEvent, SessionMeta, UserEvent};
@@ -72,6 +70,14 @@ pub fn tool_result(id: &str, name: &str, result: &str) -> SessionEvent {
 pub fn tool_error(id: &str, name: &str, error: &str) -> SessionEvent {
     SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Error {
         error: ToolCallError { id: id.into(), name: name.into(), arguments: Some("{}".into()), error: error.into() },
+    }))
+}
+
+/// A tool call refused by policy for `id`.
+pub fn tool_refused(id: &str, name: &str, arguments: &str, reason: &str) -> SessionEvent {
+    SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Refused {
+        request: ToolCallRequest { id: id.into(), name: name.into(), arguments: arguments.into() },
+        reason: reason.into(),
     }))
 }
 

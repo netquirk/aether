@@ -40,8 +40,30 @@ pub enum ToolEvent {
     Result { result: ToolCallResult, result_meta: Option<ToolResultMeta> },
     /// The tool failed.
     Error { error: ToolCallError },
+    /// The tool call was refused before execution (e.g. by a [`ToolPolicy`](crate::core::ToolPolicy)).
+    /// The `reason` is a human-readable string describing why execution was declined; the full
+    /// `request` is preserved so the transcript records exactly what was rejected.
+    Refused { request: ToolCallRequest, reason: String },
     /// The set of available tool definitions changed.
     DefinitionsUpdated { tools: Vec<ToolDefinition> },
+}
+
+/// Build the [`ChatMessage`] that tells the model a tool call was refused by policy,
+/// so it can react instead of stalling waiting for a result.
+pub fn refusal_context_message(request: &ToolCallRequest, reason: &str) -> ChatMessage {
+    let content = format!(
+        "<tool-refused tool=\"{}\" reason=\"{}\">{}</tool-refused>",
+        escape_xml(&request.name),
+        escape_xml(reason),
+        escape_xml(reason),
+    );
+    let mut message_id = MessageId::new();
+    if let Some(stripped) = request.id.strip_prefix("tool-result:") {
+        message_id = MessageId::tool_result(stripped);
+    } else if !request.id.is_empty() {
+        message_id = MessageId::tool_result(&request.id);
+    }
+    ChatMessage::User { message_id, content: vec![ContentBlock::text(content)], timestamp: IsoString::now() }
 }
 
 impl ToolEvent {

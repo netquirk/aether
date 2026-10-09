@@ -86,6 +86,12 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
             Some(map_tool_error_to_notification(error))
         }
 
+        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => Some(SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(request.id.clone())
+                .status(ToolCallStatus::Failed)
+                .content(vec![format!("Refused: {reason}").into()]),
+        )),
+
         AgentEvent::Tool(ToolEvent::TaskCreated { request, status_message, .. }) => {
             Some(SessionUpdate::ToolCallUpdate(
                 ToolCallUpdate::new(request.id.clone())

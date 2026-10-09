@@ -7,9 +7,11 @@ use crate::core::queued_input::QueuedInput;
 use crate::core::repetition_config::{RepetitionConfig, RepetitionTracker, iteration_signature};
 pub use crate::core::retry_config::RetryConfig;
 use crate::core::tool_execution::{ToolAbortPolicy, ToolExecutionUpdate, ToolExecutions};
+pub use crate::core::tool_policy::ToolPolicy;
 use crate::events::{
     AgentCommand, AgentEvent, AgentObserver, Command, CompactionId, CompactionOutcome, ContextEvent, LlmCallOutcome,
     ModelEvent, StreamState, TaskOutcome, ToolEvent, TraceContext, TurnEvent, TurnOutcome, UserCommand,
+    refusal_context_message,
 };
 use crate::mcp::McpHandle;
 use futures::Stream;
@@ -71,6 +73,7 @@ pub(crate) struct AgentConfig {
     pub prompt_cache: PromptCache,
     pub observers: Vec<Box<dyn AgentObserver>>,
     pub session_usage: SessionUsageTracker,
+    pub tool_policy: Arc<dyn ToolPolicy>,
 }
 
 pub struct Agent {
@@ -81,6 +84,7 @@ pub struct Agent {
     observers: Vec<Box<dyn AgentObserver>>,
     streams: StreamMap<StreamKey, EventStream>,
     tool_timeout: Duration,
+    tool_policy: Arc<dyn ToolPolicy>,
     token_tracker: TokenTracker,
     compaction_config: Option<CompactionConfig>,
     auto_continue: AutoContinue,
@@ -125,6 +129,7 @@ impl Agent {
             observers: config.observers,
             streams,
             tool_timeout: config.tool_timeout,
+            tool_policy: config.tool_policy,
             token_tracker: TokenTracker::new(context_limit),
             compaction_config: config.compaction_config,
             auto_continue: config.auto_continue,
@@ -590,9 +595,16 @@ impl Agent {
 
     async fn handle_tool_completion(&mut self, tool_call: ToolCallRequest, state: &mut IterationState) {
         state.record_tool_call(&tool_call);
-        let cancel = self.tool_executions.start(tool_call.clone());
-
         let tool_id = tool_call.id.clone();
+
+        if let Some(reason) = self.tool_policy.refuse(&tool_call) {
+            let reason_for_event = reason.clone();
+            self.record_tool_refusal(tool_call.clone(), reason, state).await;
+            self.emit(AgentEvent::Tool(ToolEvent::Refused { request: tool_call, reason: reason_for_event })).await;
+            return;
+        }
+
+        let cancel = self.tool_executions.start(tool_call.clone());
         tracing::debug!("Tool execution started: {} ({})", tool_call.name, tool_id);
         self.emit(AgentEvent::Tool(ToolEvent::ExecutionStarted {
             tool_id: tool_id.clone(),
@@ -619,6 +631,17 @@ impl Agent {
         let stream =
             mcp.call_model_visible(tool_call.name, &tool_call.arguments, options).map(StreamEvent::ToolExecution);
         self.streams.insert(StreamKey::Tool(tool_id), Box::pin(stream));
+    }
+
+    async fn record_tool_refusal(&mut self, request: ToolCallRequest, reason: String, state: &mut IterationState) {
+        let refusal_text = format!("Tool call `{name}` was refused by policy: {reason}", name = request.name,);
+        state.completed_tool_calls.push(Ok(ToolCallResult {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            arguments: request.arguments.clone(),
+            result: refusal_text,
+        }));
+        self.context.add_message(refusal_context_message(&request, &reason));
     }
 
     async fn handle_llm_usage(&mut self, sample: TokenUsage, state: &mut IterationState) {

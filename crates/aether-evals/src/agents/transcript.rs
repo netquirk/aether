@@ -122,6 +122,9 @@ impl Transcript {
             AgentEvent::Tool(ToolEvent::Error { error, .. }) => {
                 Some(ToolCall { name: &error.name, arguments: error.arguments.as_deref().unwrap_or("") })
             }
+            AgentEvent::Tool(ToolEvent::Refused { request, .. }) => {
+                Some(ToolCall { name: &request.name, arguments: &request.arguments })
+            }
             _ => None,
         })
     }
@@ -271,6 +274,18 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_count_includes_refused_calls() {
+        let transcript = transcript_with_events(vec![
+            tool_call("bash"),
+            refused_tool_call("bash", "no shell access"),
+            tool_result("bash"),
+        ]);
+
+        assert!(transcript.tool_called("bash"));
+        assert_eq!(transcript.tool_call_count("bash"), 2);
+    }
+
+    #[test]
     fn tool_call_arguments_json_parses_arguments() {
         let call = ToolCall { name: "bash", arguments: r#"{"command":"pwd"}"# };
 
@@ -350,5 +365,12 @@ mod tests {
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git").arg("-C").arg(repo).args(args).output().expect("git invocation");
         assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn refused_tool_call(name: &str, reason: &str) -> AgentEvent {
+        AgentEvent::Tool(ToolEvent::Refused {
+            request: ToolCallRequest { id: name.to_string(), name: name.to_string(), arguments: "{}".to_string() },
+            reason: reason.to_string(),
+        })
     }
 }

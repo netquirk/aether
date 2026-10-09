@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
 use crate::context::CompactionConfig;
+use crate::core::ToolPolicy;
 use crate::core::{AgentError, Prompt, RepetitionConfig, RetryConfig, agent};
 use crate::events::{
     AgentCommand, AgentEvent, AgentObserver, Command, ContextEvent, ToolEvent, TurnEvent, UserCommand,
@@ -217,6 +218,7 @@ struct AgentTestConfig {
     session_affinity_key: Option<String>,
     compaction: Option<CompactionConfig>,
     model_settings: Option<ModelSettings>,
+    tool_policy: Option<Arc<dyn ToolPolicy>>,
 }
 
 enum TestExecution {
@@ -254,6 +256,7 @@ impl TestAgentBuilder {
                 session_affinity_key: None,
                 compaction: None,
                 model_settings: None,
+                tool_policy: None,
             },
             execution: None,
         }
@@ -373,6 +376,12 @@ impl TestAgentBuilder {
         self
     }
 
+    /// Install a [`ToolPolicy`] consulted before every tool call the model requests.
+    pub fn tool_policy(mut self, policy: Arc<dyn ToolPolicy>) -> Self {
+        self.agent.tool_policy = Some(policy);
+        self
+    }
+
     /// Pause the fake LLM stream at `turn_index` / `chunk_index` until
     /// `release.notify_one()` is called. Used for deterministic timing tests.
     pub fn pause_turn_after(mut self, turn_index: usize, chunk_index: usize, release: Arc<Notify>) -> Self {
@@ -453,6 +462,9 @@ impl TestAgentBuilder {
         }
         if let Some(settings) = config.model_settings {
             builder = builder.model_settings(settings);
+        }
+        if let Some(policy) = config.tool_policy {
+            builder = builder.tool_policy(policy);
         }
         builder = builder.context_window(config.context_window_override);
         if !config.initial_messages.is_empty() {

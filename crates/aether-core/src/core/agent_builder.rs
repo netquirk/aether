@@ -1,5 +1,6 @@
 use super::agent::{AgentConfig, AutoContinue, RetryConfig};
 use super::repetition_config::RepetitionConfig;
+use super::tool_policy::ToolPolicy;
 use crate::agent_spec::AgentSpec;
 use crate::context::{CompactionConfig, SessionUsageTracker};
 use crate::core::{Agent, AgentDeps, Prompt, PromptCache, Result};
@@ -52,6 +53,7 @@ pub struct AgentBuilder {
     observers: Vec<Box<dyn AgentObserver>>,
     session_usage: SessionUsageTracker,
     session_affinity_key: String,
+    tool_policy: Arc<dyn ToolPolicy>,
 }
 
 impl AgentBuilder {
@@ -74,6 +76,7 @@ impl AgentBuilder {
             observers: Vec::new(),
             session_usage: SessionUsageTracker::new("agent"),
             session_affinity_key: uuid::Uuid::new_v4().to_string(),
+            tool_policy: Arc::new(super::tool_policy::AllowAllTools),
         }
     }
 
@@ -268,6 +271,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Install a [`ToolPolicy`] consulted before every tool call the model requests.
+    /// The default [`AllowAllTools`](super::tool_policy::AllowAllTools) refuses nothing.
+    pub fn tool_policy(mut self, policy: Arc<dyn ToolPolicy>) -> Self {
+        self.tool_policy = policy;
+        self
+    }
+
     /// Continue session totals from the last persisted usage event, e.g. when
     /// resuming a session.
     pub fn resume_usage(mut self, last: &SessionUsageEvent) -> Self {
@@ -305,6 +315,7 @@ impl AgentBuilder {
             prompt_cache,
             observers: self.observers,
             session_usage: self.session_usage,
+            tool_policy: self.tool_policy,
         };
 
         let agent = Agent::new(config, command_rx, message_tx);

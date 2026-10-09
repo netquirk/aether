@@ -70,6 +70,7 @@ impl SessionEvent {
                     ToolEvent::Call { .. }
                     | ToolEvent::Result { .. }
                     | ToolEvent::Error { .. }
+                    | ToolEvent::Refused { .. }
                     | ToolEvent::TaskCreated { .. }
                     | ToolEvent::TaskCompleted { .. }
                     | ToolEvent::TaskFailed { .. }

@@ -48,6 +48,7 @@ pub enum CliEventKind {
     LlmCallEnded,
     ToolExecutionStarted,
     ToolDefinitionsUpdated,
+    ToolRefused,
 }
 
 pub struct RunConfig {
