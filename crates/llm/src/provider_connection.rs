@@ -110,6 +110,14 @@ impl ProviderConnectionOverrides {
         Self { providers }
     }
 
+    /// Borrowed lookup of the override for `provider`, if any.
+    ///
+    /// Used by the `aether headless --dry-run` path to print the resolved
+    /// endpoint without cloning the entire override table.
+    pub fn get(&self, provider: &str) -> Option<&ProviderConnectionOverride> {
+        self.providers.get(provider)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
@@ -185,5 +193,18 @@ mod tests {
         first.merge(second);
 
         assert_eq!(first.config_for("bedrock").inference_profile_arn.as_deref(), Some("arn:second"));
+    }
+
+    #[test]
+    fn get_returns_borrowed_override() {
+        let overrides = ProviderConnectionOverrides::new(BTreeMap::from([(
+            "ollama".to_string(),
+            ProviderConnectionOverride::url("http://127.0.0.1:11434"),
+        )]));
+
+        let fetched = overrides.get("ollama").expect("ollama override present");
+        assert_eq!(fetched.base_url.as_deref(), Some("http://127.0.0.1:11434"));
+
+        assert!(overrides.get("anthropic").is_none());
     }
 }

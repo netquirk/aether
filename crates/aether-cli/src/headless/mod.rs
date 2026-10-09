@@ -102,6 +102,13 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // initialise the tracing subscriber before the load (the subscriber is
     // re-installed at the proper verbosity inside `run::run`).
     run::setup_tracing(args.verbose);
+    if args.dry_run {
+        // Short-circuit before any prompt resolution, session construction,
+        // MCP setup, telemetry runtime, or provider call: --dry-run only
+        // prints the resolved model/profile/endpoint and exits 0.
+        print_dry_run(&args)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     run::run(RunConfig::from_args(args)?).await
 }
 
@@ -109,6 +116,12 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
 pub struct HeadlessArgs {
     #[arg(long = "options-json", value_name = "JSON", hide = true)]
     pub options_json: Option<String>,
+
+    /// Resolve the run configuration, print the resolved model/profile/endpoint,
+    /// and exit 0 without starting a session or calling a provider. Ignores
+    /// any prompt argument and never reads stdin.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 
     /// Prompt to send (reads stdin if omitted and stdin is not a TTY)
     pub prompt: Vec<String>,
@@ -164,14 +177,7 @@ impl RunConfig {
         let provider_connections = args.provider_connection.clone().into_overrides();
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
-        let selection = match (args.agent, args.model) {
-            (Some(agent), None) => InitialSessionSelection::Agent(agent),
-            (None, Some(model)) => InitialSessionSelection::Model { model, reasoning_effort: None },
-            (None, None) => InitialSessionSelection::Default,
-            (Some(_), Some(_)) => {
-                return Err(CliError::ConflictingArgs("Cannot specify both --agent and --model".to_string()));
-            }
-        };
+        let selection = initial_selection(args.agent, args.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
         let mcp_config_sources = args.mcp_config.sources(&cwd);
@@ -200,14 +206,7 @@ impl RunConfig {
         let provider_connections = ProviderConnectionOverrides::new(options.providers.unwrap_or_default());
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
-        let selection = match (options.agent, options.model) {
-            (Some(agent), None) => InitialSessionSelection::Agent(agent),
-            (None, Some(model)) => InitialSessionSelection::Model { model, reasoning_effort: None },
-            (None, None) => InitialSessionSelection::Default,
-            (Some(_), Some(_)) => {
-                return Err(CliError::ConflictingArgs("Cannot specify both --agent and --model".to_string()));
-            }
-        };
+        let selection = initial_selection(options.agent, options.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
         let mcp_config_sources = options
@@ -244,5 +243,175 @@ fn map_selection_error(error: AgentSelectionError) -> CliError {
         AgentSelectionError::Settings(error) => CliError::Settings(error),
         AgentSelectionError::Agent(error) => CliError::AgentError(error.to_string()),
         AgentSelectionError::Model(error) => CliError::ModelError(error),
+    }
+}
+
+/// Translate a `--agent` / `--model` pair into the corresponding
+/// `InitialSessionSelection`, returning the same conflict error the inline
+/// match produced. Used by both `RunConfig::from_args`,
+/// `RunConfig::from_options`, and `print_dry_run` to keep their selection
+/// rules identical.
+fn initial_selection(agent: Option<String>, model: Option<String>) -> Result<InitialSessionSelection, CliError> {
+    Ok(match (agent, model) {
+        (Some(agent), None) => InitialSessionSelection::Agent(agent),
+        (None, Some(model)) => InitialSessionSelection::Model { model, reasoning_effort: None },
+        (None, None) => InitialSessionSelection::Default,
+        (Some(_), Some(_)) => {
+            return Err(CliError::ConflictingArgs("Cannot specify both --agent and --model".to_string()));
+        }
+    })
+}
+
+/// Resolve the same configuration `RunConfig::from_args` resolves, but stop
+/// short of any prompt, session, telemetry, MCP, or provider work. The only
+/// side effect is `println` of the resolved model/profile/endpoint summary.
+///
+/// `--options-json` is accepted (so `--dry-run` works for harness callers
+/// that always pass it); the prompt it normally requires is intentionally
+/// skipped.
+fn print_dry_run(args: &HeadlessArgs) -> Result<(), CliError> {
+    let (cwd, settings, provider_connections, selection) = if let Some(json) = args.options_json.as_deref() {
+        let options: HeadlessOptions = serde_json::from_str(json).map_err(CliError::InvalidOptionsJson)?;
+        let cwd = options.cwd.unwrap_or_else(|| PathBuf::from(".")).canonicalize().map_err(CliError::IoError)?;
+        let settings_source = SettingsSourceArgs::from_json_options(options.settings, options.settings_file)?;
+        let settings = settings_source.load_settings(&cwd)?;
+        let provider_connections = ProviderConnectionOverrides::new(options.providers.unwrap_or_default());
+        let selection = initial_selection(options.agent, options.model)?;
+        (cwd, settings, provider_connections, selection)
+    } else {
+        let cwd = args.cwd.canonicalize().map_err(CliError::IoError)?;
+        let settings = args.settings_source.load_settings(&cwd)?;
+        let provider_connections = args.provider_connection.clone().into_overrides();
+        let selection = initial_selection(args.agent.clone(), args.model.clone())?;
+        (cwd, settings, provider_connections, selection)
+    };
+
+    let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections.clone(), &selection)
+        .map_err(map_selection_error)?;
+
+    println!("{}", resolved_summary(&resolved.spec, &provider_connections));
+    Ok(())
+}
+
+/// Format the three-line model/profile/endpoint summary printed by
+/// `aether headless --dry-run`.
+///
+/// `spec.provider_connections` already contains the merged CLI + settings
+/// overrides after resolution, but we still consult the caller-supplied
+/// `overrides` as a fallback in case future catalogs expose a different
+/// merge order. When neither carries a `base_url` for the resolved provider
+/// we print `(provider default)`.
+fn resolved_summary(spec: &AgentSpec, overrides: &ProviderConnectionOverrides) -> String {
+    let provider = spec.model.split(',').next().and_then(|first| first.split(':').next()).unwrap_or("");
+    let endpoint = spec
+        .provider_connections
+        .get(provider)
+        .and_then(|c| c.base_url.clone())
+        .or_else(|| overrides.get(provider).and_then(|c| c.base_url.clone()))
+        .unwrap_or_else(|| "(provider default)".to_string());
+    format!(
+        "model: {model}\nprofile: {profile}\nendpoint: {endpoint}",
+        model = spec.model,
+        profile = spec.name,
+        endpoint = endpoint
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_selection_rejects_both_agent_and_model() {
+        let error = initial_selection(Some("build".to_string()), Some("ollama:llama3.2".to_string()))
+            .expect_err("both --agent and --model must be rejected");
+        match error {
+            CliError::ConflictingArgs(message) => assert!(message.contains("--agent")),
+            other => panic!("expected ConflictingArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initial_selection_accepts_each_alone_and_neither() {
+        let agent = initial_selection(Some("build".to_string()), None).expect("agent-only selection resolves");
+        assert!(matches!(agent, InitialSessionSelection::Agent(name) if name == "build"));
+
+        let model =
+            initial_selection(None, Some("ollama:llama3.2".to_string())).expect("model-only selection resolves");
+        match model {
+            InitialSessionSelection::Model { model, reasoning_effort } => {
+                assert_eq!(model, "ollama:llama3.2");
+                assert!(reasoning_effort.is_none());
+            }
+            other => panic!("expected Model selection, got {other:?}"),
+        }
+
+        assert!(matches!(initial_selection(None, None), Ok(InitialSessionSelection::Default)));
+    }
+
+    #[test]
+    fn resolved_summary_prints_model_profile_and_endpoint() {
+        let model: llm::LlmModel = "ollama:llama3.2".parse().expect("model parses");
+        let mut spec = AgentSpec::bare(&model, None, Vec::new());
+        spec.name = "build".to_string();
+        spec.description = "Test build agent".to_string();
+        let ollama = ProviderConnectionOverride { base_url: Some("http://127.0.0.1:11434".to_string()), ..Default::default() };
+        let overrides = ProviderConnectionOverrides::new(BTreeMap::from([("ollama".to_string(), ollama)]));
+
+        let rendered = resolved_summary(&spec, &overrides);
+
+        assert!(rendered.contains("model: ollama:llama3.2"), "missing model line in:\n{rendered}");
+        assert!(rendered.contains("profile: build"), "missing profile line in:\n{rendered}");
+        assert!(rendered.contains("endpoint: http://127.0.0.1:11434"), "missing endpoint line in:\n{rendered}");
+        assert!(rendered.starts_with("model: "), "summary should start with the model line:\n{rendered}");
+    }
+
+    #[test]
+    fn resolved_summary_falls_back_to_overrides_map() {
+        let model: llm::LlmModel = "ollama:llama3.2".parse().expect("model parses");
+        let spec = AgentSpec::bare(&model, None, Vec::new());
+        // Empty spec-level overrides, populated caller-supplied map.
+        let ollama = ProviderConnectionOverride { base_url: Some("http://example.test:11434".to_string()), ..Default::default() };
+        let overrides = ProviderConnectionOverrides::new(BTreeMap::from([("ollama".to_string(), ollama)]));
+
+        let rendered = resolved_summary(&spec, &overrides);
+        assert!(
+            rendered.contains("endpoint: http://example.test:11434"),
+            "should fall back to override map:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn resolved_summary_uses_provider_default_when_no_url_configured() {
+        let model: llm::LlmModel = "anthropic:claude-sonnet-4-5".parse().expect("model parses");
+        let spec = AgentSpec::bare(&model, None, Vec::new());
+        let overrides = ProviderConnectionOverrides::default();
+
+        let rendered = resolved_summary(&spec, &overrides);
+        assert!(rendered.contains("endpoint: (provider default)"), "should report the provider default:\n{rendered}");
+    }
+
+    #[test]
+    fn resolved_summary_picks_first_provider_in_alloy_model() {
+        // Alloy specs are stored as comma-separated `provider:model` strings;
+        // they never go through `LlmModel::parse`, so construct the spec
+        // straight from the bare helper and then overwrite `.model` to the
+        // alloy form for this unit test.
+        let single: llm::LlmModel = "anthropic:claude-sonnet-4-5".parse().expect("single model parses");
+        let mut spec = AgentSpec::bare(&single, None, Vec::new());
+        spec.name = "router".to_string();
+        spec.model = "anthropic:claude-sonnet-4-5,openai:gpt-4".to_string();
+        // Provide an override for *both* providers; only the first (anthropic)
+        // should drive the printed endpoint, mirroring how alloy specs route.
+        let mut overrides = BTreeMap::new();
+        overrides.insert("anthropic".to_string(), ProviderConnectionOverride::url("https://anthropic.example.test"));
+        overrides.insert("openai".to_string(), ProviderConnectionOverride::url("https://openai.example.test"));
+        let overrides = ProviderConnectionOverrides::new(overrides);
+
+        let rendered = resolved_summary(&spec, &overrides);
+        assert!(
+            rendered.contains("endpoint: https://anthropic.example.test"),
+            "alloy spec should pick first provider's endpoint:\n{rendered}"
+        );
     }
 }
