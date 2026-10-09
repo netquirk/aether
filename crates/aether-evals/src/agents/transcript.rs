@@ -62,6 +62,13 @@ pub struct Transcript {
 pub struct ToolCall<'a> {
     pub name: &'a str,
     pub arguments: &'a str,
+    /// Exit code returned by the tool, when applicable.
+    ///
+    /// Populated for shell (bash) calls that produced a `ToolEvent::Result`
+    /// whose payload includes an `exitCode` field or whose display metadata
+    /// contains a `(exit N)` tail. `None` for non-shell tools, failed calls
+    /// (`ToolEvent::Error`), or results that carry no exit code.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Error)]
@@ -116,14 +123,21 @@ impl Transcript {
 
     pub fn all_tool_calls(&self) -> impl Iterator<Item = ToolCall<'_>> + '_ {
         self.events.iter().filter_map(|event| match event {
-            AgentEvent::Tool(ToolEvent::Result { result, .. }) => {
-                Some(ToolCall { name: &result.name, arguments: &result.arguments })
-            }
-            AgentEvent::Tool(ToolEvent::Error { error, .. }) => {
-                Some(ToolCall { name: &error.name, arguments: error.arguments.as_deref().unwrap_or("") })
-            }
+            AgentEvent::Tool(ToolEvent::Result { result, result_meta }) => Some(ToolCall {
+                name: &result.name,
+                arguments: &result.arguments,
+                exit_code: shell_exit_code(
+                    result_meta.as_ref().map(|meta| meta.display.value.as_str()),
+                    &result.result,
+                ),
+            }),
+            AgentEvent::Tool(ToolEvent::Error { error, .. }) => Some(ToolCall {
+                name: &error.name,
+                arguments: error.arguments.as_deref().unwrap_or(""),
+                exit_code: None,
+            }),
             AgentEvent::Tool(ToolEvent::Refused { request, .. }) => {
-                Some(ToolCall { name: &request.name, arguments: &request.arguments })
+                Some(ToolCall { name: &request.name, arguments: &request.arguments, exit_code: None })
             }
             _ => None,
         })
@@ -171,6 +185,55 @@ impl ToolCall<'_> {
     pub fn arguments_json(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::from_str(self.arguments)
     }
+}
+
+/// Extract the shell exit code from a `ToolEvent::Result`, if any.
+///
+/// The bash server records the exit code in two places: a structured
+/// `exitCode` field on the serialized result, and a `"(exit N)"` tail appended
+/// to the result's display metadata. Both can survive `maybe_spillover`'s head
+/// preview because the metadata always travels alongside the result and the
+/// preview keeps the prefix that contains `exitCode`.
+///
+/// The display detail is tried first because it is the most reliable source
+/// (a single line of text), then the structured payload as a fallback. Either
+/// source independently yields the same code when both are present.
+pub(crate) fn shell_exit_code(display_detail: Option<&str>, payload: &str) -> Option<i32> {
+    parse_exit_detail(display_detail?).or_else(|| parse_exit_code(payload))
+}
+
+/// Pull an exit code from a `<display-value>` trailing `(exit N)` segment.
+///
+/// Handles the standard bash form (`/path (exit 7)`) and the timed-out form
+/// (`/path (exit -1, timed out)`). Returns `None` for any other shape.
+fn parse_exit_detail(value: &str) -> Option<i32> {
+    let marker = " (exit ";
+    let index = value.rfind(marker)?;
+    let tail = &value[index + marker.len()..];
+    // Optional sign, then ASCII digits. The terminating `)` may be followed by
+    // either end-of-string or `, timed out)`, so scan past both.
+    let bytes = tail.as_bytes();
+    let (sign, start) = match bytes.first() {
+        Some(b'-') => (-1, 1),
+        _ => (1, 0),
+    };
+    let end =
+        bytes[start..].iter().position(|byte| !byte.is_ascii_digit()).map_or(bytes.len(), |offset| start + offset);
+    let digits = &tail[start..end];
+    let parsed: i32 = digits.parse().ok()?;
+    Some(sign * parsed)
+}
+
+/// Pull an exit code from a bash result payload that contains an `exitCode`
+/// key, regardless of whether the payload is serialized as YAML or JSON.
+///
+/// The tool bridge serializes tool results as YAML for token efficiency, but
+/// downstream tools that bypass it (tests, mocks, other servers) may emit
+/// JSON. Both round-trip cleanly through `serde_yml::from_str::<Value>`.
+fn parse_exit_code(payload: &str) -> Option<i32> {
+    let value = serde_yml::from_str::<serde_json::Value>(payload).ok()?;
+    let exit_code = value.get("exitCode")?.as_i64()?;
+    i32::try_from(exit_code).ok()
 }
 
 impl TranscriptError {
@@ -287,16 +350,43 @@ mod tests {
 
     #[test]
     fn tool_call_arguments_json_parses_arguments() {
-        let call = ToolCall { name: "bash", arguments: r#"{"command":"pwd"}"# };
+        let call = ToolCall { name: "bash", arguments: r#"{"command":"pwd"}"#, exit_code: None };
 
         assert_eq!(call.arguments_json().unwrap(), serde_json::json!({ "command": "pwd" }));
     }
 
     #[test]
     fn tool_call_arguments_json_returns_error_for_invalid_json() {
-        let call = ToolCall { name: "bash", arguments: "not json" };
+        let call = ToolCall { name: "bash", arguments: "not json", exit_code: None };
 
         assert!(call.arguments_json().is_err());
+    }
+
+    #[test]
+    fn tool_call_records_a_non_zero_shell_exit_code() {
+        let transcript = transcript_with_events(vec![bash_tool_result(
+            "output: nope\nexitCode: 7\nkilled: false\n",
+            Some(r"echo nope 1>&2; exit 7 (exit 7)"),
+        )]);
+
+        let bash_call = transcript.tool_calls("bash").next().expect("bash should be called");
+        assert_eq!(bash_call.exit_code, Some(7));
+    }
+
+    #[test]
+    fn tool_call_exit_code_is_none_when_payload_lacks_it() {
+        let transcript = transcript_with_events(vec![bash_tool_result("plain text result", None)]);
+
+        let bash_call = transcript.tool_calls("bash").next().expect("bash should be called");
+        assert_eq!(bash_call.exit_code, None);
+    }
+
+    #[test]
+    fn tool_call_exit_code_is_none_when_payload_records_a_failure() {
+        let transcript = transcript_with_events(vec![tool_error("bash")]);
+
+        let bash_call = transcript.tool_calls("bash").next().expect("bash should be called");
+        assert_eq!(bash_call.exit_code, None);
     }
 
     #[test]
@@ -365,6 +455,29 @@ mod tests {
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git").arg("-C").arg(repo).args(args).output().expect("git invocation");
         assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn bash_tool_result(payload: &str, display_value: Option<&str>) -> AgentEvent {
+        AgentEvent::Tool(ToolEvent::Result {
+            result: ToolCallResult {
+                id: "call_bash".to_string(),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+                result: payload.to_string(),
+            },
+            result_meta: display_value.map(|value| mcp_utils::display_meta::ToolDisplayMeta::new("Ran", value).into()),
+        })
+    }
+
+    fn tool_error(name: &str) -> AgentEvent {
+        AgentEvent::Tool(ToolEvent::Error {
+            error: llm::ToolCallError {
+                id: format!("{name}_err"),
+                name: name.to_string(),
+                arguments: Some("{}".to_string()),
+                error: "boom".to_string(),
+            },
+        })
     }
 
     fn refused_tool_call(name: &str, reason: &str) -> AgentEvent {
