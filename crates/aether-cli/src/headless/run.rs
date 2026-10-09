@@ -77,7 +77,9 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     // promise the file is on disk; a mid-run write error is reported but
     // does not fail the run.
     let mut transcript = match &config.transcript_jsonl {
-        Some(path) => Some(JsonlTranscript::create(path).map_err(CliError::IoError)?),
+        Some(path) => {
+            Some(JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes).map_err(CliError::IoError)?)
+        }
         None => None,
     };
 

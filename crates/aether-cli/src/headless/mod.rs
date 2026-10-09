@@ -71,6 +71,12 @@ pub struct RunConfig {
     /// so a filtered run still gets a complete transcript. The run's stdout
     /// stays human-readable.
     pub transcript_jsonl: Option<PathBuf>,
+    /// When set together with `transcript_jsonl`, the transcript is rotated
+    /// to `<stem>.1` once a complete line would push the file at or past
+    /// this many bytes; the previous sibling is overwritten on each
+    /// rotation so exactly one previous file is kept. `None` and `Some(0)`
+    /// both disable rotation. No effect when `transcript_jsonl` is `None`.
+    pub transcript_max_bytes: Option<u64>,
     /// Top-level `toolOutput` block from the loaded settings. Threaded into
     /// the runtime via [`crate::runtime::RuntimeBuilder::settings_tool_output`]
     /// so the MCP runtime can resolve the cap together with the per-agent
@@ -112,6 +118,8 @@ pub struct HeadlessOptions {
     pub trace_context: Option<AgentTraceContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_jsonl: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_max_bytes: Option<u64>,
 }
 
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
@@ -190,6 +198,13 @@ pub struct HeadlessArgs {
     /// run's stdout stays human-readable. The file is truncated on open.
     #[arg(long = "transcript-jsonl", value_name = "PATH")]
     pub transcript_jsonl: Option<PathBuf>,
+
+    /// Rotate the transcript to `<stem>.1` when it reaches this many bytes;
+    /// the previous sibling is overwritten on each rotation. `0` or
+    /// omitted disables rotation. Only meaningful together with
+    /// `--transcript-jsonl`.
+    #[arg(long = "transcript-max-bytes", value_name = "BYTES")]
+    pub transcript_max_bytes: Option<u64>,
 }
 
 impl RunConfig {
@@ -225,6 +240,7 @@ impl RunConfig {
             trace_context: None,
             settings_tool_output,
             transcript_jsonl: args.transcript_jsonl,
+            transcript_max_bytes: args.transcript_max_bytes,
         })
     }
 
@@ -262,6 +278,7 @@ impl RunConfig {
             trace_context: options.trace_context,
             settings_tool_output,
             transcript_jsonl: options.transcript_jsonl,
+            transcript_max_bytes: options.transcript_max_bytes,
         })
     }
 }

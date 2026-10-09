@@ -109,6 +109,87 @@ async fn transcript_jsonl_records_one_object_per_kinded_event() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn transcript_jsonl_rotates_when_max_bytes_is_reached() {
+    // Drives the same single-turn fake-provider run as the tests above, but
+    // opens the writer with `create_with_max_bytes(..., Some(1))` so every
+    // record crosses the rotation threshold. The acceptance criterion from
+    // TASK-24-279 is: "a run produces transcript.1 and then a fresh
+    // transcript" — we assert both halves:
+    //   1. the rotated sibling exists and holds the *previous* transcript,
+    //   2. the live transcript is freshly empty (every rotation truncates
+    //      the live file), so it starts empty between writes.
+    let provider = FakeLlmProvider::new(vec![vec![LlmResponse::Start, LlmResponse::text("hi"), LlmResponse::done()]])
+        .with_display_name("fake:transcript-rotate");
+
+    let (tx, rx, _handle) = agent(provider).spawn().await.unwrap();
+    let events = drive_to_completion(rx, tx, "hi").await;
+    let kinded_count = events.iter().filter(|event| has_cli_event_kind(event)).count();
+    assert!(kinded_count >= 2, "a single-turn run must yield at least two kinded events; got {kinded_count}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transcript.jsonl");
+    let rotated = path.with_extension("1");
+
+    // `Some(1)` ensures every record crosses the threshold, so the rotated
+    // sibling holds the most-recent single-record snapshot and the live file
+    // is empty (it just got truncated by the most recent rotation).
+    let mut transcript = JsonlTranscript::create_with_max_bytes(&path, Some(1)).expect("create writer");
+    for event in &events {
+        transcript.record(event).expect("record writes");
+    }
+    transcript.flush().expect("flush");
+
+    assert!(rotated.exists(), "transcript.1 sibling must exist after rotation; path={rotated:?}");
+    let rotated_lines = parse_transcript(&rotated);
+    assert_eq!(
+        rotated_lines.len(),
+        1,
+        "rotated sibling holds exactly one record (the most recent before rotation); got {} records: {:?}",
+        rotated_lines.len(),
+        rotated_lines.iter().map(|(_, kind, _)| kind.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(rotated_lines[0].1, "turn_ended", "the rotated sibling holds the last record of the run");
+
+    // The live file is freshly empty: every record triggered rotation, and
+    // rotation truncates the live file. `flush()` after the last record
+    // only flushes the now-empty BufWriter of the freshly truncated live
+    // file.
+    let live_contents = std::fs::read_to_string(&path).expect("read live");
+    assert!(
+        live_contents.is_empty(),
+        "live transcript must be empty after every record triggers rotation; got {live_contents:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transcript_jsonl_does_not_rotate_without_max_bytes() {
+    // Regression guard: when no rotation threshold is configured the
+    // existing semantics (one growing transcript, no sibling) hold. This
+    // runs the same fixture as the rotation test above but with `None` so
+    // the sibling file must not appear.
+    let provider = FakeLlmProvider::new(vec![vec![LlmResponse::Start, LlmResponse::text("hi"), LlmResponse::done()]])
+        .with_display_name("fake:transcript-no-rotate");
+
+    let (tx, rx, _handle) = agent(provider).spawn().await.unwrap();
+    let events = drive_to_completion(rx, tx, "hi").await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transcript.jsonl");
+    let rotated = path.with_extension("1");
+
+    let mut transcript = JsonlTranscript::create_with_max_bytes(&path, None).expect("create writer");
+    for event in &events {
+        transcript.record(event).expect("record writes");
+    }
+    transcript.flush().expect("flush");
+
+    assert!(!rotated.exists(), "no rotated sibling must exist when threshold is None");
+    let parsed = parse_transcript(&path);
+    let expected = events.iter().filter(|event| has_cli_event_kind(event)).count();
+    assert_eq!(parsed.len(), expected, "all kinded events live in the unrotated transcript");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn transcript_jsonl_lines_round_trip_through_serde_json() {
     // Each line must be exactly one JSON object: parse with the public
     // AgentEvent schema to catch any tag that drifts from the wire format.
