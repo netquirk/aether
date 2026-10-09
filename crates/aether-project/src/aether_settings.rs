@@ -1237,6 +1237,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_top_level_field_and_names_it() {
+        let err = AetherSettings::try_from(
+            json!({
+                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))],
+                "completelyMadeUpKey": 42
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap_err();
+
+        match &err {
+            SettingsError::ParseError(message) => assert!(
+                message.contains("completelyMadeUpKey"),
+                "expected the unknown key name in the parse error, got: {message}"
+            ),
+            _ => panic!("expected SettingsError::ParseError, got: {err}"),
+        }
+    }
+
+    #[test]
+    fn load_default_rejects_unknown_top_level_field_and_names_it() {
+        let project = project().file(
+            ".aether/settings.json",
+            &json!({
+                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))],
+                "mysteryToggle": true
+            })
+            .to_string(),
+        );
+
+        let err = AetherSettings::load_default(project.root()).unwrap_err();
+
+        match &err {
+            SettingsError::ParseError(message) => assert!(
+                message.contains("mysteryToggle"),
+                "load_default must surface the offending key, got: {message}"
+            ),
+            _ => panic!("expected SettingsError::ParseError, got: {err}"),
+        }
+    }
+
+    #[test]
     fn load_default_resolves_workspace_scoped_user_prompt_and_mcp_paths() {
         let project = project().file("AGENTS.md", "Agent instructions").file(".aether/mcp.json", r#"{"servers":{}}"#);
         let home = home().file(".aether/agents/planner/SYSTEM.md", "System instructions").settings(
