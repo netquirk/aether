@@ -2,6 +2,7 @@ use aether_auth::OAuthError;
 use aether_project::SettingsError;
 use aether_telemetry::TelemetryInitError;
 use std::io;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,6 +25,8 @@ pub enum CliError {
     McpError(String),
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
+    #[error("failed to read system prompt from {path}: {source}")]
+    SystemPromptFile { path: PathBuf, source: io::Error },
     #[error("Agent error: {0}")]
     AgentError(String),
     #[error("Credential store error: {0}")]

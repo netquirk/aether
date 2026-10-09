@@ -88,6 +88,8 @@ pub struct HeadlessOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbose: Option<bool>,
@@ -151,6 +153,10 @@ pub struct HeadlessArgs {
     #[arg(long = "system-prompt")]
     pub system_prompt: Option<String>,
 
+    /// Read the additional system prompt from a file
+    #[arg(long = "system-prompt-file", value_name = "PATH", conflicts_with = "system_prompt")]
+    pub system_prompt_file: Option<PathBuf>,
+
     /// Output format
     #[arg(long, default_value = "text")]
     pub output: OutputFormat,
@@ -188,7 +194,7 @@ impl RunConfig {
             mcp_config_sources,
             spec: resolved.spec,
             agent_catalog: resolved.catalog,
-            system_prompt: args.system_prompt,
+            system_prompt: resolve_system_prompt(args.system_prompt, args.system_prompt_file)?,
             output: args.output,
             verbose: args.verbose,
             events: args.events,
@@ -222,7 +228,7 @@ impl RunConfig {
             mcp_config_sources,
             spec: resolved.spec,
             agent_catalog: resolved.catalog,
-            system_prompt: options.system_prompt,
+            system_prompt: resolve_system_prompt(options.system_prompt, options.system_prompt_file)?,
             output: options.output.unwrap_or(OutputFormat::Text),
             verbose: options.verbose.unwrap_or(false),
             events: options.events.unwrap_or_default(),
@@ -236,6 +242,22 @@ impl RunConfig {
 fn resolve_prompt(args: &HeadlessArgs) -> Result<String, CliError> {
     let explicit = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
     prompt_or_stdin(explicit).map_err(CliError::IoError)?.ok_or(CliError::NoPrompt)
+}
+
+/// Resolve the system prompt from either an inline string or a file path.
+/// Returns `Ok(None)` when neither is provided. A missing or unreadable file
+/// becomes `CliError::SystemPromptFile`, whose display message names the path.
+fn resolve_system_prompt(text: Option<String>, file: Option<PathBuf>) -> Result<Option<String>, CliError> {
+    match (text, file) {
+        (Some(_), Some(_)) => {
+            Err(CliError::ConflictingArgs("Cannot specify both --system-prompt and --system-prompt-file".to_string()))
+        }
+        (Some(text), None) => Ok(Some(text)),
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).map(Some).map_err(|source| CliError::SystemPromptFile { path, source })
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn map_selection_error(error: AgentSelectionError) -> CliError {
@@ -332,6 +354,70 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_file_contents_become_the_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("system.txt");
+        std::fs::write(&path, "you are a helpful agent\n").expect("write file");
+
+        let resolved = resolve_system_prompt(None, Some(path.clone())).expect("file resolves");
+        assert_eq!(resolved.as_deref(), Some("you are a helpful agent\n"));
+    }
+
+    #[test]
+    fn system_prompt_inline_string_is_returned_verbatim() {
+        let resolved = resolve_system_prompt(Some("inline".to_string()), None).expect("inline resolves");
+        assert_eq!(resolved.as_deref(), Some("inline"));
+    }
+
+    #[test]
+    fn missing_system_prompt_file_names_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-such-prompt.txt");
+        let path_for_assert = path.clone();
+
+        let error = resolve_system_prompt(None, Some(path)).expect_err("missing file must fail");
+
+        match error {
+            CliError::SystemPromptFile { path, source: _ } => {
+                assert_eq!(path, path_for_assert);
+            }
+            other => panic!("expected SystemPromptFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_system_prompt_file_message_includes_path_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.txt");
+
+        let error = resolve_system_prompt(None, Some(path.clone())).expect_err("missing file must fail");
+        let rendered = error.to_string();
+        let expected = path.to_string_lossy().into_owned();
+
+        assert!(rendered.contains(&expected), "message {rendered:?} must contain the path {expected:?}");
+    }
+
+    #[test]
+    fn both_system_prompt_sources_conflict() {
+        let error = resolve_system_prompt(Some("inline".to_string()), Some(PathBuf::from("prompt.txt")))
+            .expect_err("both sources must be rejected");
+
+        match error {
+            CliError::ConflictingArgs(message) => {
+                assert!(message.contains("--system-prompt"));
+                assert!(message.contains("--system-prompt-file"));
+            }
+            other => panic!("expected ConflictingArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_system_prompt_source_returns_none() {
+        let resolved = resolve_system_prompt(None, None).expect("no sources resolves");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
     fn initial_selection_accepts_each_alone_and_neither() {
         let agent = initial_selection(Some("build".to_string()), None).expect("agent-only selection resolves");
         assert!(matches!(agent, InitialSessionSelection::Agent(name) if name == "build"));
@@ -355,7 +441,8 @@ mod tests {
         let mut spec = AgentSpec::bare(&model, None, Vec::new());
         spec.name = "build".to_string();
         spec.description = "Test build agent".to_string();
-        let ollama = ProviderConnectionOverride { base_url: Some("http://127.0.0.1:11434".to_string()), ..Default::default() };
+        let ollama =
+            ProviderConnectionOverride { base_url: Some("http://127.0.0.1:11434".to_string()), ..Default::default() };
         let overrides = ProviderConnectionOverrides::new(BTreeMap::from([("ollama".to_string(), ollama)]));
 
         let rendered = resolved_summary(&spec, &overrides);
@@ -371,7 +458,10 @@ mod tests {
         let model: llm::LlmModel = "ollama:llama3.2".parse().expect("model parses");
         let spec = AgentSpec::bare(&model, None, Vec::new());
         // Empty spec-level overrides, populated caller-supplied map.
-        let ollama = ProviderConnectionOverride { base_url: Some("http://example.test:11434".to_string()), ..Default::default() };
+        let ollama = ProviderConnectionOverride {
+            base_url: Some("http://example.test:11434".to_string()),
+            ..Default::default()
+        };
         let overrides = ProviderConnectionOverrides::new(BTreeMap::from([("ollama".to_string(), ollama)]));
 
         let rendered = resolved_summary(&spec, &overrides);
