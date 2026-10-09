@@ -1,6 +1,73 @@
 use crate::model::{SessionEvent, UserEvent};
-use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, ToolEvent, TurnEvent, task_created_result};
-use llm::{AssistantReasoning, ChatMessage, Context, MessageId, ToolCallError, ToolCallResult};
+use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, ToolEvent, TurnEvent, TurnOutcome, task_created_result};
+use llm::{AssistantReasoning, ChatMessage, Context, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallResult};
+use serde::{Deserialize, Serialize};
+
+/// One turn in a run transcript, recording the model that served it.
+///
+/// A turn is anchored by its terminal [`TurnEvent::Ended`] event; the recorded
+/// model is the first chat-purpose [`TurnEvent::LlmCallStarted`] between the
+/// previous `Ended` (or the start of the stream) and the closing `Ended`.
+/// Turns whose `LlmCallStarted` did not survive persistence, or that had no
+/// chat call, are still recorded but their model fields are `None`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEntry {
+    /// 0-based index of the turn in the order it completed.
+    pub turn_index: usize,
+    /// The terminal outcome the agent reached for the turn.
+    pub outcome: TurnOutcome,
+    /// The provider name for the model that served the turn, if recorded.
+    pub provider: Option<String>,
+    /// The model id for the model that served the turn, if recorded.
+    pub model_id: Option<String>,
+    /// The display name the provider reported for the model.
+    pub display_name: Option<String>,
+}
+
+/// Builds a turn-by-turn transcript view from a run's persisted events.
+///
+/// A turn is the run between two terminal [`TurnEvent::Ended`] events
+/// (or from the start of the stream to the first `Ended`). Turns that never
+/// reach an `Ended` event are dropped, because their outcome is unknown. The
+/// recorded model is the first chat-purpose [`TurnEvent::LlmCallStarted`]
+/// in the turn; a turn with no chat call (or none that survived
+/// persistence) records `None` for its model fields.
+pub fn turn_entries_from_events(events: &[SessionEvent]) -> Vec<TurnEntry> {
+    let mut entries: Vec<TurnEntry> = Vec::new();
+    let mut turn_index: usize = 0;
+    let mut next_chat_identity: Option<&ModelIdentity> = None;
+    let mut next_chat_display_name: Option<&str> = None;
+
+    for event in events {
+        if let SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallStarted {
+            purpose: LlmCallPurpose::Chat,
+            model,
+            display_name,
+            ..
+        })) = event
+        {
+            if next_chat_identity.is_none() {
+                next_chat_identity = Some(model);
+                next_chat_display_name = Some(display_name.as_str());
+            }
+            continue;
+        }
+        if let SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Ended { outcome })) = event {
+            let identity = next_chat_identity.take();
+            let display_name = next_chat_display_name.take().map(str::to_string);
+            entries.push(TurnEntry {
+                turn_index,
+                outcome: outcome.clone(),
+                provider: identity.and_then(|id| id.provider.clone()),
+                model_id: identity.and_then(|id| id.model_id.clone()),
+                display_name,
+            });
+            turn_index += 1;
+        }
+    }
+    entries
+}
 
 pub fn context_from_events(events: &[SessionEvent]) -> Context {
     let mut context = Context::new(vec![], vec![]);

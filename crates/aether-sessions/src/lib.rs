@@ -17,4 +17,4 @@ pub use model::{SessionControlEvent, SessionEvent, SessionMeta, UserEvent, last_
 pub use store::{
     DiscoveredSessionFile, FileFingerprint, ScanLimits, SessionStore, SessionSummary, discover_session_files,
 };
-pub use transcript::{context_from_events, conversation_messages_from_events};
+pub use transcript::{TurnEntry, context_from_events, conversation_messages_from_events, turn_entries_from_events};

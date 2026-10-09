@@ -1,9 +1,15 @@
-use aether_core::events::{AgentEvent, ContextEvent, TurnOutcome};
+use aether_core::events::{AgentEvent, ContextEvent, LlmCallOutcome, TurnEvent, TurnOutcome};
+use aether_core::testing::{TestScenario, test_agent};
 use aether_sessions::testing::{
-    agent_switched, assistant_text, compaction_result, partial_text, tool_call, tool_error, tool_result, turn_ended,
-    user_message,
+    agent_switched, assistant_text, compaction_result, llm_call_started, partial_text, tool_call, tool_error, tool_result,
+    turn_ended, user_message,
 };
-use aether_sessions::{SessionEvent, context_from_events, conversation_messages_from_events};
+use aether_sessions::{
+    SessionEvent, TurnEntry, context_from_events, conversation_messages_from_events, turn_entries_from_events,
+};
+use llm::LlmCallPurpose;
+use llm::testing::FakeLlmProvider;
+use llm::testing::llm_response;
 
 #[test]
 fn reconstruction_preserves_stored_message_identity() {
@@ -144,4 +150,122 @@ fn complete_messages_are_reconstructed_but_streaming_chunks_are_not() {
 
     assert_eq!(context.message_count(), 1);
     assert!(matches!(&context.messages()[0], llm::ChatMessage::Assistant { content, .. } if content == "complete"));
+}
+
+#[test]
+fn turn_entries_name_each_turns_model_from_persisted_events() {
+    let events = vec![
+        // Turn 1: served by codex:gpt-5.5
+        SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Started { content: vec![] })),
+        llm_call_started(LlmCallPurpose::Chat, Some("codex"), Some("gpt-5.5"), "codex"),
+        SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+        })),
+        assistant_text("m1", "first answer"),
+        turn_ended(TurnOutcome::Completed),
+        // Turn 2: served by anthropic:claude-opus-4-6
+        SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Started { content: vec![] })),
+        llm_call_started(LlmCallPurpose::Chat, Some("anthropic"), Some("claude-opus-4-6"), "Anthropic"),
+        SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+        })),
+        assistant_text("m2", "second answer"),
+        turn_ended(TurnOutcome::Failed { error: "boom".into() }),
+    ];
+
+    let entries = turn_entries_from_events(&events);
+    assert_eq!(entries.len(), 2);
+
+    assert_eq!(
+        entries[0],
+        TurnEntry {
+            turn_index: 0,
+            outcome: TurnOutcome::Completed,
+            provider: Some("codex".into()),
+            model_id: Some("gpt-5.5".into()),
+            display_name: Some("codex".into()),
+        }
+    );
+    assert_eq!(
+        entries[1],
+        TurnEntry {
+            turn_index: 1,
+            outcome: TurnOutcome::Failed { error: "boom".into() },
+            provider: Some("anthropic".into()),
+            model_id: Some("claude-opus-4-6".into()),
+            display_name: Some("Anthropic".into()),
+        }
+    );
+}
+
+#[test]
+fn turn_entries_record_turns_without_a_chat_call_with_no_model() {
+    // A turn that emitted no LlmCallStarted (e.g. an empty or aborted turn) is
+    // still recorded: a transcript entry for a turn whose model is unknown is
+    // more useful than a gap, so the reader can see the turn happened.
+    let events = vec![
+        turn_ended(TurnOutcome::Completed),
+        SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Started { content: vec![] })),
+        llm_call_started(LlmCallPurpose::Chat, Some("openai"), Some("gpt-5.5"), "OpenAI"),
+        assistant_text("m", "ok"),
+        turn_ended(TurnOutcome::Completed),
+    ];
+
+    let entries = turn_entries_from_events(&events);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].provider, None);
+    assert_eq!(entries[0].model_id, None);
+    assert_eq!(entries[0].turn_index, 0);
+    assert_eq!(entries[1].provider.as_deref(), Some("openai"));
+    assert_eq!(entries[1].model_id.as_deref(), Some("gpt-5.5"));
+    assert_eq!(entries[1].turn_index, 1);
+}
+
+#[tokio::test]
+async fn persisted_transcript_records_each_turns_model_across_a_switch() {
+    // First turn uses the openai model; second turn uses the anthropic one.
+    let initial: llm::LlmModel = "openai:gpt-5.5".parse().expect("model parses");
+    let switched: llm::LlmModel = "anthropic:claude-opus-4-6".parse().expect("model parses");
+
+    let second_provider =
+        FakeLlmProvider::with_single_response(llm_response().text(&["after switch"]).build())
+            .with_model(switched.clone())
+            .with_display_name("Anthropic");
+
+    let events = test_agent()
+        .without_mcp()
+        .model(initial.clone())
+        .llm_responses(&[llm_response().text(&["first"]).build()])
+        .scenario(
+            TestScenario::new()
+                .user_text("hi")
+                .wait_for_turn_end()
+                .switch_model(second_provider)
+                .user_text("after switch")
+                .wait_for_turn_end(),
+        )
+        .run()
+        .await
+        .expect("agent run succeeds");
+
+    let mut persisted: Vec<SessionEvent> = vec![user_message("hi")];
+    persisted.extend(events.iter().cloned().map(SessionEvent::Agent));
+    let store = aether_sessions::testing::TestStore::new().session("mixed", &persisted);
+
+    // Read the events back from disk so the assertions are over what the
+    // run transcript would actually contain after a reload.
+    let (_, reloaded) = store.store().load("mixed").expect("session loads");
+    let entries = turn_entries_from_events(&reloaded);
+
+    assert_eq!(entries.len(), 2, "two turns were run: {entries:?}");
+    assert_eq!(entries[0].turn_index, 0);
+    assert_eq!(entries[0].provider.as_deref(), Some(initial.provider()));
+    assert_eq!(entries[0].model_id.as_deref(), Some(initial.model_id().as_ref()));
+    assert_eq!(entries[0].outcome, TurnOutcome::Completed);
+    assert_eq!(entries[1].turn_index, 1);
+    assert_eq!(entries[1].provider.as_deref(), Some(switched.provider()));
+    assert_eq!(entries[1].model_id.as_deref(), Some(switched.model_id().as_ref()));
+    assert_eq!(entries[1].outcome, TurnOutcome::Completed);
 }

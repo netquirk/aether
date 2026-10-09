@@ -7,7 +7,9 @@ use std::fs;
 use std::path::Path;
 
 use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, StreamState, ToolEvent, TurnEvent, TurnOutcome};
-use llm::{ContentBlock, MessageId, ToolCallError, ToolCallRequest, ToolCallResult};
+use llm::{
+    ContentBlock, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallRequest, ToolCallResult,
+};
 use tempfile::TempDir;
 
 use crate::model::{SessionControlEvent, SessionEvent, SessionMeta, UserEvent};
@@ -76,6 +78,26 @@ pub fn tool_error(id: &str, name: &str, error: &str) -> SessionEvent {
 /// The terminal event of a turn.
 pub fn turn_ended(outcome: TurnOutcome) -> SessionEvent {
     SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Ended { outcome }))
+}
+
+/// A `LlmCallStarted` turn event recording the model that served the call.
+pub fn llm_call_started(
+    purpose: LlmCallPurpose,
+    provider: Option<&str>,
+    model_id: Option<&str>,
+    display_name: &str,
+) -> SessionEvent {
+    SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallStarted {
+        purpose,
+        model: ModelIdentity {
+            provider: provider.map(str::to_string),
+            model_id: model_id.map(str::to_string),
+            pricing: None,
+        },
+        display_name: display_name.to_string(),
+        attempt: 0,
+        max_attempts: 1,
+    }))
 }
 
 /// A control event recording an agent switch.

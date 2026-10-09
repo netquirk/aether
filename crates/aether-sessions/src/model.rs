@@ -79,6 +79,7 @@ impl SessionEvent {
                     TurnEvent::RetryScheduled { .. }
                     | TurnEvent::AutoContinue { .. }
                     | TurnEvent::Ended { .. }
+                    | TurnEvent::LlmCallStarted { .. }
                     | TurnEvent::LlmCallEnded { outcome: LlmCallOutcome::Failed { .. }, .. },
                 )
                 | AgentEvent::Context(
@@ -101,7 +102,6 @@ impl SessionEvent {
                 )
                 | AgentEvent::Turn(
                     TurnEvent::Started { .. }
-                    | TurnEvent::LlmCallStarted { .. }
                     | TurnEvent::LlmCallEnded {
                         outcome: LlmCallOutcome::Completed { .. } | LlmCallOutcome::Cancelled,
                         ..
