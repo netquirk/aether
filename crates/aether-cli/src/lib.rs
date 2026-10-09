@@ -11,6 +11,7 @@ pub mod init;
 pub mod mcp_command;
 pub mod mcp_config_args;
 pub mod output;
+pub(crate) mod progress;
 pub(crate) mod prompt;
 pub mod provider_connection_args;
 pub mod resolve;

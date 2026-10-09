@@ -21,6 +21,7 @@ use crate::workspace::warn_if_not_a_repository;
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
 use crate::output::{OutputFormat, RetryTracker, TurnTimings, print_message, print_run_usage, print_turn_summary};
+use crate::progress::{ToolProgressReporter, tool_progress_update};
 use crate::run_usage::RunUsage;
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
@@ -122,6 +123,10 @@ async fn stream_output(
     let mut changes = FileChanges::default();
     let mut summary = RunSummary::default();
     let mut exit_code = ExitCode::SUCCESS;
+    // Live stderr progress line naming the tool currently executing. Like
+    // `timings`/`usage`, it is fed every event so a `--events`-filtered run
+    // still updates the status line.
+    let mut progress = ToolProgressReporter::new(io::stderr());
 
     while let Some(msg) = rx.recv().await {
         if let AgentEvent::SessionUsage(sample) = &msg {
@@ -142,6 +147,17 @@ async fn stream_output(
         // filtered run still reports how many turns and tool calls happened.
         summary.record(&msg);
 
+        // Update the live stderr progress line (Text mode only — Json/Pretty
+        // are machine-readable and must not be polluted with control codes).
+        // Fed every event, like `timings`/`usage`, so a filtered run still
+        // reflects the tool currently executing.
+        if matches!(format, OutputFormat::Text)
+            && let Some(update) = tool_progress_update(&msg)
+            && let Err(error) = progress.apply(update)
+        {
+            eprintln!("Failed to write tool progress: {error}");
+        }
+
         match &msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
             AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
@@ -156,6 +172,9 @@ async fn stream_output(
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
             eprintln!("Failed to serialize headless event: {error}");
+            // Clear the live progress line so we do not leave a half-written
+            // status row on stderr if the loop exits early.
+            let _ = progress.clear();
             return (ExitCode::FAILURE, changes, summary);
         }
 
@@ -172,6 +191,9 @@ async fn stream_output(
     }
 
     let run_total_elapsed = run_started_at.elapsed();
+    // Erase the live progress line so it does not bleed into the turn/run
+    // summary printed just below; clear() is a no-op when no line is active.
+    let _ = progress.clear();
     print_turn_summary(format, &timings, Some(run_total_elapsed));
     print_run_usage(format, &usage);
     (exit_code, changes, summary)
