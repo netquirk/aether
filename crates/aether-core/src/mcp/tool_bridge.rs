@@ -123,12 +123,14 @@ fn maybe_spillover(tool_id: &str, result: String, max_bytes: usize, dir: &Path) 
         return result;
     }
 
-    let preview_end = result.floor_char_boundary(SPILLOVER_PREVIEW_BYTES);
+    let preview_budget = SPILLOVER_PREVIEW_BYTES.min(max_bytes);
+    let preview_end = result.floor_char_boundary(preview_budget);
     let preview = &result[..preview_end];
     let total_bytes = result.len();
+    let dropped = total_bytes - preview_end;
 
     format!(
-        "<preview>\n{preview}\n</preview>\n\n[Tool result too large ({total_bytes} bytes). Full output saved to {path}. Use grep, read, or tail to explore the full result.]",
+        "<preview>\n{preview}\n</preview>\n\n[Tool result too large ({total_bytes} bytes; {dropped} bytes dropped). Full output saved to {path}. Use grep, read, or tail to explore the full result.]",
         path = file_path.display()
     )
 }
@@ -446,5 +448,48 @@ mod tests {
         for expected in ["<preview>", "Tool result too large", "spill_integration.txt"] {
             assert!(result.result.contains(expected));
         }
+    }
+
+    /// Oversized tool results must be cut to the configured byte cap and the
+    /// returned text must explicitly mark how many bytes were dropped.
+    #[test]
+    fn oversized_tool_result_is_truncated_to_cap_and_marked() {
+        let request =
+            ToolCallRequest { id: "oversized_cap_marker".into(), name: "big_tool".into(), arguments: "{}".into() };
+        // Order the fields so the trailing sentinel comes *after* the large `data`
+        // blob. With `SPILLOVER_PREVIEW_BYTES` (10_000) smaller than the data,
+        // the preview only contains the leading fields and TAIL_SENTINEL is cut.
+        let payload = json!({
+            "head": "HEAD_SENTINEL",
+            "data": "x".repeat(TOOL_RESULT_MAX_BYTES + 1000),
+            "tail": "TAIL_SENTINEL",
+        });
+        let mut mcp = McpCallToolResult::structured(payload);
+        mcp.content = vec![];
+        let (result, _) = mcp_result_to_tool_call_result(&request, mcp).unwrap();
+
+        // 1. The configured byte cap is enforced on the text that reaches the model.
+        assert!(
+            result.result.len() <= TOOL_RESULT_MAX_BYTES,
+            "result length {} exceeds configured cap {}",
+            result.result.len(),
+            TOOL_RESULT_MAX_BYTES,
+        );
+
+        // 2. The truncation is marked explicitly, naming both the total size and the drop.
+        assert!(
+            result.result.contains("Tool result too large"),
+            "missing 'Tool result too large' marker in: {}",
+            result.result,
+        );
+        assert!(result.result.contains("bytes dropped"), "missing 'bytes dropped' phrase in marker: {}", result.result);
+
+        // 3. The head sentinel survives, the tail sentinel was actually cut.
+        assert!(result.result.contains("HEAD_SENTINEL"));
+        assert!(
+            !result.result.contains("TAIL_SENTINEL"),
+            "tail sentinel should have been dropped, got: {}",
+            result.result,
+        );
     }
 }
