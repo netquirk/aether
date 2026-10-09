@@ -322,6 +322,8 @@ mod tests {
                     auth_mode: Some(crate::ProviderAuthMode::None),
                     request_model: Some("production-coding".to_string()),
                     inference_profile_arn: None,
+                    api_key: None,
+                    headers: BTreeMap::new(),
                 },
             )]),
         ));

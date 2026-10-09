@@ -690,6 +690,8 @@ mod tests {
             auth_mode: ProviderAuthMode::None,
             request_model: None,
             inference_profile_arn: Some(application_inference_profile_arn().to_string()),
+            api_key: None,
+            headers: std::collections::BTreeMap::new(),
         })
         .await
         .with_model(DEFAULT_MODEL);

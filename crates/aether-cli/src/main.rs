@@ -10,6 +10,7 @@ use aether_cli::settings::SettingsCommand;
 use aether_cli::show_prompt::{PromptArgs, run_prompt};
 use aether_project::{AgentCatalog, project_settings_path, user_settings_path};
 use clap::{Parser, Subcommand};
+use llm::LlmModel;
 use rustls::crypto::aws_lc_rs;
 use std::env::current_dir;
 use std::process::ExitCode;
@@ -52,6 +53,15 @@ struct Cli {
     #[arg(long, global = true)]
     sandbox_image: Option<String>,
 
+    /// Model for this run, as `provider:model` (e.g. `anthropic:claude-sonnet-4-5`).
+    /// Overrides the configured model for this run; settings are never written.
+    ///
+    /// Only the bare `aether` command (the TUI) accepts this flag. When a
+    /// subcommand is supplied, the model override lives on the subcommand's
+    /// own `--model` flag instead.
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -89,6 +99,14 @@ fn main() -> ExitCode {
         return aether_cli::sandbox::exec_in_container(&image);
     }
 
+    if let (Some(model), Some(_)) = (cli.model.as_deref(), cli.command.as_ref()) {
+        let error = CliError::ConflictingArgs(format!(
+            "--model '{model}' applies to the bare `aether` command only; pass it after the subcommand instead (for example, `aether headless --model {model}`)."
+        ));
+        eprintln!("Error: {error}");
+        return ExitCode::FAILURE;
+    }
+
     let rt = Runtime::new().expect("Failed to create tokio runtime");
     let result: Result<ExitCode, MainError> = match cli.command {
         Some(Command::Headless(args)) => rt.block_on(run_headless(args)).map_err(Into::into),
@@ -116,7 +134,7 @@ fn main() -> ExitCode {
 
         Some(Command::Lspd(args)) => aether_lspd::run_lspd(args).map(|()| ExitCode::SUCCESS).map_err(Into::into),
 
-        None => rt.block_on(run_default_command()),
+        None => rt.block_on(run_default_command(cli.model)),
     };
 
     match result {
@@ -144,7 +162,11 @@ async fn run_init_command(request: InitRequest) -> Result<ExitCode, MainError> {
     })
 }
 
-async fn run_default_command() -> Result<ExitCode, MainError> {
+async fn run_default_command(model: Option<String>) -> Result<ExitCode, MainError> {
+    if let Some(model) = model.as_deref() {
+        validate_model_override(model)?;
+    }
+
     let cwd = current_dir()?;
     let existing_settings = {
         let mut paths = Vec::new();
@@ -178,7 +200,10 @@ async fn run_default_command() -> Result<ExitCode, MainError> {
     }
 
     let settings = load_or_create_settings().with_default_status_line(default_status_line());
-    run_tui("aether acp", settings, None).await.map(|()| ExitCode::SUCCESS).map_err(Into::into)
+    run_tui(&default_agent_command(model.as_deref()), settings, None)
+        .await
+        .map(|()| ExitCode::SUCCESS)
+        .map_err(Into::into)
 }
 
 fn default_status_line() -> StatusLineSettings {
@@ -206,5 +231,75 @@ fn format_settings_paths(paths: &[std::path::PathBuf]) -> String {
         "the default locations".to_string()
     } else {
         paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// Build the agent-subprocess command string passed to the wisp TUI.
+/// Without an override, the TUI spawns `aether acp` (which reads the
+/// configured model from settings). With `--model`, the same `aether acp`
+/// command is launched and handed the override via argv so the configured
+/// model is bypassed for this run only.
+fn default_agent_command(model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("aether acp --model {model}"),
+        None => "aether acp".to_string(),
+    }
+}
+
+/// Reject any `--model` value that is not parseable as an `LlmModel`.
+/// The validated model string is then interpolated into the agent
+/// subprocess argv, so this also constrains what can land on the child's
+/// command line.
+fn validate_model_override(model: &str) -> Result<(), MainError> {
+    if model.parse::<LlmModel>().is_err() {
+        return Err(MainError::Cli(CliError::ModelError(format!(
+            "--model '{model}' is not a recognised provider:model id"
+        ))));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_agent_command_without_override_uses_configured_agent() {
+        assert_eq!(default_agent_command(None), "aether acp");
+    }
+
+    #[test]
+    fn default_agent_command_with_override_interpolates_model() {
+        let command = default_agent_command(Some("anthropic:claude-sonnet-4-5"));
+        assert_eq!(command, "aether acp --model anthropic:claude-sonnet-4-5");
+        assert!(command.contains("anthropic:claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn model_flag_overrides_the_configured_model() {
+        let command = default_agent_command(Some("zai:glm-5.1"));
+        assert_eq!(command, "aether acp --model zai:glm-5.1");
+        assert!(command.starts_with("aether acp --model zai:glm-5.1"));
+    }
+
+    #[test]
+    fn validate_model_override_accepts_a_known_catalog_model() {
+        validate_model_override("anthropic:claude-sonnet-4-5").expect("known catalog model should validate");
+    }
+
+    #[test]
+    fn validate_model_override_accepts_dynamic_providers() {
+        validate_model_override("ollama:llama3.2").expect("ollama strings should validate");
+    }
+
+    #[test]
+    fn validate_model_override_rejects_unknown_models() {
+        let error = validate_model_override("mystery:not-a-model").unwrap_err();
+        match error {
+            MainError::Cli(CliError::ModelError(message)) => {
+                assert!(message.contains("mystery:not-a-model"));
+            }
+            other => panic!("expected ModelError, got {other:?}"),
+        }
     }
 }
