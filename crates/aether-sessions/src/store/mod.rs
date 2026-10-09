@@ -188,6 +188,9 @@ impl SessionStore {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let line = serde_json::to_string(value)?;
         writeln!(file, "{line}")?;
+        // A crash mid-turn must not erase the turns that completed before it; flush
+        // each appended line to disk before returning to the actor.
+        file.sync_all()?;
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 use acp_utils::notifications::SessionPreviewRole;
+use aether_core::events::TurnOutcome;
 use aether_sessions::testing::{
-    DEFAULT_CREATED_AT, TestStore, agent_switched, assistant_text, partial_text, session_meta, tool_call, user_message,
-    user_message_with,
+    DEFAULT_CREATED_AT, TestStore, agent_switched, assistant_text, partial_text, session_meta, tool_call, turn_ended,
+    user_message, user_message_with,
 };
 use aether_sessions::{ScanLimits, SessionStore, SessionStoreError};
 use llm::ContentBlock;
@@ -224,4 +225,48 @@ fn empty_and_missing_stores_have_no_sessions_or_prompts() {
 
     let missing = SessionStore::from_path(store.path().join("missing"));
     assert!(missing.list().is_empty());
+}
+
+/// A run killed mid-turn must still leave the completed turns on disk, and the
+/// file must parse: every finished turn is loaded, the half-written trailing
+/// event (no newline yet, or torn JSON) is dropped instead of aborted.
+#[test]
+fn partial_transcript_after_kill_parses_with_completed_turns_intact() {
+    let store = TestStore::new();
+    store.append_meta("session-1", &session_meta("session-1", DEFAULT_CREATED_AT));
+
+    let first_user = user_message("first prompt");
+    let first_assistant = assistant_text("message-1", "first reply");
+    let first_ended = turn_ended(TurnOutcome::Completed);
+    let second_user = user_message("second prompt");
+    let second_assistant = assistant_text("message-2", "second reply");
+    store.append("session-1", &first_user);
+    store.append("session-1", &first_assistant);
+    store.append("session-1", &first_ended);
+    store.append("session-1", &second_user);
+    store.append("session-1", &second_assistant);
+
+    let session_path = store.path().join("session-1.jsonl");
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(&session_path).expect("session file exists");
+    write!(
+        file,
+        "{{\"kind\":\"agent\",\"data\":{{\"category\":\"turn\",\"event\":{{\"type\":\"ended\",\"outcome\":{{\"sta"
+    )
+    .expect("partial event in flight");
+    drop(file);
+
+    let (loaded_meta, events) = store.store().load("session-1").expect("partial transcript parses");
+    assert_eq!(loaded_meta.session_id, "session-1");
+    assert_eq!(
+        events,
+        vec![first_user, first_assistant, first_ended, second_user, second_assistant.clone()],
+        "every completed turn survives; the torn trailing event is dropped"
+    );
+
+    // `load` must tolerate the partial file shape: the torn trailing event
+    // does not panic, and re-reading yields the same completed events so a
+    // crashed run's transcript can be resumed by the next session.
+    let (_, events_again) = store.store().load("session-1").expect("partial transcript re-reads");
+    assert_eq!(events_again.len(), events.len());
 }
