@@ -4,6 +4,7 @@ pub mod acp;
 pub mod client;
 pub mod credentials;
 pub mod error;
+pub(crate) mod file_changes;
 pub mod generate_command;
 pub mod headless;
 pub mod init;

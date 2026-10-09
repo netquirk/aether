@@ -84,7 +84,7 @@ aether headless --model bedrock:anthropic.claude-sonnet-4-5-20250929-v1:0 \
 
 <Tabs>
   <TabItem label="text">
-    Human-readable lines. Final text is printed as plain text; tool calls, tool results, errors, context usage, and other selected events are formatted as simple lines. Background MCP tasks get their own lines as they start and finish (`Tool deferred ...`, `Background task completed ...`, `Background task failed ...`, `Background task cancelled ...`).
+    Human-readable lines. Final text is printed as plain text; tool calls, tool results, errors, context usage, and other selected events are formatted as simple lines. Background MCP tasks get their own lines as they start and finish (`Tool deferred ...`, `Background task completed ...`, `Background task failed ...`, `Background task cancelled ...`). At the end of a run the transcript ends with `Done` (or `Cancelled` / `Error: ...`) followed by a `Files changed: N (X created, Y modified, Z deleted)` line that tallies every `FileDiff` the run produced through the coding tools (`write_file`, `edit_file`, and any future tool that emits a `FileDiff`). A read-only run reports `Files changed: 0 (0 created, 0 modified, 0 deleted)`.
 
     ```bash
     aether headless --output text "What does this project do?"

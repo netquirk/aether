@@ -11,6 +11,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::error;
 
+use crate::file_changes::FileChanges;
 use crate::telemetry::build_telemetry_runtime;
 use crate::workspace::warn_if_not_a_repository;
 
@@ -61,10 +62,14 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         .await
         .map_err(|e| CliError::AgentError(format!("Failed to send prompt: {e}")))?;
 
-    let exit_code = stream_output(agent.agent_rx, config.output, &config.events).await;
+    let (exit_code, changes) = stream_output(agent.agent_rx, config.output, &config.events).await;
 
     drop(agent.agent_tx);
     agent.agent_handle.await_completion().await;
+
+    if config.output == OutputFormat::Text {
+        println!("{}", changes.summary());
+    }
 
     Ok(exit_code)
 }
@@ -83,6 +88,7 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
+<<<<<<< HEAD
 async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat, events: &[CliEventKind]) -> ExitCode {
 <<<<<<< HEAD
     let mut tracker = RetryTracker::default();
@@ -97,6 +103,7 @@ async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat,
         };
         tracker.observe(&msg);
 =======
+<<<<<<< HEAD
     // Wall-clock timing of every turn seen on the stream, independent of the
     // `--events` filter so a filtered run still reports how long it ran.
     let mut timings = TurnTimings::default();
@@ -110,24 +117,59 @@ async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat,
         }
 
 >>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
+=======
+async fn stream_output(
+    mut rx: mpsc::Receiver<AgentEvent>,
+    format: OutputFormat,
+    events: &[CliEventKind],
+) -> (ExitCode, FileChanges) {
+    let mut changes = FileChanges::default();
+    while let Some(msg) = rx.recv().await {
+        if let Some(meta) = tool_result_meta(&msg) {
+            changes.record(meta);
+        }
+
+>>>>>>> bfe6b8c6 (TASK-23-469: capture the agent's working tree for rebase)
+>>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
         if should_emit(&msg, events)
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
             eprintln!("Failed to serialize headless event: {error}");
-            return ExitCode::FAILURE;
+            return (ExitCode::FAILURE, changes);
         }
 
         if let Some(outcome) = msg.turn_outcome() {
+<<<<<<< HEAD
             exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled => ExitCode::SUCCESS,
+=======
+            return match outcome {
+                TurnOutcome::Failed { .. } => (ExitCode::FAILURE, changes),
+                TurnOutcome::Completed | TurnOutcome::Cancelled => (ExitCode::SUCCESS, changes),
+>>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
             };
             break;
         }
     }
+<<<<<<< HEAD
 
     print_turn_summary(format, &timings);
     exit_code
+=======
+    (ExitCode::SUCCESS, changes)
+}
+
+/// Extract the `FileDiff`-bearing metadata from a tool event, if any.
+fn tool_result_meta(msg: &AgentEvent) -> Option<&mcp_utils::display_meta::ToolResultMeta> {
+    match msg {
+        AgentEvent::Tool(
+            ToolEvent::Result { result_meta: Some(meta), .. }
+            | ToolEvent::TaskCompleted { result_meta: Some(meta), .. },
+        ) => Some(meta),
+        _ => None,
+    }
+>>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
 }
 
 fn should_emit(msg: &AgentEvent, include: &[CliEventKind]) -> bool {
@@ -348,16 +390,114 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
-        let code = stream_output(rx, OutputFormat::Text, &filter).await;
+        let (code, changes) = stream_output(rx, OutputFormat::Text, &filter).await;
         assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(changes.total(), 0);
     }
 
     #[tokio::test]
     async fn stream_output_failed_turn_exits_with_failure() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
-        let code = stream_output(rx, OutputFormat::Text, &[]).await;
+        let (code, changes) = stream_output(rx, OutputFormat::Text, &[]).await;
         assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(changes.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_output_reports_two_file_changes() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(tool_result_with_file_diff("created.rs", None, Some("new"))).await.unwrap();
+        tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let (code, changes) = stream_output(rx, OutputFormat::Text, &[]).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(changes.total(), 2);
+        assert_eq!(changes.created(), 1);
+        assert_eq!(changes.modified(), 1);
+        assert_eq!(changes.deleted(), 0);
+        assert!(changes.summary().contains("Files changed: 2"));
+    }
+
+    #[tokio::test]
+    async fn stream_output_reports_zero_when_nothing_changed() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let (code, changes) = stream_output(rx, OutputFormat::Text, &[]).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(changes.total(), 0);
+        assert!(changes.summary().contains("Files changed: 0"));
+    }
+
+    #[tokio::test]
+    async fn stream_output_counts_task_completed_file_diffs() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let (code, changes) = stream_output(rx, OutputFormat::Text, &[]).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(changes.total(), 1);
+        assert_eq!(changes.deleted(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_output_ignores_events_filtered_out_by_cli_flag() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(tool_result_with_file_diff("filtered.rs", None, Some("new"))).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        // Restrict to a different event kind so the ToolResult is not printed,
+        // but file changes are still tallied.
+        let filter = vec![CliEventKind::TurnEnded];
+        let (_code, changes) = stream_output(rx, OutputFormat::Text, &filter).await;
+        assert_eq!(changes.total(), 1);
+    }
+
+    fn tool_result_with_file_diff(path: &str, old: Option<&str>, new: Option<&str>) -> AgentEvent {
+        let diff = mcp_utils::display_meta::FileDiff {
+            path: path.to_string(),
+            old_text: old.map(str::to_string),
+            new_text: new.map(str::to_string),
+        };
+        let meta = mcp_utils::display_meta::ToolResultMeta::with_file_diff(
+            mcp_utils::display_meta::ToolDisplayMeta::new("Edit", path),
+            diff,
+        );
+        AgentEvent::Tool(ToolEvent::Result {
+            result: llm::ToolCallResult {
+                id: "tc1".to_string(),
+                name: "edit_file".to_string(),
+                arguments: "{}".to_string(),
+                result: "ok".to_string(),
+            },
+            result_meta: Some(meta),
+        })
+    }
+
+    fn task_completed_with_file_diff(path: &str, old: Option<&str>, new: Option<&str>) -> AgentEvent {
+        let diff = mcp_utils::display_meta::FileDiff {
+            path: path.to_string(),
+            old_text: old.map(str::to_string),
+            new_text: new.map(str::to_string),
+        };
+        let meta = mcp_utils::display_meta::ToolResultMeta::with_file_diff(
+            mcp_utils::display_meta::ToolDisplayMeta::new("Delete", path),
+            diff,
+        );
+        AgentEvent::Tool(ToolEvent::TaskCompleted {
+            request: llm::ToolCallRequest {
+                id: "tc1".to_string(),
+                name: "delete_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+            task_id: "task-1".to_string(),
+            result: llm::ToolCallResult {
+                id: "tc1".to_string(),
+                name: "delete_file".to_string(),
+                arguments: "{}".to_string(),
+                result: "ok".to_string(),
+            },
+            result_meta: Some(meta),
+        })
     }
 
     #[tokio::test]
