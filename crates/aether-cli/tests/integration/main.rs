@@ -10,6 +10,7 @@ mod acp_stdio;
 mod acp_workspace_move;
 mod dry_run;
 mod headless_system_prompt;
+mod list_tools;
 mod mcp_command;
 mod retry_reporting;
 mod run_init;

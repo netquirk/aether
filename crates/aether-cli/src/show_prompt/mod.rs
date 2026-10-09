@@ -23,6 +23,10 @@ pub struct PromptArgs {
     /// Named agent to inspect (defaults to first user-invocable agent)
     #[arg(short = 'a', long = "agent")]
     pub agent: Option<String>,
+
+    /// Print each model-visible tool name (one per line) and exit
+    #[arg(long = "list-tools")]
+    pub list_tools: bool,
 }
 
 pub use run::run_prompt;

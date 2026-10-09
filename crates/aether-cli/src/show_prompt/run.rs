@@ -20,6 +20,14 @@ pub async fn run_prompt(args: PromptArgs) -> Result<(), CliError> {
         .build_prompt_info()
         .await?;
 
+    if args.list_tools {
+        let names = tool_names(&info.tool_definitions);
+        if !names.is_empty() {
+            println!("{names}");
+        }
+        return Ok(());
+    }
+
     let system_prompt = build_prompt(&info.spec.prompts, args.system_prompt.as_deref()).await?;
     let tools_output = build_tools(&info.tool_definitions);
 
@@ -69,6 +77,15 @@ pub fn build_tools(tools: &[ToolDefinition]) -> String {
     }
 
     sections.join("\n\n")
+}
+
+/// Render a tool registry as one model-visible tool name per line.
+///
+/// Names are emitted verbatim (including any `<server>__<tool>` namespace the
+/// MCP layer attaches), so the printed set is exactly what `aether` exposes to
+/// the model during a run.
+pub fn tool_names(tools: &[ToolDefinition]) -> String {
+    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 pub fn format_stats(prompt_chars: usize, tool_schema_chars: usize, tool_count: usize) -> String {
@@ -173,5 +190,27 @@ mod tests {
     #[test]
     fn build_tools_empty() {
         assert_eq!(build_tools(&[]), "");
+    }
+
+    #[test]
+    fn tool_names_one_tool_one_line() {
+        let tools = vec![tool("bash", "Run a command", r#"{"type":"object"}"#, Some("coding"))];
+        assert_eq!(tool_names(&tools), "bash");
+    }
+
+    #[test]
+    fn tool_names_multiple_tools_one_per_line_preserves_order() {
+        let tools = vec![
+            tool("bash", "Run a command", r#"{"type":"object"}"#, Some("coding")),
+            tool("read_file", "Read a file", r#"{"type":"object"}"#, Some("coding")),
+            tool("grep", "Search text", r#"{"type":"object"}"#, Some("coding")),
+        ];
+        assert_eq!(tool_names(&tools), "bash\nread_file\ngrep");
+    }
+
+    #[test]
+    fn tool_names_empty_returns_empty_string() {
+        let tools: Vec<ToolDefinition> = Vec::new();
+        assert_eq!(tool_names(&tools), "");
     }
 }
