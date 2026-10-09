@@ -116,6 +116,17 @@ impl GitRepo {
     pub fn diff(&self, from_commit: &str, to_commit: &str) -> Result<String, GitRepoError> {
         self.diff_range(from_commit, Some(to_commit))
     }
+
+    /// Get the SHA of the current `HEAD` commit (output of `git rev-parse HEAD`).
+    ///
+    /// The returned string is trimmed of any trailing whitespace. Returns an error
+    /// when the path is not a git repository, when `HEAD` does not yet exist (an
+    /// empty repository with no commits), or when the `git` binary cannot be spawned.
+    #[tracing::instrument(skip(self))]
+    pub fn head_commit(&self) -> Result<String, GitRepoError> {
+        let raw = run_git(Some(&self.path), ["rev-parse", "HEAD"], |reason| GitRepoError::HeadFailed { reason })?;
+        Ok(raw.trim().to_string())
+    }
 }
 
 /// Run `git` (optionally inside `cwd`) and return its stdout.
@@ -167,6 +178,9 @@ pub enum GitRepoError {
 
     #[error("Failed to diff '{from}..{to}': {reason}")]
     DiffFailed { from: String, to: String, reason: String },
+
+    #[error("Failed to read HEAD commit: {reason}")]
+    HeadFailed { reason: String },
 }
 
 #[cfg(test)]

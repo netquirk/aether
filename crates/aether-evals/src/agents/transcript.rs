@@ -1,13 +1,62 @@
 use super::{AgentRunResult, RunError};
 use crate::EvalRunError;
+use crate::git_repo::GitRepo;
 use aether_core::events::{AgentEvent, ToolEvent};
 use futures::{Stream, StreamExt};
 use llm::SessionUsageTotals;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display};
+use std::path::PathBuf;
 use thiserror::Error;
+
+/// The git commit the run started from, or an explicit signal that the working
+/// directory was not a git repository at capture time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartingCommit {
+    Commit(String),
+    NotARepository,
+}
+
+/// Header that captures, at run start, where the run happened and the git state of
+/// that directory. A header is captured once at the beginning of the run and stored on
+/// the [`Transcript`] alongside the streamed `AgentEvent`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptHeader {
+    pub working_dir: PathBuf,
+    pub starting_commit: StartingCommit,
+}
+
+impl TranscriptHeader {
+    /// Capture a header for `working_dir`. The directory's current `HEAD` is recorded
+    /// when it lives inside a git repository; otherwise `starting_commit` is set to
+    /// [`StartingCommit::NotARepository`].
+    pub fn capture(working_dir: impl Into<PathBuf>) -> Self {
+        let working_dir = working_dir.into();
+        let starting_commit = GitRepo::from_path(&working_dir)
+            .head_commit()
+            .map_or_else(|_| StartingCommit::NotARepository, StartingCommit::Commit);
+        Self { working_dir, starting_commit }
+    }
+}
+
+impl Display for StartingCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StartingCommit::Commit(sha) => formatter.write_str(sha),
+            StartingCommit::NotARepository => formatter.write_str("not a git repository"),
+        }
+    }
+}
+
+impl Display for TranscriptHeader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "Working directory: {}", self.working_dir.display())?;
+        write!(formatter, "Starting commit: {}", self.starting_commit)
+    }
+}
 
 pub struct Transcript {
     events: Vec<AgentEvent>,
+    header: Option<TranscriptHeader>,
 }
 
 pub struct ToolCall<'a> {
@@ -25,7 +74,22 @@ pub struct TranscriptError {
 
 impl Transcript {
     pub fn new(events: Vec<AgentEvent>) -> Self {
-        Self { events }
+        Self { events, header: None }
+    }
+
+    pub fn with_header(mut self, header: TranscriptHeader) -> Self {
+        self.header = Some(header);
+        self
+    }
+
+    /// Attach a header that captures `working_dir` and its current git HEAD commit (or
+    /// records that the directory is not a git repository).
+    pub fn with_working_dir(self, working_dir: impl Into<PathBuf>) -> Self {
+        self.with_header(TranscriptHeader::capture(working_dir))
+    }
+
+    pub fn header(&self) -> Option<&TranscriptHeader> {
+        self.header.as_ref()
     }
 
     pub async fn from_stream<T: Stream<Item = AgentRunResult>>(stream: T) -> Result<Self, TranscriptError> {
@@ -141,6 +205,9 @@ mod tests {
     use aether_core::events::TurnEvent;
     use llm::testing::session_usage_event;
     use llm::{TokenUsage, ToolCallRequest, ToolCallResult};
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn transcript_from_stream() {
@@ -150,6 +217,46 @@ mod tests {
 
         assert!(transcript.tool_called("bash"));
         assert!(matches!(transcript.events().last(), Some(AgentEvent::Turn(TurnEvent::Ended { .. }))));
+    }
+
+    #[test]
+    fn header_names_the_starting_commit_in_a_git_directory() {
+        let repo = init_git_repo();
+        let expected_sha = read_head_commit(repo.path());
+
+        let transcript = Transcript::new(vec![]).with_working_dir(repo.path());
+
+        let header = transcript.header().expect("header should be captured when attached");
+        assert_eq!(header.working_dir, repo.path());
+        assert_eq!(header.starting_commit, StartingCommit::Commit(expected_sha));
+
+        let rendered = header.to_string();
+        assert!(rendered.contains("Working directory:"), "rendered header: {rendered}");
+        assert!(rendered.contains(repo.path().to_str().unwrap()), "rendered header: {rendered}");
+        assert!(rendered.contains("Starting commit:"), "rendered header: {rendered}");
+        assert!(!rendered.contains("not a git repository"), "rendered header: {rendered}");
+    }
+
+    #[test]
+    fn header_says_not_a_git_repository_outside_one() {
+        let non_repo = TempDir::new().unwrap();
+
+        let transcript = Transcript::new(vec![]).with_working_dir(non_repo.path());
+
+        let header = transcript.header().expect("header should always be captured when attached");
+        assert_eq!(header.working_dir, non_repo.path());
+        assert_eq!(header.starting_commit, StartingCommit::NotARepository);
+
+        let rendered = header.to_string();
+        assert!(rendered.contains("Working directory:"));
+        assert!(rendered.contains(non_repo.path().to_str().unwrap()));
+        assert!(rendered.contains("Starting commit: not a git repository"));
+    }
+
+    #[test]
+    fn transcript_without_a_header_has_none() {
+        let transcript = Transcript::new(vec![]);
+        assert!(transcript.header().is_none());
     }
 
     #[test]
@@ -221,5 +328,27 @@ mod tests {
             },
             result_meta: None,
         })
+    }
+
+    fn init_git_repo() -> TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path();
+        run_git(path, &["init", "--initial-branch", "main"]);
+        std::fs::write(path.join("README.md"), "header test\n").unwrap();
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["-c", "user.email=header@example.com", "-c", "user.name=Header", "commit", "-m", "init"]);
+        repo
+    }
+
+    fn read_head_commit(repo: &Path) -> String {
+        let output =
+            Command::new("git").arg("-C").arg(repo).args(["rev-parse", "HEAD"]).output().expect("git rev-parse HEAD");
+        assert!(output.status.success(), "git rev-parse HEAD failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git").arg("-C").arg(repo).args(args).output().expect("git invocation");
+        assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 }

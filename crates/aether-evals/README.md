@@ -28,10 +28,12 @@ async fn hello_world_test() -> Result<(), aether_evals::WorkspaceError> {
     let workspace = Workspace::empty()?;
     let prompt = "Write 'Hello, World!' to hello.txt";
     let agent = FakeAgent::writes_file("hello.txt", "Hello, World!").with_workspace(workspace.path());
-    let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await.unwrap();
+    let transcript =
+        Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
 
     assert!(!transcript.events().is_empty());
     assert!(workspace.join("hello.txt").exists());
+    assert_eq!(transcript.header().map(|header| header.working_dir.clone()), Some(workspace.path().to_path_buf()));
     Ok(())
 }
 ```
@@ -55,6 +57,7 @@ Aether Evals' fake-agent coverage should use normal test names. Reserve `_eval` 
 - `Agent::run(task)` streams `AgentEvent`s from an agent's configured execution environment.
 - `Transcript::from_stream(agent.run(task))` collects the stream into a `Transcript`.
 - `Transcript::default()` plus `transcript.add(message)` supports observing each streamed message while building the transcript manually.
+- `Transcript::with_working_dir(path)` records the run's working directory and its git HEAD commit (or `not a git repository`) on the transcript header.
 - `Container::builder(image).start(&workspace)` starts a caller-owned Docker container with the workspace mounted at `/workspace`.
 - `DockerAgent::new(container, command)` runs an in-container command whose stdout is newline-delimited `AgentEvent` JSON.
 - `Container::exec_shell(script)` runs follow-up assertions or test commands in the same caller-owned container.
@@ -62,7 +65,7 @@ Aether Evals' fake-agent coverage should use normal test names. Reserve `_eval` 
 - `Workspace::empty()` creates an isolated temp directory.
 - `Workspace::from_dir(path)` copies fixture directory contents into a temp directory.
 - `Workspace::from_git_repo(GitRepoSpec { url, start_commit, gold_commit, subdir })` clones and checks out a git repository.
-- `Transcript` exposes collected agent messages, token usage, and tool-call helpers.
+- `Transcript` exposes collected agent messages, token usage, tool-call helpers, and an optional header recording the run's working directory and starting commit.
 
 ## Dockerized evals
 
@@ -94,10 +97,12 @@ let container = Container::builder(Image::new("aether-sandbox", "latest"))
 let agent = DockerAgent::new(container.clone(), vec!["/usr/local/bin/aether-eval-agent".to_string()]);
 
 let prompt = "fix the failing test";
-let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
+let transcript =
+    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
 let tests = container.exec_shell("cargo test").await?;
 assert_eq!(tests.exit_code, 0, "stdout:\n{}\nstderr:\n{}", tests.stdout, tests.stderr);
 assert!(!transcript.events().is_empty());
+assert!(transcript.header().is_some(), "transcript should record its run header");
 ```
 
 Run follow-up `container.exec_shell(...)` assertions before dropping the caller-owned container and workspace.
@@ -127,7 +132,8 @@ Use normal Rust assertions over the returned `Transcript` and files on disk:
 
 ```rust
 let workspace = Workspace::empty()?;
-let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
+let transcript =
+    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
 
 assert!(transcript.tool_called("write_file"));
 assert_eq!(transcript.tool_call_count("bash"), 1);
@@ -166,7 +172,8 @@ let workspace = Workspace::from_git_repo(GitRepoSpec {
     subdir: Some("packages/api".into()),
 })?;
 let prompt = "Make the test pass";
-let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
+let transcript =
+    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
 
 assert!(transcript.tool_called("bash"));
 ```
