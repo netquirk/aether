@@ -134,6 +134,11 @@ fn assert_initialize_response(line: &str) -> TestResult {
     assert_eq!(response["id"], serde_json::json!(1), "response should echo the request id: {response}");
     assert_eq!(response["result"]["protocolVersion"], 2);
     assert_eq!(response["result"]["info"]["name"], "Aether");
+    assert_eq!(
+        response["result"]["info"]["version"],
+        serde_json::json!(env!("CARGO_PKG_VERSION")),
+        "initialize response should name the aether build version: {response}"
+    );
     assert!(response["result"]["capabilities"]["session"].is_object());
     assert!(response["result"]["capabilities"].get("loadSession").is_none());
     Ok(())

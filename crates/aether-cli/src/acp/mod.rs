@@ -148,6 +148,7 @@ pub enum AcpOptionsJsonError {
 }
 
 pub async fn run_acp(args: AcpArgs) -> Result<AcpRunOutcome, AcpRunError> {
+    eprintln!("{}", crate::version::startup_line());
     info!("Starting Aether ACP server");
 
     let cwd = current_dir().unwrap_or_else(|_| PathBuf::from("."));

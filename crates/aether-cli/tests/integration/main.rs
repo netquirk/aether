@@ -12,4 +12,5 @@ mod mcp_command;
 mod retry_reporting;
 mod run_init;
 mod slash_commands;
+mod startup_version;
 mod trace_context;

@@ -8,7 +8,6 @@ use acp_utils::notifications::{
 };
 use aether_auth::OAuthCredentialStorage;
 use aether_telemetry::TelemetryRuntime;
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v2::{
     self as acp, AgentCapabilities, AuthMethod, CancelSessionNotification, CloseSessionRequest, CloseSessionResponse,
     Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoginAuthRequest,
@@ -211,10 +210,13 @@ impl AcpState {
             .and_then(|id| self.session_store.session_cwd(id.0.as_ref()))
             .unwrap_or_else(|| self.cwd.clone());
         let remote_meta = Some(RemoteServerInfo { cwd, session_id }.to_meta());
-        Ok(InitializeResponse::new(ProtocolVersion::V2, Implementation::new("Aether", "0.1.0"))
-            .meta(remote_meta)
-            .capabilities(AgentCapabilities::new().session(session_capabilities))
-            .auth_methods(auth_methods))
+        Ok(InitializeResponse::new(
+            crate::version::ACP_PROTOCOL_VERSION,
+            Implementation::new("Aether", crate::version::aether_version()),
+        )
+        .meta(remote_meta)
+        .capabilities(AgentCapabilities::new().session(session_capabilities))
+        .auth_methods(auth_methods))
     }
 
     pub(crate) async fn login(
@@ -775,11 +777,11 @@ mod tests {
     async fn initialize_advertises_session_lifecycle_support() {
         let state = test_state();
         let response = state
-            .initialize(InitializeRequest::new(ProtocolVersion::V2, Implementation::new("test", "1")))
+            .initialize(InitializeRequest::new(crate::version::ACP_PROTOCOL_VERSION, Implementation::new("test", "1")))
             .await
             .expect("initialize succeeds");
         let json = serde_json::to_string(&response).expect("response serializes");
-        assert_eq!(response.protocol_version, ProtocolVersion::V2);
+        assert_eq!(response.protocol_version, crate::version::ACP_PROTOCOL_VERSION);
         let session = response.capabilities.session.unwrap();
         assert!(session.prompt.is_some());
         let mcp = session.mcp.unwrap();
@@ -794,7 +796,7 @@ mod tests {
     async fn initialize_advertises_aether_capabilities_once() {
         let state = test_state();
         let response = state
-            .initialize(InitializeRequest::new(ProtocolVersion::V2, Implementation::new("test", "1")))
+            .initialize(InitializeRequest::new(crate::version::ACP_PROTOCOL_VERSION, Implementation::new("test", "1")))
             .await
             .expect("initialize succeeds");
         assert_eq!(
