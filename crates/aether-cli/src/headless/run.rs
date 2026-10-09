@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::telemetry::build_telemetry_runtime;
+use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
@@ -20,6 +21,7 @@ use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     setup_tracing(config.verbose);
+    warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
     let result = run_agent(config, telemetry.clone()).await;

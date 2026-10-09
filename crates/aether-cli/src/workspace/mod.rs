@@ -13,6 +13,21 @@ use git::GitError;
 pub(crate) use git::current_ref;
 use registry::{RegistryError, WorkspaceRegistry};
 
+/// Warning to print when `cwd` is not inside a git repository, or `None` when it is.
+/// A run started outside a repository produces changes that cannot be diffed.
+pub fn not_a_repository_warning(cwd: &Path) -> Option<String> {
+    git::repo_root(cwd)
+        .is_err()
+        .then(|| format!("warning: {} is not a git repository; changes will not be diffed", cwd.display()))
+}
+
+/// Prints [`not_a_repository_warning`] to stderr when `cwd` is not a git repository.
+pub fn warn_if_not_a_repository(cwd: &Path) {
+    if let Some(message) = not_a_repository_warning(cwd) {
+        eprintln!("{message}");
+    }
+}
+
 /// Manages the workspaces of a repository: listing the known clones and
 /// moving uncommitted changes between them.
 pub struct WorkspaceManager {
@@ -297,6 +312,21 @@ mod tests {
         assert!(matches!(move_to("."), Err(WorkspaceError::ReservedName(_))));
         assert!(matches!(move_to(".."), Err(WorkspaceError::ReservedName(_))));
         assert!(matches!(move_to("taken"), Err(WorkspaceError::TargetPathExists(_))));
+    }
+
+    #[test]
+    fn warns_when_cwd_is_not_a_git_repository() {
+        let tmp = TempDir::new().unwrap();
+        let warning = not_a_repository_warning(tmp.path()).expect("non-repo path should warn");
+        assert!(warning.contains(&tmp.path().display().to_string()));
+        assert!(warning.contains("not a git repository"), "missing phrase in: {warning}");
+    }
+
+    #[test]
+    fn does_not_warn_inside_a_git_repository() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path(), "repo");
+        assert_eq!(not_a_repository_warning(&repo), None);
     }
 
     #[test]

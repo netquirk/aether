@@ -17,7 +17,7 @@ use crate::provider_connection_args::ProviderConnectionArgs;
 use crate::resolve::InitialSessionSelection;
 use crate::settings_args::{ConflictingSettingsSources, SettingsSourceArgs};
 use crate::telemetry::build_telemetry_runtime;
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{WorkspaceManager, warn_if_not_a_repository};
 use aether_project::AetherSettings;
 use aether_sessions::SessionStore;
 use aether_telemetry::{AgentTraceContext, TelemetryInitError};
@@ -151,6 +151,7 @@ pub async fn run_acp(args: AcpArgs) -> Result<AcpRunOutcome, AcpRunError> {
     info!("Starting Aether ACP server");
 
     let cwd = current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    warn_if_not_a_repository(&cwd);
     let state = Arc::new(create_acp_state(args, &cwd, DetachedArgs::default())?);
     let connect_result = state.serve(Stdio::new(), state.stop_token()).await;
     state.shutdown_all().await;
