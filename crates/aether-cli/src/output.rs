@@ -106,6 +106,77 @@ pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings, ru
     println!("{}", turn_summary_body(timings, run_total));
 }
 
+/// Accumulates the wall-clock time the agent spent waiting on the provider.
+///
+/// Each provider request is bracketed by
+/// [`TurnEvent::LlmCallStarted`](aether_core::events::TurnEvent::LlmCallStarted)
+/// and [`TurnEvent::LlmCallEnded`](aether_core::events::TurnEvent::LlmCallEnded);
+/// the headless event loop feeds every event through
+/// [`ProviderWaitTracker::observe`] with the matching `Instant::now()` so the
+/// tracker is independent of the `--events` filter and the turn lifecycle.
+/// Retries naturally produce more start/end pairs, so each attempt contributes
+/// its own wait time.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ProviderWaitTracker {
+    total: Duration,
+    calls: u32,
+    pending_start: Option<Instant>,
+}
+
+impl ProviderWaitTracker {
+    /// Record a single agent event with the wall-clock `now` it was observed.
+    ///
+    /// On `LlmCallStarted` any prior unmatched start is overwritten so a
+    /// missing `LlmCallEnded` does not leave dangling state. On `LlmCallEnded`,
+    /// the elapsed duration is added to the total and the call count is
+    /// incremented; an unmatched end is a no-op.
+    pub(crate) fn observe(&mut self, event: &AgentEvent, now: Instant) {
+        match event {
+            AgentEvent::Turn(TurnEvent::LlmCallStarted { .. }) => {
+                self.pending_start = Some(now);
+            }
+            AgentEvent::Turn(TurnEvent::LlmCallEnded { .. }) => {
+                if let Some(start) = self.pending_start.take() {
+                    self.total = self.total.saturating_add(now.saturating_duration_since(start));
+                    self.calls = self.calls.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Total wall-clock time spent waiting on the provider.
+    pub(crate) fn total(&self) -> Duration {
+        self.total
+    }
+
+    /// Number of completed provider calls recorded so far. Test-only; the
+    /// production path only prints the total time.
+    #[cfg(test)]
+    pub(crate) fn calls(&self) -> u32 {
+        self.calls
+    }
+
+    /// True when no provider wait has been recorded.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.calls == 0
+    }
+
+    /// Single-line summary of the total wait time, e.g. `Provider wait: 1.234s`.
+    pub(crate) fn line(&self) -> String {
+        format!("Provider wait: {}", format_duration(self.total()))
+    }
+}
+
+/// Print the end-of-run provider-wait summary. No-op when format is not `Text`
+/// or no provider call has been observed.
+pub(crate) fn print_provider_wait(format: OutputFormat, tracker: &ProviderWaitTracker) {
+    if !matches!(format, OutputFormat::Text) || tracker.is_empty() {
+        return;
+    }
+    println!("{}", tracker.line());
+}
+
 /// Print a single agent event using the chosen format.
 ///
 /// `retry_note` is optional context appended to the human-readable failure line
@@ -699,5 +770,93 @@ mod tests {
         assert_eq!(summary.retries, 1);
         assert!(!summary.failed);
         assert_eq!(summary.provider.as_deref(), Some("Fake LLM"));
+    }
+
+    fn llm_chat_ended() -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: llm::LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+        })
+    }
+
+    fn llm_compaction_ended() -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: llm::LlmCallPurpose::Compaction,
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+        })
+    }
+
+    #[test]
+    fn provider_wait_sums_each_matched_call() {
+        let base = Instant::now();
+        let mut tracker = ProviderWaitTracker::default();
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.total(), Duration::ZERO);
+
+        // First call (chat): 1.250s
+        tracker.observe(&llm_chat_started("primary"), base);
+        tracker.observe(&llm_chat_ended(), base + Duration::from_millis(1_250));
+        // Second call (compaction): 2.500s
+        tracker.observe(&llm_compaction_started("primary"), base + Duration::from_millis(1_250));
+        tracker.observe(&llm_compaction_ended(), base + Duration::from_millis(3_750));
+        // A retry of the chat call: 0.500s
+        tracker.observe(&llm_chat_started("primary"), base + Duration::from_millis(3_750));
+        tracker.observe(&llm_chat_ended(), base + Duration::from_millis(4_250));
+
+        assert_eq!(tracker.calls(), 3);
+        assert_eq!(tracker.total(), Duration::from_millis(4_250));
+        assert!(!tracker.is_empty());
+
+        let line = tracker.line();
+        assert!(line.starts_with("Provider wait: "), "missing prefix: {line}");
+        assert!(line.contains(&format_duration(Duration::from_millis(4_250))), "missing total in line: {line}");
+    }
+
+    #[test]
+    fn provider_wait_ignores_unmatched_end() {
+        let base = Instant::now();
+        let mut tracker = ProviderWaitTracker::default();
+        // No matching start: end is a no-op.
+        tracker.observe(&llm_chat_ended(), base + Duration::from_millis(500));
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.total(), Duration::ZERO);
+        assert_eq!(tracker.calls(), 0);
+    }
+
+    #[test]
+    fn provider_wait_ignores_unmatched_start() {
+        let base = Instant::now();
+        let mut tracker = ProviderWaitTracker::default();
+        // Start with no matching end: the duration is dropped.
+        tracker.observe(&llm_chat_started("primary"), base);
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.total(), Duration::ZERO);
+        assert_eq!(tracker.calls(), 0);
+    }
+
+    #[test]
+    fn provider_wait_overwrites_unmatched_start() {
+        let base = Instant::now();
+        let mut tracker = ProviderWaitTracker::default();
+        // First start is overwritten by the second one (no end between them);
+        // only the second call should be measured.
+        tracker.observe(&llm_chat_started("primary"), base);
+        tracker.observe(&llm_chat_started("primary"), base + Duration::from_millis(1_000));
+        tracker.observe(&llm_chat_ended(), base + Duration::from_millis(1_500));
+
+        assert_eq!(tracker.calls(), 1);
+        assert_eq!(tracker.total(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn provider_wait_ignores_unrelated_events() {
+        let base = Instant::now();
+        let mut tracker = ProviderWaitTracker::default();
+        tracker.observe(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }), base);
+        tracker.observe(&chat_retry(1), base + Duration::from_millis(100));
+        tracker.observe(&AgentEvent::turn_ended(TurnOutcome::Completed), base + Duration::from_millis(200));
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.total(), Duration::ZERO);
+        assert_eq!(tracker.calls(), 0);
     }
 }

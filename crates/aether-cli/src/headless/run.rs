@@ -21,7 +21,10 @@ use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
-use crate::output::{OutputFormat, RetryTracker, TurnTimings, print_message, print_run_usage, print_turn_summary};
+use crate::output::{
+    OutputFormat, ProviderWaitTracker, RetryTracker, TurnTimings, print_message, print_provider_wait, print_run_usage,
+    print_turn_summary,
+};
 use crate::progress::{ToolProgressReporter, tool_progress_update};
 use crate::run_usage::RunUsage;
 use crate::runtime::RuntimeBuilder;
@@ -130,6 +133,10 @@ async fn stream_output(
     // Wall-clock timing of every turn seen on the stream, independent of the
     // `--events` filter so a filtered run still reports how long it ran.
     let mut timings = TurnTimings::default();
+    // Wall-clock time the agent spent blocked on provider responses. Like
+    // `timings`/`usage`, fed every event so a `--events`-filtered run still
+    // reports the figure.
+    let mut provider_wait = ProviderWaitTracker::default();
     // Per-model token totals across every SessionUsage event, also
     // independent of the `--events` filter so the end-of-run summary is
     // always complete.
@@ -175,6 +182,9 @@ async fn stream_output(
         match &msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
             AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
+            AgentEvent::Turn(TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. }) => {
+                provider_wait.observe(&msg, Instant::now());
+            }
             _ => {}
         }
 
@@ -221,6 +231,7 @@ async fn stream_output(
     // summary printed just below; clear() is a no-op when no line is active.
     let _ = progress.clear();
     print_turn_summary(format, &timings, Some(run_total_elapsed));
+    print_provider_wait(format, &provider_wait);
     print_run_usage(format, &usage);
     if let Some(t) = transcript.as_mut() {
         let _ = t.flush();
