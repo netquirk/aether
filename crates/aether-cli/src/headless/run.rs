@@ -20,7 +20,8 @@ use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
-use crate::output::{OutputFormat, RetryTracker, TurnTimings, print_message, print_turn_summary};
+use crate::output::{OutputFormat, RetryTracker, TurnTimings, print_message, print_run_usage, print_turn_summary};
+use crate::run_usage::RunUsage;
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
@@ -114,11 +115,19 @@ async fn stream_output(
     // Wall-clock timing of every turn seen on the stream, independent of the
     // `--events` filter so a filtered run still reports how long it ran.
     let mut timings = TurnTimings::default();
+    // Per-model token totals across every SessionUsage event, also
+    // independent of the `--events` filter so the end-of-run summary is
+    // always complete.
+    let mut usage = RunUsage::default();
     let mut changes = FileChanges::default();
     let mut summary = RunSummary::default();
     let mut exit_code = ExitCode::SUCCESS;
 
     while let Some(msg) = rx.recv().await {
+        if let AgentEvent::SessionUsage(sample) = &msg {
+            usage.record(sample);
+        }
+
         // Capture the note for failed turns *before* we update the tracker
         // with the event we are about to print. Observing the `Ended` event
         // for a failed turn does not change the count or provider, so the
@@ -151,6 +160,7 @@ async fn stream_output(
         }
 
         if let Some(outcome) = msg.turn_outcome() {
+            print_run_usage(format, &usage);
             exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled | TurnOutcome::MaxTurnsReached { .. } => {
@@ -163,6 +173,7 @@ async fn stream_output(
 
     let run_total_elapsed = run_started_at.elapsed();
     print_turn_summary(format, &timings, Some(run_total_elapsed));
+    print_run_usage(format, &usage);
     (exit_code, changes, summary)
 }
 
