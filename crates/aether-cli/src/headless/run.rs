@@ -93,6 +93,8 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         &config.events,
         run_started_at,
         config.provider_stall_warn,
+        config.quiet,
+        io::stderr(),
         transcript.as_mut(),
     )
     .await;
@@ -130,12 +132,19 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
-async fn stream_output(
+// `stream_output` already takes 7 positional parameters before `--quiet`
+// landed; adding the `quiet` flag and a generic progress writer pushes it to
+// 8. Bundling them into a config struct would obscure the call sites without
+// reducing total surface area, so silence the threshold-crossing lint.
+#[allow(clippy::too_many_arguments)]
+async fn stream_output<W: io::Write>(
     mut rx: mpsc::Receiver<AgentEvent>,
     format: OutputFormat,
     events: &[CliEventKind],
     run_started_at: Instant,
     provider_stall_warn: Option<Duration>,
+    quiet: bool,
+    progress_writer: W,
     mut transcript: Option<&mut JsonlTranscript>,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
@@ -155,12 +164,16 @@ async fn stream_output(
     let mut exit_code = ExitCode::SUCCESS;
     // Live stderr progress line naming the tool currently executing. Like
     // `timings`/`usage`, it is fed every event so a `--events`-filtered run
-    // still updates the status line.
-    let mut progress = ToolProgressReporter::new(io::stderr());
+    // still updates the status line. When `--quiet` is set the reporter is
+    // still constructed (so the post-loop `clear()` calls stay safe) but
+    // `apply()` is skipped below, so no progress bytes reach `progress_writer`.
+    let mut progress = ToolProgressReporter::new(progress_writer);
     // Live one-line stall warning for provider calls that exceed
     // `provider_stall_warn`. Fed the same events as `provider_wait`. The
     // select loop below races `rx.recv()` against the watch's deadline so a
     // hung call prints the warning once instead of hanging silently.
+    // `--quiet` intentionally does not gate the stall warning: it is a
+    // problem-reporting line the task asks to keep.
     let mut stall = ProviderStallWatch::new(provider_stall_warn, io::stderr());
 
     loop {
@@ -207,8 +220,12 @@ async fn stream_output(
         // Update the live stderr progress line (Text mode only — Json/Pretty
         // are machine-readable and must not be polluted with control codes).
         // Fed every event, like `timings`/`usage`, so a filtered run still
-        // reflects the tool currently executing.
-        if matches!(format, OutputFormat::Text)
+        // reflects the tool currently executing. `--quiet` short-circuits the
+        // `apply()` call so no progress bytes reach `progress_writer`; the
+        // end-of-loop `clear()` calls below stay no-ops because the
+        // reporter is never set active in quiet mode.
+        if !quiet
+            && matches!(format, OutputFormat::Text)
             && let Some(update) = tool_progress_update(&msg)
             && let Err(error) = progress.apply(update)
         {
@@ -559,7 +576,7 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -568,7 +585,8 @@ mod tests {
     async fn stream_output_failed_turn_exits_with_failure() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -579,7 +597,8 @@ mod tests {
         tx.send(tool_result_with_file_diff("created.rs", None, Some("new"))).await.unwrap();
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -592,7 +611,8 @@ mod tests {
     async fn stream_output_reports_zero_when_nothing_changed() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -603,7 +623,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -618,7 +639,7 @@ mod tests {
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
         let (_code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -675,7 +696,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -695,7 +717,8 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         drop(tx);
 
-        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
+        let (code, _changes, summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
@@ -704,6 +727,29 @@ mod tests {
         let line = summary.line();
         assert_eq!(line, "Run finished: 2 turns, 2 tool calls");
         assert_eq!(line.lines().count(), 1);
+    }
+
+    fn execution_started(tool: &str) -> AgentEvent {
+        AgentEvent::Tool(ToolEvent::ExecutionStarted { tool_id: "tc1".to_string(), tool_name: tool.to_string() })
+    }
+
+    #[tokio::test]
+    async fn stream_output_quiet_suppresses_tool_progress_line() {
+        // Not quiet: the live line is written (contains the ⏺ glyph, bytes e2 8f ba).
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(execution_started("bash")).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let mut sink = Vec::new();
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None).await;
+        assert!(sink.windows(3).any(|w| w == b"\xe2\x8f\xba"), "non-quiet must draw the progress line: {sink:?}");
+
+        // Quiet: no progress bytes at all.
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(execution_started("bash")).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let mut sink = Vec::new();
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None).await;
+        assert!(sink.is_empty(), "quiet must not write progress bytes: {sink:?}");
     }
 
     #[tokio::test]
@@ -724,7 +770,7 @@ mod tests {
 
         let threshold = Duration::from_millis(50);
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), false, io::sink(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 

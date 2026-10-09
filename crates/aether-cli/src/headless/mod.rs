@@ -62,6 +62,12 @@ pub struct RunConfig {
     pub system_prompt: Option<String>,
     pub output: OutputFormat,
     pub verbose: bool,
+    /// When true, the headless loop does not write the live per-tool progress
+    /// line on stderr. Warnings and errors (including the provider-stall
+    /// warning, `eprintln!` failure messages, and `tracing` warnings/errors)
+    /// are unaffected. Independent of `--events` so a filtered run still
+    /// reflects the tool currently executing unless this flag is set.
+    pub quiet: bool,
     pub events: Vec<CliEventKind>,
     pub oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
     pub telemetry: Option<TelemetrySettings>,
@@ -126,6 +132,11 @@ pub struct HeadlessOptions {
     pub output: Option<OutputFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbose: Option<bool>,
+    /// Mirror of the `--quiet` flag for `--options-json` callers. `true`
+    /// suppresses the live per-tool progress line on stderr; warnings and
+    /// errors remain unchanged. `None` falls back to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<CliEventKind>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +213,13 @@ pub struct HeadlessArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Suppress the live per-tool progress line on stderr. Warnings and
+    /// errors (including the provider-stall warning and `tracing` diagnostics)
+    /// are still printed. Has no effect on `--events` filtering or on
+    /// `--transcript-jsonl`.
+    #[arg(long = "quiet")]
+    pub quiet: bool,
+
     /// Comma-separated list of events to emit (e.g. `tool_call,tool_result,turn_ended`).
     /// Omit to emit every output event. When set, turn outcomes are only shown if `turn_ended` is listed.
     #[arg(long = "events", value_enum, value_delimiter = ',')]
@@ -251,6 +269,7 @@ impl RunConfig {
             system_prompt: resolve_system_prompt(args.system_prompt, args.system_prompt_file)?,
             output: args.output,
             verbose: args.verbose,
+            quiet: args.quiet,
             events: args.events,
             oauth_credential_store,
             telemetry,
@@ -294,6 +313,7 @@ impl RunConfig {
             system_prompt: resolve_system_prompt(options.system_prompt, options.system_prompt_file)?,
             output: options.output.unwrap_or(OutputFormat::Text),
             verbose: options.verbose.unwrap_or(false),
+            quiet: options.quiet.unwrap_or(false),
             events: options.events.unwrap_or_default(),
             oauth_credential_store,
             telemetry,
@@ -501,6 +521,37 @@ mod tests {
         }
 
         assert!(matches!(initial_selection(None, None), Ok(InitialSessionSelection::Default)));
+    }
+
+    /// Tiny harness so the clap `HeadlessArgs` parser can be exercised in
+    /// isolation; the production binary adds subcommand plumbing that is not
+    /// relevant to argument parsing.
+    #[derive(clap::Parser)]
+    struct QuietHarness {
+        #[command(flatten)]
+        args: HeadlessArgs,
+    }
+
+    #[test]
+    fn quiet_flag_is_accepted() {
+        use clap::Parser as _;
+        assert!(QuietHarness::try_parse_from(["aether", "--quiet"]).unwrap().args.quiet);
+        assert!(!QuietHarness::try_parse_from(["aether"]).unwrap().args.quiet);
+    }
+
+    #[test]
+    fn quiet_flag_defaults_to_false_and_can_be_combined() {
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).unwrap().args;
+        assert!(!parsed.quiet, "quiet must default to false when the flag is absent");
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+
+        // `--quiet` is a long flag, so positional prompt words that look like
+        // options still parse. We just verify the flag survives alongside the
+        // positional prompt.
+        let parsed = QuietHarness::try_parse_from(["aether", "--quiet", "hello"]).unwrap().args;
+        assert!(parsed.quiet, "--quiet must set the flag alongside a positional prompt");
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
     }
 
     #[test]
