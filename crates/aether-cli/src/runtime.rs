@@ -5,6 +5,10 @@ use aether_core::events::{AgentEvent, Command};
 use aether_core::mcp::McpBuilder;
 use aether_core::mcp::mcp;
 use aether_core::mcp::{McpHandle, McpRuntime, McpSession};
+use aether_project::ToolOutputSettings;
+use aether_project::resolve_tool_output_cap;
+use aether_project::tool_output_dir_from_env;
+use aether_project::tool_output_max_bytes_from_env;
 use llm::{ChatMessage, SessionUsageEvent, ToolDefinition};
 use mcp_servers::McpBuilderExt;
 use mcp_utils::client::{McpClientEvent, McpConnectionDetails, McpServer, OAuthHandlerFactory};
@@ -15,6 +19,10 @@ use tracing::debug;
 pub struct RuntimeBuilder {
     cwd: PathBuf,
     spec: AgentSpec,
+    /// Top-level `toolOutput` block from the loaded settings. `None` means
+    /// the settings file did not declare a cap; the CLI falls back to the
+    /// 16 KiB default and env-var overrides.
+    settings_tool_output: Option<ToolOutputSettings>,
     mcp_config_sources: Vec<McpConfigSource>,
     extra_mcp_servers: Vec<McpServer>,
     oauth_applicator: Option<Box<dyn FnOnce(McpBuilder) -> McpBuilder + Send>>,
@@ -40,12 +48,22 @@ impl RuntimeBuilder {
         Self {
             cwd,
             spec,
+            settings_tool_output: None,
             mcp_config_sources: Vec::new(),
             extra_mcp_servers: Vec::new(),
             oauth_applicator: None,
             agent_deps: AgentDeps::default(),
             usage_seed: None,
         }
+    }
+
+    /// Set the top-level `toolOutput` block from the loaded settings. The CLI
+    /// resolves the per-agent cap together with this block and the
+    /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` env vars
+    /// inside [`spawn_mcp`].
+    pub fn settings_tool_output(mut self, tool_output: Option<ToolOutputSettings>) -> Self {
+        self.settings_tool_output = tool_output;
+        self
     }
 
     pub fn agent_deps(mut self, deps: AgentDeps) -> Self {
@@ -166,6 +184,15 @@ impl RuntimeBuilder {
             builder =
                 builder.from_mcp_config_sources(&mcp_config_sources).map_err(|e| CliError::McpError(e.to_string()))?;
         }
+
+        let tool_output_cap = resolve_tool_output_cap(
+            &self.cwd,
+            self.settings_tool_output.as_ref(),
+            self.spec.tool_output.as_ref(),
+            tool_output_max_bytes_from_env(),
+            tool_output_dir_from_env(),
+        );
+        builder = builder.with_tool_output_cap(tool_output_cap);
 
         let spawn = builder.spawn().await.map_err(|e| CliError::McpError(e.to_string()))?;
         Ok((self.spec, spawn))

@@ -248,13 +248,7 @@ const PROVIDERS: &[ProviderConfig] = &[
         is_hybrid_dynamic: false,
     },
     ProviderConfig::openai_compatible("deepseek", "DeepSeek", "deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
-    ProviderConfig::openai_compatible(
-        "opencode-go",
-        "OpencodeGo",
-        "opencode-go",
-        "OpenCode Go",
-        "OPENCODE_API_KEY",
-    ),
+    ProviderConfig::openai_compatible("opencode-go", "OpencodeGo", "opencode-go", "OpenCode Go", "OPENCODE_API_KEY"),
     ProviderConfig {
         source_dev_id: Some("fireworks-ai"),
         ..ProviderConfig::openai_compatible("fireworks", "Fireworks", "fireworks", "Fireworks AI", "FIREWORKS_API_KEY")
@@ -1096,10 +1090,7 @@ fn emit_llm_model_impl() -> TokenStream {
         .filter(|cfg| cfg.uses_openai_compatible_api)
         .map(|cfg| format_ident!("{}", cfg.enum_name))
         .collect();
-    let dynamic_variants: Vec<_> = DYNAMIC_PROVIDERS
-        .iter()
-        .map(|cfg| format_ident!("{}", cfg.enum_name))
-        .collect();
+    let dynamic_variants: Vec<_> = DYNAMIC_PROVIDERS.iter().map(|cfg| format_ident!("{}", cfg.enum_name)).collect();
 
     quote! {
         impl LlmModel {

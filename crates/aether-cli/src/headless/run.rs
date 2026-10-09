@@ -51,6 +51,7 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
             .with_agent_registry(registry);
     let (agent, _mcp_snapshot) = RuntimeBuilder::from_spec(config.cwd.clone(), spec)
         .mcp_sources(config.mcp_config_sources)
+        .settings_tool_output(config.settings_tool_output.clone())
         .agent_deps(deps)
         .build_ready(vec![])
         .await?;

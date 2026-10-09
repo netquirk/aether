@@ -7,6 +7,7 @@ use acp_utils::notifications::{
     WorkspaceStatusPayload, WorkspaceStatusResponse,
 };
 use aether_auth::OAuthCredentialStorage;
+use aether_project::ToolOutputSettings;
 use aether_telemetry::TelemetryRuntime;
 use agent_client_protocol::schema::v2::{
     self as acp, AgentCapabilities, AuthMethod, CancelSessionNotification, CloseSessionRequest, CloseSessionResponse,
@@ -76,6 +77,10 @@ pub(crate) struct AcpStateConfig {
     pub(crate) runtime_factory: Option<Arc<dyn super::session::runtime::RuntimeFactory>>,
     pub(crate) cwd: PathBuf,
     pub(crate) detached: DetachedArgs,
+    /// Top-level `toolOutput` block from the loaded settings. Threaded into
+    /// the [`SessionFactory`] so the runtime's MCP layer can resolve the
+    /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` cap.
+    pub(crate) tool_output_settings: Option<ToolOutputSettings>,
 }
 
 struct SpawnedSession {
@@ -175,6 +180,7 @@ impl AcpState {
             config.telemetry.as_ref().map(|runtime| runtime.observer_factory()),
             config.runtime_factory,
             config.detached,
+            config.tool_output_settings.clone(),
         );
         Self {
             client_slot: ClientSlot::default(),
@@ -770,6 +776,7 @@ mod tests {
             runtime_factory: None,
             cwd: PathBuf::from("/tmp"),
             detached: DetachedArgs::default(),
+            tool_output_settings: None,
         })
     }
 

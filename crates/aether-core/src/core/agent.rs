@@ -127,6 +127,11 @@ impl Agent {
 
         let context_limit = config.context_window.or_else(|| config.llm.context_window());
 
+        let mut tool_executions = ToolExecutions::default();
+        if let Some(handle) = &config.mcp {
+            tool_executions.set_tool_output_cap(handle.tool_output_cap_arc());
+        }
+
         Self {
             llm: config.llm,
             context: config.context,
@@ -141,7 +146,7 @@ impl Agent {
             auto_continue: config.auto_continue,
             retry_config: config.retry_config,
             repetition: RepetitionTracker::new(config.repetition),
-            tool_executions: ToolExecutions::default(),
+            tool_executions,
             pending_inputs: VecDeque::new(),
             queued_inputs: VecDeque::new(),
             context_window: config.context_window,

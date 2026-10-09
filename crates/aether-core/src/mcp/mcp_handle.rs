@@ -1,4 +1,5 @@
 use super::run_mcp_task::ManagerCommand;
+use super::tool_output::ToolOutputCap;
 use futures::{Stream, future::join_all};
 use mcp_utils::client::{CallToolError, CallToolOptions, McpError, McpSnapshot, ToolCallEvent, ToolRoute, call_tool};
 use rmcp::model::{GetPromptRequestParams, GetPromptResult, Prompt};
@@ -13,6 +14,7 @@ pub type ToolCallStream = Pin<Box<dyn Stream<Item = ToolCallEvent> + Send>>;
 pub struct McpHandle {
     control_tx: mpsc::Sender<ManagerCommand>,
     snapshot_rx: watch::Receiver<Arc<McpSnapshot>>,
+    tool_output_cap: Arc<ToolOutputCap>,
 }
 
 #[derive(Debug, Error)]
@@ -31,8 +33,22 @@ impl McpHandle {
     pub(super) fn new(
         control_tx: mpsc::Sender<ManagerCommand>,
         snapshot_rx: watch::Receiver<Arc<McpSnapshot>>,
+        tool_output_cap: Arc<ToolOutputCap>,
     ) -> Self {
-        Self { control_tx, snapshot_rx }
+        Self { control_tx, snapshot_rx, tool_output_cap }
+    }
+
+    /// The cap applied to every successful tool result before it reaches the
+    /// model context. Shared by handle so the production and test paths cap
+    /// the same way.
+    pub fn tool_output_cap(&self) -> &ToolOutputCap {
+        &self.tool_output_cap
+    }
+
+    /// An `Arc` clone of the cap, for callers that need to keep one across an
+    /// `await` (e.g. when wiring it into the agent's tool-execution registry).
+    pub fn tool_output_cap_arc(&self) -> Arc<ToolOutputCap> {
+        self.tool_output_cap.clone()
     }
 
     pub fn snapshot(&self) -> Arc<McpSnapshot> {

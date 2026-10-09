@@ -9,6 +9,7 @@ use utils::{SettingsStore, variables::Vars};
 use crate::agent_spec::McpConfigSource;
 use crate::core::AgentDeps;
 use crate::events::{AgentCommand, Command};
+use crate::mcp::tool_output::ToolOutputCap;
 
 use super::{
     gateway_service::GatewayService,
@@ -187,6 +188,7 @@ pub struct McpBuilder {
     vars: Vars,
     tool_filter: ToolFilter,
     progressive_discovery_instructions: Option<String>,
+    tool_output_cap: Arc<ToolOutputCap>,
 }
 
 impl McpBuilder {
@@ -208,6 +210,7 @@ impl McpBuilder {
             vars,
             tool_filter: ToolFilter::default(),
             progressive_discovery_instructions: None,
+            tool_output_cap: Arc::new(ToolOutputCap::new(0, root_dir.as_ref().join(".prairie/out"))),
         }
     }
 
@@ -218,6 +221,13 @@ impl McpBuilder {
 
     pub fn with_tool_filter(mut self, filter: ToolFilter) -> Self {
         self.tool_filter = filter;
+        self
+    }
+
+    /// Replace the cap applied to every successful tool result before it
+    /// reaches the model context. Pass `0` to disable the cap.
+    pub fn with_tool_output_cap(mut self, cap: ToolOutputCap) -> Self {
+        self.tool_output_cap = Arc::new(cap);
         self
     }
 
@@ -304,6 +314,7 @@ impl McpBuilder {
             vars: _,
             tool_filter,
             progressive_discovery_instructions,
+            tool_output_cap,
         } = self;
         if servers.iter().any(|server| server.tool_exposure.has_deferred_tools())
             && servers.iter().any(|server| server.name == PROGRESSIVE_DISCOVERY_INSTRUCTION_NAME)
@@ -313,7 +324,7 @@ impl McpBuilder {
         let (manager_tx, manager_rx) = mpsc::channel::<ManagerCommand>(mcp_channel_capacity);
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(mcp_utils::client::McpSnapshot::default()));
         let (event_tx, event_rx) = mpsc::channel::<McpClientEvent>(mcp_channel_capacity);
-        let mcp = McpHandle::new(manager_tx, snapshot_rx);
+        let mcp = McpHandle::new(manager_tx, snapshot_rx, tool_output_cap);
         let gateway_transport = if servers.iter().any(|server| server.tool_exposure.has_deferred_tools()) {
             let path = UnixSocketPath::new().map_err(|error| McpError::TransportError(error.to_string()))?;
             Some(UnixSocketMcpTransport::bind(path).map_err(|error| McpError::TransportError(error.to_string()))?)

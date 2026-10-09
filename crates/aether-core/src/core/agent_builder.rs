@@ -401,6 +401,7 @@ mod tests {
             mcp_config_sources: Vec::new(),
             exposure: AgentSpecExposure::both(),
             tools: ToolFilter::default(),
+            tool_output: None,
         };
 
         let dependencies = AgentDeps::default().with_session_affinity_key("conversation-123");
@@ -427,6 +428,7 @@ mod tests {
             mcp_config_sources: Vec::new(),
             exposure: AgentSpecExposure::both(),
             tools: ToolFilter::default(),
+            tool_output: None,
         };
 
         let builder = AgentBuilder::from_spec(&spec, vec![], &AgentDeps::default()).await;

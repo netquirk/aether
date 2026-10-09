@@ -11,10 +11,12 @@ pub mod prompt_file;
 pub mod testing;
 
 pub use aether_core::core::{PromptSource, PromptSourceError};
+pub use aether_core::mcp::ToolOutputSettings;
 pub use aether_settings::{
-    AetherSettings, AetherSettingsSource, CredentialsStoreConfig, OtlpTelemetrySettings, SettingsFileSource,
-    TelemetryContentSettings, TelemetrySettings, project_settings_exist, project_settings_path, settings_resource_root,
-    user_settings_exist, user_settings_path,
+    AETHER_TOOL_OUTPUT_MAX_BYTES_ENV, AetherSettings, AetherSettingsSource, CredentialsStoreConfig,
+    OtlpTelemetrySettings, PRAIRIE_TOOL_OUTPUT_DIR_ENV, SettingsFileSource, TelemetryContentSettings,
+    TelemetrySettings, project_settings_exist, project_settings_path, resolve_tool_output_cap, settings_resource_root,
+    tool_output_dir_from_env, tool_output_max_bytes_from_env, user_settings_exist, user_settings_path,
 };
 pub use agent_catalog::AgentCatalog;
 pub use agent_config::AgentConfig;

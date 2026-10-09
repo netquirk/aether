@@ -2,6 +2,7 @@ pub mod error;
 pub mod run;
 
 use aether_core::agent_spec::{AgentSpec, McpConfigSource};
+use aether_project::ToolOutputSettings;
 use aether_project::{AetherSettings, AgentCatalog, TelemetrySettings};
 use aether_telemetry::AgentTraceContext;
 use error::CliError;
@@ -64,6 +65,12 @@ pub struct RunConfig {
     pub oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
     pub telemetry: Option<TelemetrySettings>,
     pub trace_context: Option<AgentTraceContext>,
+    /// Top-level `toolOutput` block from the loaded settings. Threaded into
+    /// the runtime via [`crate::runtime::RuntimeBuilder::settings_tool_output`]
+    /// so the MCP runtime can resolve the cap together with the per-agent
+    /// override and the `AETHER_TOOL_OUTPUT_MAX_BYTES` /
+    /// `PRAIRIE_TOOL_OUTPUT_DIR` env vars.
+    pub settings_tool_output: Option<ToolOutputSettings>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -183,6 +190,7 @@ impl RunConfig {
         let provider_connections = args.provider_connection.clone().into_overrides();
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
+        let settings_tool_output = settings.tool_output.clone();
         let selection = initial_selection(args.agent, args.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -201,6 +209,7 @@ impl RunConfig {
             oauth_credential_store,
             telemetry,
             trace_context: None,
+            settings_tool_output,
         })
     }
 
@@ -212,6 +221,7 @@ impl RunConfig {
         let provider_connections = ProviderConnectionOverrides::new(options.providers.unwrap_or_default());
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
+        let settings_tool_output = settings.tool_output.clone();
         let selection = initial_selection(options.agent, options.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -235,6 +245,7 @@ impl RunConfig {
             oauth_credential_store,
             telemetry,
             trace_context: options.trace_context,
+            settings_tool_output,
         })
     }
 }

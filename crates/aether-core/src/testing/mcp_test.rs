@@ -205,7 +205,8 @@ impl McpTest {
                     };
                 }
                 ToolCallEvent::Complete(outcome) => {
-                    let result = convert_tool_result(&request_for_outcome, outcome).map(|(result, _)| result);
+                    let result = convert_tool_result(&request_for_outcome, outcome, self.mcp.tool_output_cap())
+                        .map(|(result, _)| result);
                     return ToolCallOutcome { result, progress, deferred_task: None };
                 }
                 ToolCallEvent::TaskStatus(_) | ToolCallEvent::TaskComplete { .. } | ToolCallEvent::Cancelled { .. } => {
@@ -229,7 +230,12 @@ impl McpTest {
         while let Some((request, event)) = self.next_deferred_event().await {
             match event {
                 ToolCallEvent::TaskComplete { task, result } => {
-                    return Some(task_outcome(map_task_result_to_outcome(request, task, result)));
+                    return Some(task_outcome(map_task_result_to_outcome(
+                        request,
+                        task,
+                        result,
+                        self.mcp.tool_output_cap(),
+                    )));
                 }
                 ToolCallEvent::Cancelled { task_id } => {
                     return Some(task_outcome(crate::events::TaskOutcome {

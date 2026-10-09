@@ -1,4 +1,6 @@
-use aether_project::{AetherSettings, AetherSettingsSource, AgentCatalog, SettingsError, SettingsFileSource};
+use aether_project::{
+    AetherSettings, AetherSettingsSource, AgentCatalog, SettingsError, SettingsFileSource, ToolOutputSettings,
+};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -50,6 +52,19 @@ impl SettingsSourceArgs {
     pub fn load_agent_catalog(&self, cwd: &Path) -> Result<AgentCatalog, SettingsError> {
         let settings = self.load_settings(cwd)?;
         AgentCatalog::from_settings_or_empty(cwd, settings)
+    }
+
+    /// Return the top-level `toolOutput` block from the loaded settings, or
+    /// `None` if the source is missing the block. Used by [`SessionFactory`]
+    /// to thread the cap into the runtime without re-loading the catalog.
+    pub fn tool_output_settings(&self) -> Result<Option<ToolOutputSettings>, SettingsError> {
+        // The settings source may not point at a file at all (e.g. CLI args
+        // with neither `--settings-json` nor `--settings-file`); in that case
+        // fall through to the project/user defaults so the runtime still
+        // picks up the top-level cap if one is declared.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let settings = self.load_settings(&cwd)?;
+        Ok(settings.tool_output)
     }
 }
 

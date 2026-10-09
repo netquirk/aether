@@ -1,4 +1,5 @@
 use crate::{McpSourceSpec, PromptSource};
+use aether_core::mcp::ToolOutputSettings;
 use llm::{ModelSettings, ProviderConnectionOverrides, ReasoningEffort};
 use mcp_utils::client::ToolFilter;
 
@@ -55,6 +56,11 @@ pub struct AgentConfig {
     /// Per-agent MCP tool filter (allow/deny lists).
     #[serde(default, skip_serializing_if = "ToolFilter::is_empty")]
     pub tools: ToolFilter,
+    /// Per-agent override of the tool result cap. When unset the agent
+    /// inherits the top-level `toolOutput` block. Env vars still win over
+    /// both. See [`ToolOutputSettings`] and `AETHER_TOOL_OUTPUT_MAX_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<ToolOutputSettings>,
 }
 
 fn require_agent_invocation_surface_schema(schema: &mut schemars::Schema) {

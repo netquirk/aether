@@ -257,6 +257,7 @@ fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result
         runtime_factory: None,
         cwd: cwd.to_path_buf(),
         detached,
+        tool_output_settings: settings.tool_output,
     }))
 }
 

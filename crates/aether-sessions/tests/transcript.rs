@@ -1,8 +1,8 @@
 use aether_core::events::{AgentEvent, ContextEvent, LlmCallOutcome, TurnEvent, TurnOutcome};
 use aether_core::testing::{TestScenario, test_agent};
 use aether_sessions::testing::{
-    agent_switched, assistant_text, compaction_result, llm_call_started, partial_text, tool_call, tool_error, tool_result,
-    turn_ended, user_message,
+    agent_switched, assistant_text, compaction_result, llm_call_started, partial_text, tool_call, tool_error,
+    tool_result, turn_ended, user_message,
 };
 use aether_sessions::{
     SessionEvent, TurnEntry, context_from_events, conversation_messages_from_events, turn_entries_from_events,
@@ -229,10 +229,9 @@ async fn persisted_transcript_records_each_turns_model_across_a_switch() {
     let initial: llm::LlmModel = "openai:gpt-5.5".parse().expect("model parses");
     let switched: llm::LlmModel = "anthropic:claude-opus-4-6".parse().expect("model parses");
 
-    let second_provider =
-        FakeLlmProvider::with_single_response(llm_response().text(&["after switch"]).build())
-            .with_model(switched.clone())
-            .with_display_name("Anthropic");
+    let second_provider = FakeLlmProvider::with_single_response(llm_response().text(&["after switch"]).build())
+        .with_model(switched.clone())
+        .with_display_name("Anthropic");
 
     let events = test_agent()
         .without_mcp()

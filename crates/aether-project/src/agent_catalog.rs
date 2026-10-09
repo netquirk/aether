@@ -237,6 +237,7 @@ fn resolve_agent_entry(
         mcp_config_sources,
         exposure: AgentSpecExposure { user_invocable: entry.user_invocable, agent_invocable: entry.agent_invocable },
         tools: entry.tools,
+        tool_output: entry.tool_output,
     })
 }
 

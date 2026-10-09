@@ -6,6 +6,7 @@ use aether_core::agent_spec::AgentSpec;
 use aether_core::core::{AgentDeps, AgentHandle};
 use aether_core::events::{AgentCommand, AgentEvent, Command};
 use aether_core::mcp::{McpHandle, McpRuntime};
+use aether_project::ToolOutputSettings;
 use llm::{ChatMessage, SessionUsageEvent};
 use mcp_utils::client::{
     ElicitingOAuthHandler, McpClientEvent, McpConnectionDetails, McpError, McpServer, McpServerStatusEntry,
@@ -90,11 +91,21 @@ pub(crate) struct ProductionRuntimeFactory {
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
     agent_deps: AgentDeps,
+    /// Top-level `toolOutput` block from the loaded settings. The factory
+    /// passes it to the [`RuntimeBuilder`] which resolves the cap with the
+    /// per-agent override and the `AETHER_TOOL_OUTPUT_MAX_BYTES` /
+    /// `PRAIRIE_TOOL_OUTPUT_DIR` env vars.
+    settings_tool_output: Option<ToolOutputSettings>,
 }
 
 impl ProductionRuntimeFactory {
-    pub fn new(cwd: PathBuf, client_servers: Vec<McpServer>, agent_deps: AgentDeps) -> Self {
-        Self { cwd, mcp_servers: client_servers, agent_deps }
+    pub fn new(
+        cwd: PathBuf,
+        client_servers: Vec<McpServer>,
+        agent_deps: AgentDeps,
+        settings_tool_output: Option<ToolOutputSettings>,
+    ) -> Self {
+        Self { cwd, mcp_servers: client_servers, agent_deps, settings_tool_output }
     }
 }
 
@@ -111,6 +122,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
 
         let mut builder = RuntimeBuilder::from_spec(self.cwd.clone(), spec.clone())
             .extra_servers(extra_servers)
+            .settings_tool_output(self.settings_tool_output.clone())
             .agent_deps(self.agent_deps.clone());
         if let Some(last) = usage_seed {
             builder = builder.resume_usage(last);

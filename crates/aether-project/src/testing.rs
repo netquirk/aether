@@ -80,6 +80,7 @@ pub fn fake_spec(name: &str, exposure: AgentSpecExposure) -> AgentSpec {
         mcp_config_sources: Vec::new(),
         exposure,
         tools: ToolFilter::default(),
+        tool_output: None,
     }
 }
 

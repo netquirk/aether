@@ -102,3 +102,57 @@ your collector and its access controls. See the website telemetry reference for 
 attribute mapping.
 
 For an OTLP backend with exact signal URLs, set `otlp.tracesEndpoint` and `otlp.metricsEndpoint`. Aether sends each configured signal to its matching URL unchanged; an unconfigured signal uses the `/v1/traces` or `/v1/metrics` URL derived from `otlp.endpoint`.
+
+## Tool output cap
+
+Aether caps the byte length of every tool result before it reaches the model. The
+cap keeps the head and tail of the original text, writes the full output to a
+content-hashed file on disk, and embeds a marker in the model-visible text
+naming the file so the model can read it back in ranges. The on-disk filename
+is a hex content hash, so the same `(tool, cap)` pair produces byte-identical
+text on every call — including across runs — which keeps prompt caches warm.
+
+The cap is 16 KiB by default. Configure it with the top-level `toolOutput`
+block; agents can override it per-agent with their own `toolOutput` field.
+Two environment variables always win over the settings file:
+
+- `AETHER_TOOL_OUTPUT_MAX_BYTES` overrides `maxBytes`. `0` disables the cap.
+- `PRAIRIE_TOOL_OUTPUT_DIR` overrides `outputDir`.
+
+A project that caps tool results at 32 KiB and writes full outputs to
+`/var/log/aether`:
+
+```json
+{
+  "toolOutput": {
+    "maxBytes": 32768,
+    "outputDir": "/var/log/aether"
+  },
+  "agents": [
+    {
+      "name": "Build",
+      "description": "Builds features and fixes bugs",
+      "model": "anthropic:claude-sonnet-4-5-20250929",
+      "userInvocable": true
+    }
+  ]
+}
+```
+
+An agent that disables the cap while leaving the top-level default in place:
+
+```json
+{
+  "toolOutput": { "maxBytes": 32768 },
+  "agents": [
+    {
+      "name": "Audit",
+      "description": "Inspects verbose CI logs that must reach the model verbatim",
+      "model": "anthropic:claude-sonnet-4-5-20250929",
+      "userInvocable": true,
+      "toolOutput": { "maxBytes": 0 }
+    }
+  ]
+}
+```
+

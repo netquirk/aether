@@ -1,14 +1,17 @@
 use crate::events::{SubAgentProgressPayload, TaskOutcome, TaskOutcomeState, ToolEvent, task_created_result};
 use crate::mcp::tool_bridge::{convert_tool_result, map_task_result_to_outcome};
+use crate::mcp::tool_output::ToolOutputCap;
 use llm::{ToolCallError, ToolCallRequest, ToolCallResult};
 use mcp_utils::client::{CancellationToken, ToolCallEvent};
 use mcp_utils::display_meta::ToolResultMeta;
 use rmcp::model::ProgressNotificationParam;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct ToolExecutions {
     executions: HashMap<String, ToolExecution>,
+    cap: Option<Arc<ToolOutputCap>>,
 }
 
 pub(super) enum ToolExecutionUpdate {
@@ -52,6 +55,10 @@ impl ToolExecutions {
             },
         );
         cancellation_token
+    }
+
+    pub(super) fn set_tool_output_cap(&mut self, cap: Arc<ToolOutputCap>) {
+        self.cap = Some(cap);
     }
 
     pub(super) fn has_foreground(&self) -> bool {
@@ -112,7 +119,8 @@ impl ToolExecutions {
                 let Some(execution) = self.take_background(tool_id) else {
                     return ToolExecutionUpdate::Ignored;
                 };
-                ToolExecutionUpdate::TaskCompleted(map_task_result_to_outcome(execution.request, task, result))
+                let cap = self.cap.clone().unwrap_or_else(|| Arc::new(ToolOutputCap::new(0, std::env::temp_dir())));
+                ToolExecutionUpdate::TaskCompleted(map_task_result_to_outcome(execution.request, task, result, &cap))
             }
             ToolCallEvent::Cancelled { task_id } => {
                 if self.take_retiring(tool_id).is_some() {
@@ -134,7 +142,8 @@ impl ToolExecutions {
                 let Some(execution) = self.take_foreground(tool_id) else {
                     return ToolExecutionUpdate::Ignored;
                 };
-                match convert_tool_result(&execution.request, outcome) {
+                let cap = self.cap.clone().unwrap_or_else(|| Arc::new(ToolOutputCap::new(0, std::env::temp_dir())));
+                match convert_tool_result(&execution.request, outcome, &cap) {
                     Ok((result, result_meta)) => ToolExecutionUpdate::Completed {
                         result: Ok(result.clone()),
                         event: ToolEvent::Result { result, result_meta },

@@ -3,6 +3,7 @@ use aether_core::agent_spec::AgentSpec;
 use aether_core::core::AgentDeps;
 use aether_core::events::DynObserverFactory;
 use aether_project::AgentCatalog;
+use aether_project::ToolOutputSettings;
 use aether_sessions::model::{SessionEvent, SessionMeta, last_agent_from_events};
 use agent_client_protocol::schema::v2::{self as acp, NewSessionRequest, ResumeSessionRequest, SessionId};
 use agent_client_protocol::{Client, ConnectionTo, Error};
@@ -39,6 +40,10 @@ pub(crate) struct SessionFactory {
     runtime_factory: Option<Arc<dyn RuntimeFactory>>,
     detached: DetachedArgs,
     available: OnceCell<Vec<LlmModel>>,
+    /// Top-level `toolOutput` block from the loaded settings. The factory
+    /// passes it to the [`ProductionRuntimeFactory`] which threads it into
+    /// the MCP runtime.
+    tool_output_settings: Option<ToolOutputSettings>,
 }
 
 /// The fully-built session ready to be registered with [`AcpState`](crate::acp::state::AcpState).
@@ -80,6 +85,7 @@ impl SessionFactory {
         observer_factory: Option<DynObserverFactory>,
         runtime_factory: Option<Arc<dyn RuntimeFactory>>,
         detached: DetachedArgs,
+        tool_output_settings: Option<ToolOutputSettings>,
     ) -> Self {
         Self {
             settings_source,
@@ -91,6 +97,7 @@ impl SessionFactory {
             runtime_factory,
             detached,
             available: OnceCell::new(),
+            tool_output_settings,
         }
     }
 
@@ -226,7 +233,12 @@ impl SessionFactory {
             .with_agent_registry(catalog.registry().clone())
             .with_mcp_client_capabilities(mcp_capabilities)
             .with_session_affinity_key(session_affinity_key);
-        Arc::new(ProductionRuntimeFactory::new(cwd, map_acp_mcp_servers(mcp_servers), deps))
+        Arc::new(ProductionRuntimeFactory::new(
+            cwd,
+            map_acp_mcp_servers(mcp_servers),
+            deps,
+            self.tool_output_settings.clone(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -4,6 +4,8 @@ use crate::agent_config::AgentConfig;
 use crate::error::SettingsError;
 use crate::{McpFileSpec, McpSourceSpec, PromptSource};
 use aether_core::core::Prompt;
+use aether_core::mcp::ToolOutputSettings;
+use aether_core::mcp::tool_output::ToolOutputCap;
 use llm::ProviderConnectionOverrides;
 use mcp_utils::client::McpConfig;
 use schemars::JsonSchema;
@@ -12,6 +14,22 @@ use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 use utils::variables::{VarError, Vars};
+
+/// Environment variable that overrides the per-call tool result byte cap for a
+/// single run. `0` disables the cap; an unparseable value is ignored.
+pub const AETHER_TOOL_OUTPUT_MAX_BYTES_ENV: &str = "AETHER_TOOL_OUTPUT_MAX_BYTES";
+/// Environment variable that overrides the directory the cap writes full
+/// truncated tool outputs to.
+pub const PRAIRIE_TOOL_OUTPUT_DIR_ENV: &str = "PRAIRIE_TOOL_OUTPUT_DIR";
+/// Parses `AETHER_TOOL_OUTPUT_MAX_BYTES` from the process environment.
+pub fn tool_output_max_bytes_from_env() -> Option<usize> {
+    std::env::var(AETHER_TOOL_OUTPUT_MAX_BYTES_ENV).ok().and_then(|value| value.parse().ok())
+}
+/// Returns the directory named by `PRAIRIE_TOOL_OUTPUT_DIR` in the process
+/// environment, or `None` when unset / blank.
+pub fn tool_output_dir_from_env() -> Option<PathBuf> {
+    std::env::var(PRAIRIE_TOOL_OUTPUT_DIR_ENV).ok().map(PathBuf::from).filter(|path| !path.as_os_str().is_empty())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -39,6 +57,35 @@ pub enum CredentialsStoreConfig {
 
 const PROJECT_SETTINGS_PATH: &str = ".aether/settings.json";
 const USER_SETTINGS_FILENAME: &str = "settings.json";
+
+/// Resolve the [`ToolOutputCap`] for a run. The layering, lowest to highest
+/// precedence, is:
+///
+/// 1. The 16 KiB default for `max_bytes` and `<project_root>/.prairie/out` for
+///    `output_dir`.
+/// 2. The top-level `AetherSettings.tool_output` block.
+/// 3. The per-agent `AgentConfig.tool_output` override.
+/// 4. The `AETHER_TOOL_OUTPUT_MAX_BYTES` env var (wins over settings for
+///    `max_bytes`; an unparseable value is ignored). `0` disables the cap.
+/// 5. The `PRAIRIE_TOOL_OUTPUT_DIR` env var (wins over settings for
+///    `output_dir`; an empty value is ignored).
+pub fn resolve_tool_output_cap(
+    project_root: &Path,
+    settings: Option<&ToolOutputSettings>,
+    agent_override: Option<&ToolOutputSettings>,
+    env_max_bytes: Option<usize>,
+    env_output_dir: Option<PathBuf>,
+) -> ToolOutputCap {
+    // Merge agent override over top-level settings on a per-field basis, then
+    // let the env vars override the merged values.
+    let mut merged = settings.cloned().unwrap_or_default();
+    if let Some(agent) = agent_override.cloned() {
+        merged.merge(agent);
+    }
+    let max_bytes = env_max_bytes.unwrap_or_else(|| merged.resolved_max_bytes());
+    let output_dir = env_output_dir.unwrap_or_else(|| merged.resolved_output_dir(project_root));
+    ToolOutputCap::new(max_bytes, output_dir)
+}
 
 pub fn user_settings_path() -> Option<PathBuf> {
     SettingsStore::new("AETHER_HOME", ".aether").map(|store| store.home().join(USER_SETTINGS_FILENAME))
@@ -98,6 +145,15 @@ pub struct AetherSettings {
     /// OpenTelemetry `GenAI` telemetry configuration. Its presence enables telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetrySettings>,
+    /// Per-call tool result cap applied by the MCP runtime. Inherited by every
+    /// agent unless the agent sets its own `toolOutput` block. The cap writes
+    /// full truncated tool results to disk so the model can read them back in
+    /// ranges, and embeds a marker in the returned text naming the on-disk
+    /// file. See [`ToolOutputSettings`] for the layering rules and
+    /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` for the env
+    /// overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<ToolOutputSettings>,
     /// The agents defined for this project. At least one agent is required.
     #[schemars(length(min = 1))]
     pub agents: Vec<AgentConfig>,
@@ -111,7 +167,7 @@ pub struct AetherSettings {
 /// `known_top_level_keys_match_schema` test in this module will fail the build
 /// if they ever drift.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] =
-    &["agent", "prompts", "mcps", "providers", "credentialsStore", "telemetry", "agents"];
+    &["agent", "prompts", "mcps", "providers", "credentialsStore", "telemetry", "toolOutput", "agents"];
 
 /// Returns the keys present in `value` that [`AetherSettings`] does not
 /// declare, preserving their original ordering for stable, testable output.
@@ -337,6 +393,10 @@ impl AetherSettings {
             self.telemetry.get_or_insert_default().merge(next_telemetry);
         }
 
+        if let Some(next_tool_output) = next.tool_output {
+            self.tool_output.get_or_insert_default().merge(next_tool_output);
+        }
+
         for next_agent in next.agents {
             if let Some(existing) = self.agents.iter_mut().find(|agent| agent.name.trim() == next_agent.name.trim()) {
                 *existing = next_agent;
@@ -534,6 +594,7 @@ mod tests {
     use crate::{AgentCatalog, McpFileSpec, McpSourceSpec, PromptSource};
     use aether_core::agent_spec::McpConfigSource;
     use aether_core::core::Prompt;
+    use aether_core::mcp::tool_output::DEFAULT_MAX_BYTES;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1637,5 +1698,142 @@ mod tests {
             if path == &Some(PathBuf::from("/custom/creds.enc"))
                 && password_env == &Some("MY_SECRET".to_string())
         ));
+    }
+
+    #[test]
+    fn parses_top_level_tool_output_settings() {
+        let config = AetherSettings::try_from(
+            json!({
+                "toolOutput": { "maxBytes": 4096, "outputDir": "/tmp/aether-tool-out" },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+
+        let tool_output = config.tool_output.expect("tool output parsed");
+        assert_eq!(tool_output.max_bytes, Some(4096));
+        assert_eq!(tool_output.output_dir, Some(PathBuf::from("/tmp/aether-tool-out")));
+    }
+
+    #[test]
+    fn parses_partial_tool_output_settings() {
+        // Only one field set; the other inherits from lower layers.
+        let config = AetherSettings::try_from(
+            json!({
+                "toolOutput": { "maxBytes": 0 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+
+        let tool_output = config.tool_output.expect("tool output parsed");
+        assert_eq!(tool_output.max_bytes, Some(0));
+        assert!(tool_output.output_dir.is_none());
+    }
+
+    #[test]
+    fn tool_output_settings_merge_overrides_per_field() {
+        let mut base = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/base")) };
+        base.merge(ToolOutputSettings { max_bytes: Some(0), output_dir: None });
+        // max_bytes from the next layer wins, output_dir keeps the base value.
+        assert_eq!(base.max_bytes, Some(0));
+        assert_eq!(base.output_dir, Some(PathBuf::from("/from/base")));
+    }
+
+    #[test]
+    fn tool_output_settings_resolved_max_bytes_uses_default() {
+        let settings = ToolOutputSettings::default();
+        assert_eq!(settings.resolved_max_bytes(), DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn tool_output_settings_resolved_output_dir_uses_default() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings::default();
+        assert_eq!(settings.resolved_output_dir(project), PathBuf::from("/repo/.prairie/out"));
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_uses_defaults() {
+        let project = Path::new("/repo");
+        let cap = resolve_tool_output_cap(project, None, None, None, None);
+        assert_eq!(cap.max_bytes(), DEFAULT_MAX_BYTES);
+        assert_eq!(cap.output_dir(), Path::new("/repo/.prairie/out"));
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_top_level_overrides_default() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let cap = resolve_tool_output_cap(project, Some(&settings), None, None, None);
+        assert_eq!(cap.max_bytes(), 4096);
+        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_agent_overrides_top_level() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let agent = ToolOutputSettings { max_bytes: Some(0), output_dir: Some(PathBuf::from("/from/agent")) };
+        let cap = resolve_tool_output_cap(project, Some(&settings), Some(&agent), None, None);
+        // Per-agent wins on every field it sets; the unset field
+        // (output_dir) is also overridden because the agent sets it.
+        assert_eq!(cap.max_bytes(), 0);
+        assert_eq!(cap.output_dir(), Path::new("/from/agent"));
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_agent_partial_override_inherits_rest() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let agent = ToolOutputSettings { max_bytes: Some(0), output_dir: None };
+        let cap = resolve_tool_output_cap(project, Some(&settings), Some(&agent), None, None);
+        assert_eq!(cap.max_bytes(), 0, "agent override wins for max_bytes");
+        assert_eq!(cap.output_dir(), Path::new("/from/settings"), "inherits from top-level");
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_env_wins_for_max_bytes() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let cap = resolve_tool_output_cap(project, Some(&settings), None, Some(8192), None);
+        assert_eq!(cap.max_bytes(), 8192, "env wins over settings for max_bytes");
+        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_env_wins_for_output_dir() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let cap = resolve_tool_output_cap(project, Some(&settings), None, None, Some(PathBuf::from("/from/env")));
+        assert_eq!(cap.max_bytes(), 4096);
+        assert_eq!(cap.output_dir(), Path::new("/from/env"), "env wins over settings for output_dir");
+    }
+
+    #[test]
+    fn resolve_tool_output_cap_env_zero_disables() {
+        let project = Path::new("/repo");
+        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
+        let cap = resolve_tool_output_cap(project, Some(&settings), None, Some(0), None);
+        assert_eq!(cap.max_bytes(), 0, "env 0 disables the cap");
+        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
+    }
+
+    #[test]
+    fn tool_output_settings_round_trip() {
+        // Both the JSON value and the typed value must produce equal settings
+        // for every legal combination so the public API can be used as the
+        // single source of truth.
+        let value = json!({
+            "maxBytes": 4096,
+            "outputDir": "/tmp/round-trip"
+        });
+        let parsed: ToolOutputSettings = serde_json::from_value(value.clone()).unwrap();
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(serialized, value);
     }
 }

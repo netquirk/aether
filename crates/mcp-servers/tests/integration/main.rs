@@ -17,3 +17,4 @@ mod test_bash;
 mod test_read_before_edit_safety;
 mod test_read_file_rule_meta;
 mod test_web_fetch;
+mod tool_output_cap_e2e;

@@ -139,8 +139,7 @@ impl GenericOpenAiProvider {
                 } else if let Some(env_var) = config.provider.required_env_var() {
                     std::env::var(env_var).map_err(|_| LlmError::MissingApiKey(env_var.to_string()))?
                 } else {
-                    std::env::var(CUSTOM_KEY_ENV)
-                        .map_err(|_| LlmError::MissingApiKey(CUSTOM_KEY_ENV.to_string()))?
+                    std::env::var(CUSTOM_KEY_ENV).map_err(|_| LlmError::MissingApiKey(CUSTOM_KEY_ENV.to_string()))?
                 }
             }
             ProviderAuthMode::None => String::new(),

@@ -281,6 +281,7 @@ mod tests {
             mcp_config_sources: Vec::new(),
             exposure: AgentSpecExposure::both(),
             tools: ToolFilter::default(),
+            tool_output: None,
         }
     }
 

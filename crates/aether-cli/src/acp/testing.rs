@@ -273,6 +273,7 @@ impl AcpTestHarness {
                 runtime_factory: Some(runtime_factory),
                 cwd: PathBuf::from("/tmp"),
                 detached,
+                tool_output_settings: None,
             },
             Arc::new(FakeProviderLogin),
         ));

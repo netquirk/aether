@@ -1,6 +1,5 @@
-use std::path::{Path, PathBuf};
-
 use crate::events::{TaskOutcome, TaskOutcomeState};
+use crate::mcp::tool_output::{ToolOutputCap, cap_tool_output};
 use mcp_utils::{
     client::{CallToolError, SERVERNAME_DELIMITER},
     display_meta::ToolResultMeta,
@@ -9,13 +8,6 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, Task};
 use serde_json;
 
 use llm::{ToolCallError, ToolCallRequest, ToolCallResult};
-
-/// Maximum bytes for a tool result before spilling to disk.
-/// ~50K tokens at ~4 bytes/token.
-const TOOL_RESULT_MAX_BYTES: usize = 200_000;
-
-/// Size of the head preview included inline when a result spills to disk.
-const SPILLOVER_PREVIEW_BYTES: usize = 10_000;
 
 /// Convert a `ToolCallRequest` to `rmcp::CallToolRequestParams`
 pub fn tool_call_request_to_mcp(request: &ToolCallRequest) -> Result<CallToolRequestParams, String> {
@@ -39,9 +31,14 @@ pub fn tool_call_request_to_mcp(request: &ToolCallRequest) -> Result<CallToolReq
 
 /// Convert an rmcp `CallToolResult` and request to `ToolCallResult` or `ToolCallError`,
 /// extracting any `_meta` metadata from structured content.
+///
+/// `cap` enforces the per-call result byte budget and writes the full output
+/// to disk when the result is over the budget. Pass a disabled cap (`max_bytes
+/// == 0`) to skip truncation.
 pub fn mcp_result_to_tool_call_result(
     request: &ToolCallRequest,
     mcp_result: rmcp::model::CallToolResult,
+    cap: &ToolOutputCap,
 ) -> Result<(ToolCallResult, Option<ToolResultMeta>), ToolCallError> {
     if mcp_result.is_error.unwrap_or(false) {
         let error_msg = mcp_result.content.first().map_or_else(
@@ -66,13 +63,13 @@ pub fn mcp_result_to_tool_call_result(
             .ok()
             .filter(|yaml| serde_yml::from_str::<serde_json::Value>(yaml).is_ok_and(|decoded| decoded == result_value))
             .unwrap_or_else(|| result_value.to_string());
-        let result_str = maybe_spillover(&request.id, yaml, TOOL_RESULT_MAX_BYTES, &spillover_dir());
+        let capped = cap_tool_output(cap, &yaml);
         Ok((
             ToolCallResult {
                 id: request.id.clone(),
                 name: request.name.clone(),
                 arguments: request.arguments.clone(),
-                result: result_str,
+                result: capped.text,
             },
             result_meta,
         ))
@@ -83,8 +80,9 @@ pub fn map_task_result_to_outcome(
     request: ToolCallRequest,
     task: Task,
     outcome: Result<CallToolResult, CallToolError>,
+    cap: &ToolOutputCap,
 ) -> TaskOutcome {
-    let state = match convert_tool_result(&request, outcome) {
+    let state = match convert_tool_result(&request, outcome, cap) {
         Ok((result, result_meta)) => TaskOutcomeState::Completed { result, result_meta },
         Err(error) => TaskOutcomeState::Failed { error },
     };
@@ -94,45 +92,11 @@ pub fn map_task_result_to_outcome(
 pub fn convert_tool_result(
     request: &ToolCallRequest,
     outcome: Result<CallToolResult, CallToolError>,
+    cap: &ToolOutputCap,
 ) -> Result<(ToolCallResult, Option<ToolResultMeta>), ToolCallError> {
     outcome
         .map_err(|error| ToolCallError::from_request(request, error.to_string()))
-        .and_then(|mcp_result| mcp_result_to_tool_call_result(request, mcp_result))
-}
-
-fn spillover_dir() -> PathBuf {
-    std::env::temp_dir().join("aether-tool-output")
-}
-
-/// If `result` exceeds `max_bytes`, write the full output to disk and return
-/// a head preview with a pointer to the file. Otherwise return unchanged.
-fn maybe_spillover(tool_id: &str, result: String, max_bytes: usize, dir: &Path) -> String {
-    if result.len() <= max_bytes {
-        return result;
-    }
-
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!("Failed to create tool-output dir: {e}");
-        return result;
-    }
-
-    let file_path = dir.join(format!("{tool_id}.txt"));
-
-    if let Err(e) = std::fs::write(&file_path, &result) {
-        tracing::warn!("Failed to write spillover file: {e}");
-        return result;
-    }
-
-    let preview_budget = SPILLOVER_PREVIEW_BYTES.min(max_bytes);
-    let preview_end = result.floor_char_boundary(preview_budget);
-    let preview = &result[..preview_end];
-    let total_bytes = result.len();
-    let dropped = total_bytes - preview_end;
-
-    format!(
-        "<preview>\n{preview}\n</preview>\n\n[Tool result too large ({total_bytes} bytes; {dropped} bytes dropped). Full output saved to {path}. Use grep, read, or tail to explore the full result.]",
-        path = file_path.display()
-    )
+        .and_then(|mcp_result| mcp_result_to_tool_call_result(request, mcp_result, cap))
 }
 
 fn extract_result_and_meta(
@@ -180,21 +144,26 @@ mod tests {
     use rmcp::model::{CallToolResult as McpCallToolResult, ContentBlock};
     use serde::Serialize;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn req() -> ToolCallRequest {
         ToolCallRequest { id: "call_123".into(), name: "test_tool".into(), arguments: "{}".into() }
     }
 
+    /// Tests use a cap with the budget high enough that the cap is
+    /// effectively a no-op; the cap's own behaviour is tested in
+    /// `mcp::tool_output::tests`. These tests focus on the bridge between
+    /// MCP results and `ToolCallResult`.
+    fn no_op_cap() -> Arc<ToolOutputCap> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(ToolOutputCap::new(usize::MAX, dir.keep()))
+    }
+
     fn call_structured(structured: serde_json::Value) -> (ToolCallResult, Option<ToolResultMeta>) {
         let mut mcp = McpCallToolResult::structured(structured);
         mcp.content = vec![];
-        mcp_result_to_tool_call_result(&req(), mcp).unwrap()
-    }
-
-    fn extract_preview(result: &str) -> &str {
-        let start = result.find("<preview>\n").unwrap() + "<preview>\n".len();
-        let end = result.find("\n</preview>").unwrap();
-        &result[start..end]
+        let cap = no_op_cap();
+        mcp_result_to_tool_call_result(&req(), mcp, &cap).unwrap()
     }
 
     #[test]
@@ -205,7 +174,8 @@ mod tests {
         });
         let mut mcp = McpCallToolResult::structured(structured);
         mcp.content = vec![ContentBlock::text("plain text fallback")];
-        let (result, meta) = mcp_result_to_tool_call_result(&req(), mcp).unwrap();
+        let cap = no_op_cap();
+        let (result, meta) = mcp_result_to_tool_call_result(&req(), mcp, &cap).unwrap();
 
         assert!(!result.result.contains("_meta"));
         assert!(result.result.contains("success"));
@@ -288,7 +258,8 @@ mod tests {
     #[test]
     fn test_tool_call_result_falls_back_to_content() {
         let mcp = McpCallToolResult::success(vec![ContentBlock::text("plain text result")]);
-        let (result, meta) = mcp_result_to_tool_call_result(&req(), mcp).unwrap();
+        let cap = no_op_cap();
+        let (result, meta) = mcp_result_to_tool_call_result(&req(), mcp, &cap).unwrap();
         assert!(result.result.contains("plain text result"));
         assert!(meta.is_none());
     }
@@ -365,7 +336,8 @@ mod tests {
     #[test]
     fn test_tool_call_result_handles_text_error_without_sdk_debug_output() {
         let mcp = McpCallToolResult::error(vec![ContentBlock::text("Error: file not found")]);
-        let err = mcp_result_to_tool_call_result(&req(), mcp).unwrap_err();
+        let cap = no_op_cap();
+        let err = mcp_result_to_tool_call_result(&req(), mcp, &cap).unwrap_err();
         assert_eq!(err.error, "Tool execution error: Error: file not found");
     }
 
@@ -378,7 +350,8 @@ mod tests {
         }))
         .unwrap();
         let mcp = McpCallToolResult::error(vec![image]);
-        let err = mcp_result_to_tool_call_result(&req(), mcp).unwrap_err();
+        let cap = no_op_cap();
+        let err = mcp_result_to_tool_call_result(&req(), mcp, &cap).unwrap_err();
         assert_eq!(err.error, r#"Tool execution error: {"type":"image","data":"aW1hZ2U=","mimeType":"image/png"}"#);
     }
 
@@ -402,94 +375,37 @@ mod tests {
         assert!(yaml.contains("key:") && yaml.contains("value") && !yaml.starts_with('{'));
     }
 
+    /// Bridge-level integration: a structured result over the cap is truncated
+    /// to the cap and the on-disk file holds the full YAML text. The
+    /// cap's own head+tail logic is exercised in `mcp::tool_output::tests`.
     #[test]
-    fn test_spillover_small_input_unchanged() {
+    fn oversized_structured_result_truncates_and_saves_full_yaml() {
         let dir = tempfile::tempdir().unwrap();
-        let input = "hello world".to_string();
-        assert_eq!(maybe_spillover("id", input.clone(), 1000, dir.path()), input);
-    }
-
-    #[test]
-    fn test_spillover_large_input_writes_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let large = "x".repeat(5000);
-        let result = maybe_spillover("test_large", large.clone(), 1000, dir.path());
-        for expected in ["<preview>", "</preview>", "Tool result too large", "5000 bytes", "test_large.txt"] {
-            assert!(result.contains(expected), "missing '{expected}' in: {result}");
-        }
-        let on_disk = std::fs::read_to_string(dir.path().join("test_large.txt")).unwrap();
-        assert_eq!(on_disk, large);
-    }
-
-    #[test]
-    fn test_spillover_preview_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let large = format!("HEAD_{}{}", "z".repeat(SPILLOVER_PREVIEW_BYTES + 5000), "TAIL");
-        let result = maybe_spillover("id", large, 1000, dir.path());
-        assert!(result.contains("HEAD_"));
-        assert!(!result.contains("TAIL"));
-    }
-
-    #[test]
-    fn test_spillover_preserves_utf8_boundaries() {
-        let dir = tempfile::tempdir().unwrap();
-        let large = format!("{}{}", "\u{1F600}".repeat(300), "a".repeat(5000));
-        let result = maybe_spillover("id", large, 100, dir.path());
-        assert!(extract_preview(&result).chars().count() > 0);
-    }
-
-    #[test]
-    fn test_mcp_result_spills_large_output() {
-        let request =
-            ToolCallRequest { id: "spill_integration".into(), name: "big_tool".into(), arguments: "{}".into() };
-        let mut mcp = McpCallToolResult::structured(json!({"data": "x".repeat(TOOL_RESULT_MAX_BYTES + 1000)}));
-        mcp.content = vec![];
-        let (result, _) = mcp_result_to_tool_call_result(&request, mcp).unwrap();
-        for expected in ["<preview>", "Tool result too large", "spill_integration.txt"] {
-            assert!(result.result.contains(expected));
-        }
-    }
-
-    /// Oversized tool results must be cut to the configured byte cap and the
-    /// returned text must explicitly mark how many bytes were dropped.
-    #[test]
-    fn oversized_tool_result_is_truncated_to_cap_and_marked() {
-        let request =
-            ToolCallRequest { id: "oversized_cap_marker".into(), name: "big_tool".into(), arguments: "{}".into() };
-        // Order the fields so the trailing sentinel comes *after* the large `data`
-        // blob. With `SPILLOVER_PREVIEW_BYTES` (10_000) smaller than the data,
-        // the preview only contains the leading fields and TAIL_SENTINEL is cut.
+        let cap = Arc::new(ToolOutputCap::new(256, dir.path().to_path_buf()));
+        let request = ToolCallRequest { id: "bridge_cap".into(), name: "big_tool".into(), arguments: "{}".into() };
         let payload = json!({
             "head": "HEAD_SENTINEL",
-            "data": "x".repeat(TOOL_RESULT_MAX_BYTES + 1000),
+            "data": "x".repeat(64 * 1024),
             "tail": "TAIL_SENTINEL",
         });
         let mut mcp = McpCallToolResult::structured(payload);
         mcp.content = vec![];
-        let (result, _) = mcp_result_to_tool_call_result(&request, mcp).unwrap();
+        let (result, _) = mcp_result_to_tool_call_result(&request, mcp, &cap).unwrap();
 
-        // 1. The configured byte cap is enforced on the text that reaches the model.
-        assert!(
-            result.result.len() <= TOOL_RESULT_MAX_BYTES,
-            "result length {} exceeds configured cap {}",
-            result.result.len(),
-            TOOL_RESULT_MAX_BYTES,
-        );
-
-        // 2. The truncation is marked explicitly, naming both the total size and the drop.
-        assert!(
-            result.result.contains("Tool result too large"),
-            "missing 'Tool result too large' marker in: {}",
-            result.result,
-        );
-        assert!(result.result.contains("bytes dropped"), "missing 'bytes dropped' phrase in marker: {}", result.result);
-
-        // 3. The head sentinel survives, the tail sentinel was actually cut.
+        assert!(result.result.len() <= 256, "result length {} exceeds cap 256", result.result.len());
+        assert!(result.result.starts_with("[aether: output truncated;"));
+        // Both head and tail are preserved in the preview; only the middle of
+        // the data blob is elided. The on-disk file still holds the full
+        // text so the model can read it back in ranges.
         assert!(result.result.contains("HEAD_SENTINEL"));
-        assert!(
-            !result.result.contains("TAIL_SENTINEL"),
-            "tail sentinel should have been dropped, got: {}",
-            result.result,
-        );
+        assert!(result.result.contains("TAIL_SENTINEL"));
+        // The elided marker advertises how much of the data was dropped.
+        assert!(result.result.contains(" elided "));
+        let saved = std::fs::read_dir(dir.path()).unwrap().find_map(Result::ok).expect("cap wrote the full output to disk");
+        let on_disk = std::fs::read_to_string(saved.path()).unwrap();
+        // The file holds the full YAML-encoded result byte-for-byte.
+        assert!(on_disk.contains("TAIL_SENTINEL"));
+        assert!(on_disk.contains("HEAD_SENTINEL"));
+        assert!(on_disk.len() > 256, "on-disk file should hold the full ~64 KiB payload, got {}", on_disk.len());
     }
 }

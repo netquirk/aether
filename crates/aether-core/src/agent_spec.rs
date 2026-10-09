@@ -4,6 +4,7 @@
 //! It represents a resolved runtime type, not a raw settings DTO.
 
 use crate::core::Prompt;
+use crate::mcp::ToolOutputSettings;
 use llm::{LlmModel, ModelSettings, ProviderConnectionOverrides, ReasoningEffort};
 use mcp_utils::client::{McpConfig, ToolFilter};
 use std::path::PathBuf;
@@ -67,6 +68,11 @@ pub struct AgentSpec {
     pub exposure: AgentSpecExposure,
     /// Tool filter for restricting which MCP tools this agent can use.
     pub tools: ToolFilter,
+    /// Per-agent override of the tool result cap. The MCP runtime resolves
+    /// this together with the top-level `toolOutput` block and the
+    /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` env vars to
+    /// build the cap. `None` means inherit the top-level block.
+    pub tool_output: Option<ToolOutputSettings>,
 }
 
 impl AgentSpec {
@@ -86,6 +92,7 @@ impl AgentSpec {
             mcp_config_sources: Vec::new(),
             exposure: AgentSpecExposure::none(),
             tools: ToolFilter::default(),
+            tool_output: None,
         }
     }
 }
