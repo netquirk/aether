@@ -209,6 +209,7 @@ struct AgentTestConfig {
     timeout: Option<Duration>,
     max_auto_continues: Option<u32>,
     max_turns: Option<u32>,
+    require_tool_call: Option<bool>,
     retry_config: Option<RetryConfig>,
     repetition: Option<RepetitionConfig>,
     observers: Vec<Box<dyn AgentObserver>>,
@@ -247,6 +248,7 @@ impl TestAgentBuilder {
                 timeout: None,
                 max_auto_continues: None,
                 max_turns: None,
+                require_tool_call: None,
                 retry_config: None,
                 repetition: None,
                 observers: Vec::new(),
@@ -312,6 +314,12 @@ impl TestAgentBuilder {
     /// Cap the number of LLM chat turns in a run for this test agent.
     pub fn max_turns(mut self, max: u32) -> Self {
         self.agent.max_turns = Some(max);
+        self
+    }
+
+    /// Mirror of [`crate::core::AgentBuilder::require_tool_call`].
+    pub fn require_tool_call(mut self, require: bool) -> Self {
+        self.agent.require_tool_call = Some(require);
         self
     }
 
@@ -444,6 +452,9 @@ impl TestAgentBuilder {
         }
         if let Some(max) = config.max_turns {
             builder = builder.max_turns(Some(max));
+        }
+        if let Some(require) = config.require_tool_call {
+            builder = builder.require_tool_call(require);
         }
         if let Some(retry) = config.retry_config {
             builder = builder.retry(retry);

@@ -45,6 +45,7 @@ pub struct AgentBuilder {
     tool_timeout: Duration,
     compaction_config: Option<CompactionConfig>,
     max_auto_continues: u32,
+    require_tool_call: bool,
     retry_config: RetryConfig,
     repetition_config: RepetitionConfig,
     context_window: Option<u32>,
@@ -68,6 +69,7 @@ impl AgentBuilder {
             tool_timeout: Duration::from_mins(60),
             compaction_config: Some(CompactionConfig::default()),
             max_auto_continues: 3,
+            require_tool_call: false,
             retry_config: RetryConfig::default(),
             repetition_config: RepetitionConfig::default(),
             context_window: None,
@@ -197,6 +199,28 @@ impl AgentBuilder {
         self
     }
 
+    /// Require the model to make at least one tool call before ending a turn.
+    ///
+    /// When enabled, a turn that ends with no tool call, no queued user input,
+    /// and no `EndTurn` declaration from the provider is treated as a "dead
+    /// turn": the first occurrence shares the existing auto-continue budget and
+    /// nudges the model once via [`AgentBuilder::max_auto_continues`]; the next
+    /// occurrence fails the turn with
+    /// `TurnOutcome::Failed { error: "turn ended without a tool call" }`.
+    ///
+    /// Off by default so existing chat-style agents (where an end-turn reply
+    /// without a tool call is normal) keep working unchanged.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Require a tool call on every turn, allowing one nudge before failing
+    /// agent(llm).require_tool_call(true).max_auto_continues(1)
+    /// ```
+    pub fn require_tool_call(mut self, require: bool) -> Self {
+        self.require_tool_call = require;
+        self
+    }
+
     /// Configure retry behavior for transient LLM provider failures.
     pub fn retry(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
@@ -316,6 +340,7 @@ impl AgentBuilder {
             observers: self.observers,
             session_usage: self.session_usage,
             tool_policy: self.tool_policy,
+            require_tool_call: self.require_tool_call,
         };
 
         let agent = Agent::new(config, command_rx, message_tx);

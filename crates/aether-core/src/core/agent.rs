@@ -74,6 +74,11 @@ pub(crate) struct AgentConfig {
     pub observers: Vec<Box<dyn AgentObserver>>,
     pub session_usage: SessionUsageTracker,
     pub tool_policy: Arc<dyn ToolPolicy>,
+    /// When `true`, a turn that ends with no tool call and no `EndTurn`
+    /// declaration is treated as a "dead turn" and reused with the existing
+    /// auto-continue budget: first occurrence nudges the model once, the next
+    /// occurrence fails the turn with `"turn ended without a tool call"`.
+    pub require_tool_call: bool,
 }
 
 pub struct Agent {
@@ -105,6 +110,7 @@ pub struct Agent {
     active_compaction: Option<CompactionId>,
     active_model: Option<LlmModel>,
     session_usage: SessionUsageTracker,
+    require_tool_call: bool,
 }
 
 impl Agent {
@@ -147,6 +153,7 @@ impl Agent {
             active_compaction: None,
             active_model: None,
             session_usage: config.session_usage,
+            require_tool_call: config.require_tool_call,
         }
     }
 
@@ -257,7 +264,10 @@ impl Agent {
         } = iteration;
         let has_tool_calls = !completed_tool_calls.is_empty();
         let has_content = !message_content.is_empty() || !reasoning_summary_text.is_empty() || has_tool_calls;
-        let should_auto_continue = self.auto_continue.should_continue(stop_reason.as_ref());
+        let has_queued_input = !self.queued_inputs.is_empty();
+        let declares_end_turn = matches!(stop_reason, Some(StopReason::EndTurn));
+        let missing_tool_call = self.require_tool_call && !has_tool_calls && !has_queued_input && !declares_end_turn;
+        let should_auto_continue = self.auto_continue.should_continue(stop_reason.as_ref(), missing_tool_call);
 
         if has_content {
             let reasoning = AssistantReasoning::from_parts(reasoning_summary_text.clone(), encrypted_reasoning);
@@ -270,7 +280,6 @@ impl Agent {
             }
         }
 
-        let has_queued_input = !self.queued_inputs.is_empty();
         let signature = iteration_signature(&message_content, &reasoning_summary_text, &tool_calls);
 
         // A queued user input is progress: the model has been told something
@@ -302,6 +311,12 @@ impl Agent {
 
             self.inject_continuation_prompt(stop_reason.as_ref()).await;
             self.start_next_turn().await;
+        } else if missing_tool_call {
+            tracing::debug!(
+                "LLM ended a turn without a tool call after exhausting the auto-continue budget; failing turn"
+            );
+            self.auto_continue.reset();
+            self.finish_turn(TurnOutcome::Failed { error: "turn ended without a tool call".to_string() }).await;
         } else {
             tracing::debug!("LLM completed turn with stop reason: {:?}", stop_reason);
             self.auto_continue.reset();
@@ -869,8 +884,9 @@ impl AutoContinue {
         self.count = 0;
     }
 
-    fn should_continue(&self, stop_reason: Option<&StopReason>) -> bool {
-        matches!(stop_reason, Some(StopReason::Length)) && self.count < self.max
+    fn should_continue(&self, stop_reason: Option<&StopReason>, missing_tool_call: bool) -> bool {
+        let resumable_stop = matches!(stop_reason, Some(StopReason::Length));
+        (resumable_stop || missing_tool_call) && self.count < self.max
     }
 
     fn advance(&mut self) {

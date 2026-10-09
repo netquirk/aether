@@ -28,6 +28,7 @@ pub struct ProviderConfig {
     /// provider instance — opencode-go rejects a request without
     /// `x-opencode-session` (it uses the value for upstream routing), and a
     /// value shared by every run would defeat that routing.
+    #[allow(clippy::type_complexity)]
     pub extra_headers: Option<fn() -> Vec<(&'static str, String)>>,
 }
 

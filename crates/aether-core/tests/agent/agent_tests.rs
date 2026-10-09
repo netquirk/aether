@@ -444,6 +444,84 @@ fn auto_continue_attempts(events: &[AgentEvent]) -> Vec<(u32, u32)> {
 }
 
 #[tokio::test]
+async fn test_require_tool_call_nudges_dead_turn_once_then_completes() -> Result<(), Box<dyn Error>> {
+    // First reply: text-only, no tool call → "dead turn" → nudge.
+    // Second reply: real tool call → agent recovers and runs the call.
+    // Third reply: trailing `EndTurn` → turn completes cleanly.
+    let tool_request = json!({ "a": 1, "b": 2 });
+    let llm_responses = [
+        llm_response().text(&["I think we're done."]).build(),
+        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
+        llm_response().text(&["All done."]).build_with_stop_reason(StopReason::EndTurn),
+    ];
+
+    let messages = test_agent()
+        .llm_responses(&llm_responses)
+        .user_text("compute 1+2")
+        .require_tool_call(true)
+        .max_auto_continues(1)
+        .run()
+        .await?;
+
+    assert_eq!(
+        auto_continue_attempts(&messages),
+        vec![(1, 1)],
+        "Expected exactly one nudge on the first dead turn, got {messages:?}"
+    );
+
+    // The tool call from the second reply must have been honoured.
+    let tool_call_succeeded = messages.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Tool(ToolEvent::Result { result, .. })
+                if result.id == "call_1" && result.result.contains("sum")
+        )
+    });
+    assert!(tool_call_succeeded, "Expected the recovered tool call to execute, got {messages:?}");
+
+    let last_outcome = messages.last().and_then(AgentEvent::turn_outcome);
+    assert!(
+        matches!(last_outcome, Some(TurnOutcome::Completed)),
+        "Expected the turn to end Completed after the recovered tool call, got {last_outcome:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_require_tool_call_fails_after_one_nudge_when_model_persists() -> Result<(), Box<dyn Error>> {
+    // First reply: text-only, no tool call → dead turn → nudge.
+    // Second reply: text-only again, no tool call → budget exhausted → Failed.
+    let llm_responses =
+        [llm_response().text(&["I think we're done."]).build(), llm_response().text(&["Still just talking."]).build()];
+
+    let messages = test_agent()
+        .llm_responses(&llm_responses)
+        .user_text("compute 1+2")
+        .require_tool_call(true)
+        .max_auto_continues(1)
+        .run()
+        .await?;
+
+    assert_eq!(
+        auto_continue_attempts(&messages),
+        vec![(1, 1)],
+        "Expected exactly one nudge before failing, got {messages:?}"
+    );
+
+    let last_outcome = messages.last().and_then(AgentEvent::turn_outcome);
+    assert!(
+        matches!(
+            last_outcome,
+            Some(TurnOutcome::Failed { error }) if error == "turn ended without a tool call"
+        ),
+        "Expected Failed with the dead-turn error string, got {last_outcome:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_reasoning_content_is_saved_in_context_after_tool_call() -> Result<(), Box<dyn Error>> {
     let tool_request = json!({ "a": 2, "b": 3 });
 
