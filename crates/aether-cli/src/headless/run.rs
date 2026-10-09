@@ -17,11 +17,7 @@ use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
-<<<<<<< HEAD
-use crate::output::{OutputFormat, RetryTracker, print_message};
-=======
-use crate::output::{OutputFormat, TurnTimings, print_message, print_turn_summary};
->>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
+use crate::output::{OutputFormat, RetryTracker, TurnTimings, print_message, print_turn_summary};
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
@@ -88,10 +84,18 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
-<<<<<<< HEAD
-async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat, events: &[CliEventKind]) -> ExitCode {
-<<<<<<< HEAD
+async fn stream_output(
+    mut rx: mpsc::Receiver<AgentEvent>,
+    format: OutputFormat,
+    events: &[CliEventKind],
+) -> (ExitCode, FileChanges) {
     let mut tracker = RetryTracker::default();
+    // Wall-clock timing of every turn seen on the stream, independent of the
+    // `--events` filter so a filtered run still reports how long it ran.
+    let mut timings = TurnTimings::default();
+    let mut changes = FileChanges::default();
+    let mut exit_code = ExitCode::SUCCESS;
+
     while let Some(msg) = rx.recv().await {
         // Capture the note for failed turns *before* we update the tracker
         // with the event we are about to print. Observing the `Ended` event
@@ -102,35 +106,17 @@ async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat,
             _ => None,
         };
         tracker.observe(&msg);
-=======
-<<<<<<< HEAD
-    // Wall-clock timing of every turn seen on the stream, independent of the
-    // `--events` filter so a filtered run still reports how long it ran.
-    let mut timings = TurnTimings::default();
-    let mut exit_code = ExitCode::SUCCESS;
 
-    while let Some(msg) = rx.recv().await {
         match &msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
             AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
             _ => {}
         }
 
->>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
-=======
-async fn stream_output(
-    mut rx: mpsc::Receiver<AgentEvent>,
-    format: OutputFormat,
-    events: &[CliEventKind],
-) -> (ExitCode, FileChanges) {
-    let mut changes = FileChanges::default();
-    while let Some(msg) = rx.recv().await {
         if let Some(meta) = tool_result_meta(&msg) {
             changes.record(meta);
         }
 
->>>>>>> bfe6b8c6 (TASK-23-469: capture the agent's working tree for rebase)
->>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
         if should_emit(&msg, events)
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
@@ -139,25 +125,16 @@ async fn stream_output(
         }
 
         if let Some(outcome) = msg.turn_outcome() {
-<<<<<<< HEAD
             exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled => ExitCode::SUCCESS,
-=======
-            return match outcome {
-                TurnOutcome::Failed { .. } => (ExitCode::FAILURE, changes),
-                TurnOutcome::Completed | TurnOutcome::Cancelled => (ExitCode::SUCCESS, changes),
->>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
             };
             break;
         }
     }
-<<<<<<< HEAD
 
     print_turn_summary(format, &timings);
-    exit_code
-=======
-    (ExitCode::SUCCESS, changes)
+    (exit_code, changes)
 }
 
 /// Extract the `FileDiff`-bearing metadata from a tool event, if any.
@@ -169,7 +146,6 @@ fn tool_result_meta(msg: &AgentEvent) -> Option<&mcp_utils::display_meta::ToolRe
         ) => Some(meta),
         _ => None,
     }
->>>>>>> 0c19f69e (TASK-23-469: capture the agent's working tree for rebase)
 }
 
 fn should_emit(msg: &AgentEvent, include: &[CliEventKind]) -> bool {
@@ -505,7 +481,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let code = stream_output(rx, OutputFormat::Text, &[]).await;
+        let (code, _changes) = stream_output(rx, OutputFormat::Text, &[]).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 

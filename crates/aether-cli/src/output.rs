@@ -15,19 +15,6 @@ pub enum OutputFormat {
     Json,
 }
 
-<<<<<<< HEAD
-/// Print a single agent event using the chosen format.
-///
-/// `retry_note` is optional context appended to the human-readable failure line
-/// (e.g. the number of LLM retries observed before the turn ended). Machine
-/// formats (`Pretty`, `Json`) ignore it because the underlying retry events are
-/// already in the stream.
-pub(crate) fn print_message(
-    format: OutputFormat,
-    message: &AgentEvent,
-    retry_note: Option<&str>,
-) -> Result<(), serde_json::Error> {
-=======
 /// Accumulates the wall-clock duration of each turn observed on the agent
 /// event stream. Callers feed `Instant::now()` to `begin` for every
 /// `TurnEvent::Started` and to `end` for every `TurnEvent::Ended`; each matched
@@ -107,8 +94,17 @@ pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings) {
     println!("{}", timings.summary());
 }
 
-pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent) -> Result<(), serde_json::Error> {
->>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
+/// Print a single agent event using the chosen format.
+///
+/// `retry_note` is optional context appended to the human-readable failure line
+/// (e.g. the number of LLM retries observed before the turn ended). Machine
+/// formats (`Pretty`, `Json`) ignore it because the underlying retry events are
+/// already in the stream.
+pub(crate) fn print_message(
+    format: OutputFormat,
+    message: &AgentEvent,
+    retry_note: Option<&str>,
+) -> Result<(), serde_json::Error> {
     match format {
         OutputFormat::Text => {
             if let Some(text) = format_text(message, retry_note) {
