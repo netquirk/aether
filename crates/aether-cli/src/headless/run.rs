@@ -14,7 +14,7 @@ use crate::telemetry::build_telemetry_runtime;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
-use crate::output::{OutputFormat, print_message};
+use crate::output::{OutputFormat, RetryTracker, print_message};
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
@@ -77,9 +77,19 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
 }
 
 async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat, events: &[CliEventKind]) -> ExitCode {
+    let mut tracker = RetryTracker::default();
     while let Some(msg) = rx.recv().await {
+        // Capture the note for failed turns *before* we update the tracker
+        // with the event we are about to print. Observing the `Ended` event
+        // for a failed turn does not change the count or provider, so the
+        // value is identical before and after the observation.
+        let note = match &msg {
+            AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { .. } }) => Some(tracker.failure_note()),
+            _ => None,
+        };
+        tracker.observe(&msg);
         if should_emit(&msg, events)
-            && let Err(error) = print_message(format, &msg)
+            && let Err(error) = print_message(format, &msg, note.as_deref())
         {
             eprintln!("Failed to serialize headless event: {error}");
             return ExitCode::FAILURE;

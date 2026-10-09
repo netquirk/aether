@@ -9,6 +9,7 @@ mod acp_session_lifecycle;
 mod acp_stdio;
 mod acp_workspace_move;
 mod mcp_command;
+mod retry_reporting;
 mod run_init;
 mod slash_commands;
 mod trace_context;

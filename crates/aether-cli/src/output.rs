@@ -2,6 +2,7 @@ use aether_core::events::{
     AgentEvent, CompactionOutcome, ContextEvent, LlmCallOutcome, MessageEvent, ModelEvent, ToolEvent, TurnEvent,
     TurnOutcome,
 };
+use llm::LlmCallPurpose;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +14,20 @@ pub enum OutputFormat {
     Json,
 }
 
-pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent) -> Result<(), serde_json::Error> {
+/// Print a single agent event using the chosen format.
+///
+/// `retry_note` is optional context appended to the human-readable failure line
+/// (e.g. the number of LLM retries observed before the turn ended). Machine
+/// formats (`Pretty`, `Json`) ignore it because the underlying retry events are
+/// already in the stream.
+pub(crate) fn print_message(
+    format: OutputFormat,
+    message: &AgentEvent,
+    retry_note: Option<&str>,
+) -> Result<(), serde_json::Error> {
     match format {
         OutputFormat::Text => {
-            if let Some(text) = format_text(message) {
+            if let Some(text) = format_text(message, retry_note) {
                 if matches!(message, AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { .. } })) {
                     eprintln!("{text}");
                 } else {
@@ -31,7 +42,7 @@ pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent) -> Resul
     Ok(())
 }
 
-fn format_text(message: &AgentEvent) -> Option<String> {
+fn format_text(message: &AgentEvent, retry_note: Option<&str>) -> Option<String> {
     match message {
         AgentEvent::Message(MessageEvent::Text { chunk, is_complete: true, .. }) => Some(chunk.clone()),
         AgentEvent::Message(MessageEvent::Thought { chunk, is_complete: true, .. }) => {
@@ -68,7 +79,10 @@ fn format_text(message: &AgentEvent) -> Option<String> {
         AgentEvent::Turn(TurnEvent::Ended { outcome }) => Some(match outcome {
             TurnOutcome::Completed => "Done".to_string(),
             TurnOutcome::Cancelled => "Cancelled".to_string(),
-            TurnOutcome::Failed { error } => format!("Error: {error}"),
+            TurnOutcome::Failed { error } => match retry_note {
+                Some(note) => format!("Error: {error} ({note})"),
+                None => format!("Error: {error}"),
+            },
         }),
         AgentEvent::Turn(TurnEvent::AutoContinue { attempt, max_attempts, .. }) => {
             Some(format!("Continuing ({attempt}/{max_attempts})..."))
@@ -96,9 +110,8 @@ fn format_text(message: &AgentEvent) -> Option<String> {
         }
         AgentEvent::Tool(ToolEvent::SubAgentProgress { payload, .. }) => match &payload.event {
             AgentEvent::SessionUsage(_) => None,
-            event => {
-                format_text(event).map(|text| format!("Sub-agent {} [{}]: {text}", payload.agent_name, payload.task_id))
-            }
+            event => format_text(event, None)
+                .map(|text| format!("Sub-agent {} [{}]: {text}", payload.agent_name, payload.task_id)),
         },
         AgentEvent::Context(ContextEvent::CompactionStarted { message_count, .. }) => {
             Some(format!("Context compaction started ({message_count} messages)"))
@@ -141,6 +154,71 @@ fn format_context_usage(usage: &llm::ContextUsage) -> String {
     }
 }
 
+/// Tracks how many provider retries the CLI saw before the turn ended.
+///
+/// The headless event loop feeds [`AgentEvent`]s through [`RetryTracker::observe`].
+/// Only `LlmCallPurpose::Chat` retries are counted; compaction retries are
+/// excluded because the task scope ("retries it made for a provider error") is
+/// the user-facing chat path. The last observed `LlmCallStarted` display name
+/// is taken as "the failing provider".
+#[derive(Default, Debug)]
+pub(crate) struct RetryTracker {
+    retries: u32,
+    provider: Option<String>,
+}
+
+impl RetryTracker {
+    /// Record one event. Each `RetryScheduled` chat event increments the
+    /// counter; the `Started` event resets it because a new turn begins.
+    pub(crate) fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::Turn(TurnEvent::Started { .. }) => {
+                self.retries = 0;
+                self.provider = None;
+            }
+            AgentEvent::Turn(TurnEvent::LlmCallStarted { display_name, purpose, .. }) => {
+                if matches!(purpose, LlmCallPurpose::Chat) {
+                    self.provider = Some(display_name.clone());
+                }
+            }
+            AgentEvent::Turn(TurnEvent::RetryScheduled { purpose: LlmCallPurpose::Chat, .. }) => {
+                self.retries = self.retries.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Render the note appended to the CLI failure line.
+    pub(crate) fn failure_note(&self) -> String {
+        match &self.provider {
+            Some(provider) => format!("after {} retries on {provider}", self.retries),
+            None => format!("after {} retries", self.retries),
+        }
+    }
+}
+
+/// Summary surfaced to integration tests so they can assert on the retry
+/// count and the provider display name the CLI saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrySummary {
+    pub retries: u32,
+    pub failed: bool,
+    pub provider: Option<String>,
+}
+
+/// Reduce a recorded event stream to the retry summary the CLI would render.
+pub fn summarize_retries(events: &[AgentEvent]) -> RetrySummary {
+    let mut tracker = RetryTracker::default();
+    let mut failed = false;
+    for event in events {
+        tracker.observe(event);
+        if let AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { .. } }) = event {
+            failed = true;
+        }
+    }
+    RetrySummary { retries: tracker.retries, failed, provider: tracker.provider }
+}
+
 fn format_session_usage(usage: &llm::SessionUsageEvent) -> String {
     let call_cost =
         usage.estimated_cost.map_or_else(|| "unknown".to_string(), |cost| format!("${:.6}", cost.total_usd));
@@ -170,27 +248,27 @@ mod tests {
     #[test]
     fn format_text_formats_complete_text() {
         assert_eq!(
-            format_text(&AgentEvent::text("id", "hello world", StreamState::Complete)),
+            format_text(&AgentEvent::text("id", "hello world", StreamState::Complete), None),
             Some("hello world".to_string())
         );
     }
 
     #[test]
     fn format_text_skips_incomplete_text() {
-        assert_eq!(format_text(&AgentEvent::text("id", "partial", StreamState::Partial)), None);
+        assert_eq!(format_text(&AgentEvent::text("id", "partial", StreamState::Partial), None), None);
     }
 
     #[test]
     fn format_text_formats_complete_thought() {
         assert_eq!(
-            format_text(&AgentEvent::thought("id", "reasoning here", StreamState::Complete)),
+            format_text(&AgentEvent::thought("id", "reasoning here", StreamState::Complete), None),
             Some("Thought: reasoning here".to_string())
         );
     }
 
     #[test]
     fn format_text_skips_incomplete_thought() {
-        assert_eq!(format_text(&AgentEvent::thought("id", "partial", StreamState::Partial)), None);
+        assert_eq!(format_text(&AgentEvent::thought("id", "partial", StreamState::Partial), None), None);
     }
 
     #[test]
@@ -202,19 +280,19 @@ mod tests {
                 arguments: r#"{"cmd":"ls"}"#.to_string(),
             },
         });
-        assert_eq!(format_text(&message), Some(r#"Tool call: bash({"cmd":"ls"})"#.to_string()));
+        assert_eq!(format_text(&message, None), Some(r#"Tool call: bash({"cmd":"ls"})"#.to_string()));
     }
 
     #[test]
     fn format_text_skips_tool_call_updates() {
         let message =
             AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id: "tc1".to_string(), chunk: "partial".to_string() });
-        assert_eq!(format_text(&message), None);
+        assert_eq!(format_text(&message, None), None);
     }
 
     #[test]
     fn format_text_formats_tool_result() {
-        assert_eq!(format_text(&tool_result()), Some("Tool result [bash]: ok".to_string()));
+        assert_eq!(format_text(&tool_result(), None), Some("Tool result [bash]: ok".to_string()));
     }
 
     #[test]
@@ -227,19 +305,27 @@ mod tests {
                 error: "not found".to_string(),
             },
         });
-        assert_eq!(format_text(&message), Some("Tool error [bash]: not found".to_string()));
+        assert_eq!(format_text(&message, None), Some("Tool error [bash]: not found".to_string()));
     }
 
     #[test]
     fn format_text_formats_turn_outcomes() {
         assert_eq!(
-            format_text(&AgentEvent::Turn(TurnEvent::Ended {
-                outcome: TurnOutcome::Failed { error: "boom".to_string() }
-            })),
+            format_text(
+                &AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { error: "boom".to_string() } }),
+                None,
+            ),
             Some("Error: boom".to_string())
         );
-        assert_eq!(format_text(&AgentEvent::turn_ended(TurnOutcome::Cancelled)), Some("Cancelled".to_string()));
-        assert_eq!(format_text(&AgentEvent::turn_ended(TurnOutcome::Completed)), Some("Done".to_string()));
+        assert_eq!(
+            format_text(
+                &AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { error: "boom".to_string() } }),
+                Some("after 3 retries on Fake LLM"),
+            ),
+            Some("Error: boom (after 3 retries on Fake LLM)".to_string())
+        );
+        assert_eq!(format_text(&AgentEvent::turn_ended(TurnOutcome::Cancelled), None), Some("Cancelled".to_string()));
+        assert_eq!(format_text(&AgentEvent::turn_ended(TurnOutcome::Completed), None), Some("Done".to_string()));
     }
 
     #[test]
@@ -251,18 +337,18 @@ mod tests {
             attempt: 0,
             max_attempts: 3,
         });
-        assert_eq!(format_text(&started), None);
-        assert_eq!(format_text(&retry_scheduled()), Some("Retrying (1/3) in 10ms".to_string()));
+        assert_eq!(format_text(&started, None), None);
+        assert_eq!(format_text(&retry_scheduled(), None), Some("Retrying (1/3) in 10ms".to_string()));
         let retrying = AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: llm::LlmCallPurpose::Chat,
             outcome: LlmCallOutcome::failed("overloaded", true),
         });
-        assert_eq!(format_text(&retrying), Some("LLM call failed (will retry): overloaded".to_string()));
+        assert_eq!(format_text(&retrying, None), Some("LLM call failed (will retry): overloaded".to_string()));
         let terminal = AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: llm::LlmCallPurpose::Chat,
             outcome: LlmCallOutcome::failed("boom", false),
         });
-        assert_eq!(format_text(&terminal), None);
+        assert_eq!(format_text(&terminal, None), None);
     }
 
     #[test]
@@ -273,19 +359,19 @@ mod tests {
             message_id: llm::MessageId::new(),
             content: vec![],
         });
-        assert_eq!(format_text(&continuing), Some("Continuing (2/5)...".to_string()));
+        assert_eq!(format_text(&continuing, None), Some("Continuing (2/5)...".to_string()));
         let switched =
             AgentEvent::Model(ModelEvent::Switched { previous: "old-model".to_string(), new: "new-model".to_string() });
-        assert_eq!(format_text(&switched), Some("Model switched: old-model -> new-model".to_string()));
+        assert_eq!(format_text(&switched, None), Some("Model switched: old-model -> new-model".to_string()));
     }
 
     #[test]
     fn format_text_formats_tool_progress() {
         assert_eq!(
-            format_text(&tool_progress(50.0, Some(100.0), Some("halfway"))),
+            format_text(&tool_progress(50.0, Some(100.0), Some("halfway")), None),
             Some("Tool progress [bash]: 50/100 - halfway".to_string())
         );
-        assert_eq!(format_text(&tool_progress(42.0, None, None)), Some("Tool progress [bash]: 42".to_string()));
+        assert_eq!(format_text(&tool_progress(42.0, None, None), None), Some("Tool progress [bash]: 42".to_string()));
     }
 
     #[test]
@@ -294,16 +380,19 @@ mod tests {
             compaction_id: "compaction".into(),
             message_count: 42,
         });
-        assert_eq!(format_text(&started), Some("Context compaction started (42 messages)".to_string()));
+        assert_eq!(format_text(&started, None), Some("Context compaction started (42 messages)".to_string()));
         let result = AgentEvent::Context(ContextEvent::CompactionResult {
             compaction_id: "compaction".into(),
             message_id: llm::MessageId::new(),
             summary: "summary here".to_string(),
             messages_removed: 10,
         });
-        assert_eq!(format_text(&result), Some("Context compacted: 10 messages removed. summary here".to_string()));
-        assert_eq!(format_text(&usage_update()), Some("Context: 100000 / 200000 tokens (50.0%)".to_string()));
-        assert_eq!(format_text(&AgentEvent::Context(ContextEvent::Cleared)), Some("Context cleared".to_string()));
+        assert_eq!(
+            format_text(&result, None),
+            Some("Context compacted: 10 messages removed. summary here".to_string())
+        );
+        assert_eq!(format_text(&usage_update(), None), Some("Context: 100000 / 200000 tokens (50.0%)".to_string()));
+        assert_eq!(format_text(&AgentEvent::Context(ContextEvent::Cleared), None), Some("Context cleared".to_string()));
     }
 
     fn tool_result() -> AgentEvent {
@@ -348,5 +437,108 @@ mod tests {
                 usage_ratio: Some(0.5),
             },
         })
+    }
+
+    fn llm_chat_started(display_name: &str) -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::LlmCallStarted {
+            purpose: llm::LlmCallPurpose::Chat,
+            model: llm::ModelIdentity::default(),
+            display_name: display_name.to_string(),
+            attempt: 0,
+            max_attempts: 3,
+        })
+    }
+
+    fn llm_compaction_started(display_name: &str) -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::LlmCallStarted {
+            purpose: llm::LlmCallPurpose::Compaction,
+            model: llm::ModelIdentity::default(),
+            display_name: display_name.to_string(),
+            attempt: 0,
+            max_attempts: 1,
+        })
+    }
+
+    fn chat_retry(attempt: u32) -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::RetryScheduled {
+            purpose: llm::LlmCallPurpose::Chat,
+            attempt,
+            max_attempts: 3,
+            delay_ms: 10,
+        })
+    }
+
+    fn compaction_retry(attempt: u32) -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::RetryScheduled {
+            purpose: llm::LlmCallPurpose::Compaction,
+            attempt,
+            max_attempts: 1,
+            delay_ms: 10,
+        })
+    }
+
+    #[test]
+    fn retry_tracker_resets_on_new_turn() {
+        let mut tracker = RetryTracker::default();
+        tracker.observe(&chat_retry(1));
+        tracker.observe(&chat_retry(2));
+        tracker.observe(&chat_retry(3));
+        assert_eq!(tracker.failure_note(), "after 3 retries");
+        tracker.observe(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }));
+        assert_eq!(tracker.failure_note(), "after 0 retries");
+    }
+
+    #[test]
+    fn retry_tracker_counts_only_chat_retries() {
+        let mut tracker = RetryTracker::default();
+        tracker.observe(&llm_chat_started("primary"));
+        // chat retries should be counted
+        tracker.observe(&chat_retry(1));
+        tracker.observe(&chat_retry(2));
+        // compaction retries should be ignored
+        tracker.observe(&llm_compaction_started("primary"));
+        tracker.observe(&compaction_retry(1));
+        assert_eq!(tracker.failure_note(), "after 2 retries on primary");
+    }
+
+    #[test]
+    fn retry_tracker_failure_note_renders_provider_when_known() {
+        let mut tracker = RetryTracker::default();
+        assert_eq!(tracker.failure_note(), "after 0 retries");
+        tracker.observe(&llm_chat_started("Fake LLM"));
+        tracker.observe(&chat_retry(1));
+        assert_eq!(tracker.failure_note(), "after 1 retries on Fake LLM");
+        tracker.observe(&chat_retry(2));
+        tracker.observe(&chat_retry(3));
+        assert_eq!(tracker.failure_note(), "after 3 retries on Fake LLM");
+    }
+
+    #[test]
+    fn summarize_retries_reports_outcome() {
+        let events = vec![
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_chat_started("Fake LLM"),
+            chat_retry(1),
+            chat_retry(2),
+            AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { error: "boom".to_string() } }),
+        ];
+        let summary = summarize_retries(&events);
+        assert_eq!(summary.retries, 2);
+        assert!(summary.failed);
+        assert_eq!(summary.provider.as_deref(), Some("Fake LLM"));
+    }
+
+    #[test]
+    fn summarize_retries_reports_completed_run() {
+        let events = vec![
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_chat_started("Fake LLM"),
+            chat_retry(1),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+        ];
+        let summary = summarize_retries(&events);
+        assert_eq!(summary.retries, 1);
+        assert!(!summary.failed);
+        assert_eq!(summary.provider.as_deref(), Some("Fake LLM"));
     }
 }

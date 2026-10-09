@@ -641,7 +641,7 @@ impl SessionActor {
         self.persist_event(SessionEvent::Agent(message.clone()));
         if self.io.connection.is_none()
             && let Some(format) = self.detached.output
-            && let Err(error) = print_message(format, message)
+            && let Err(error) = print_message(format, message, None)
         {
             error!(%error, "Failed to serialize server event");
         }
