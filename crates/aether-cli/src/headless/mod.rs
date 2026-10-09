@@ -65,6 +65,12 @@ pub struct RunConfig {
     pub oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
     pub telemetry: Option<TelemetrySettings>,
     pub trace_context: Option<AgentTraceContext>,
+    /// When set, the run appends a JSON Lines transcript of every output
+    /// event to this path (one object per line, each carrying `turn` and
+    /// `type`). The file is truncated on open and independent of `--events`,
+    /// so a filtered run still gets a complete transcript. The run's stdout
+    /// stays human-readable.
+    pub transcript_jsonl: Option<PathBuf>,
     /// Top-level `toolOutput` block from the loaded settings. Threaded into
     /// the runtime via [`crate::runtime::RuntimeBuilder::settings_tool_output`]
     /// so the MCP runtime can resolve the cap together with the per-agent
@@ -104,6 +110,8 @@ pub struct HeadlessOptions {
     pub events: Option<Vec<CliEventKind>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<AgentTraceContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_jsonl: Option<PathBuf>,
 }
 
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
@@ -176,6 +184,12 @@ pub struct HeadlessArgs {
     /// Omit to emit every output event. When set, turn outcomes are only shown if `turn_ended` is listed.
     #[arg(long = "events", value_enum, value_delimiter = ',')]
     pub events: Vec<CliEventKind>,
+
+    /// Append a JSON Lines transcript of every output event to PATH (one
+    /// object per line, each carrying `turn` and `type`). Written to PATH; the
+    /// run's stdout stays human-readable. The file is truncated on open.
+    #[arg(long = "transcript-jsonl", value_name = "PATH")]
+    pub transcript_jsonl: Option<PathBuf>,
 }
 
 impl RunConfig {
@@ -210,6 +224,7 @@ impl RunConfig {
             telemetry,
             trace_context: None,
             settings_tool_output,
+            transcript_jsonl: args.transcript_jsonl,
         })
     }
 
@@ -246,6 +261,7 @@ impl RunConfig {
             telemetry,
             trace_context: options.trace_context,
             settings_tool_output,
+            transcript_jsonl: options.transcript_jsonl,
         })
     }
 }

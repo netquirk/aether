@@ -16,6 +16,7 @@ use tracing::error;
 
 use crate::file_changes::FileChanges;
 use crate::telemetry::build_telemetry_runtime;
+use crate::transcript::JsonlTranscript;
 use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
@@ -71,8 +72,17 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         .await
         .map_err(|e| CliError::AgentError(format!("Failed to send prompt: {e}")))?;
 
+    // Open the JSON Lines transcript writer up front so a bad path fails
+    // the run before any provider call. A successful open is also the
+    // promise the file is on disk; a mid-run write error is reported but
+    // does not fail the run.
+    let mut transcript = match &config.transcript_jsonl {
+        Some(path) => Some(JsonlTranscript::create(path).map_err(CliError::IoError)?),
+        None => None,
+    };
+
     let (exit_code, changes, summary) =
-        stream_output(agent.agent_rx, config.output, &config.events, run_started_at).await;
+        stream_output(agent.agent_rx, config.output, &config.events, run_started_at, transcript.as_mut()).await;
     print_run_summary(config.output, &summary);
 
     drop(agent.agent_tx);
@@ -112,6 +122,7 @@ async fn stream_output(
     format: OutputFormat,
     events: &[CliEventKind],
     run_started_at: Instant,
+    mut transcript: Option<&mut JsonlTranscript>,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
     // Wall-clock timing of every turn seen on the stream, independent of the
@@ -169,6 +180,15 @@ async fn stream_output(
             changes.record(meta);
         }
 
+        // Write the transcript line before we print: a bad disk shows up
+        // here, not as a corrupt half-line on stdout. The writer ignores
+        // events with no CLI event kind (streaming fragments, CallUpdate).
+        if let Some(t) = transcript.as_mut()
+            && let Err(error) = t.record(&msg)
+        {
+            eprintln!("Failed to write transcript: {error}");
+        }
+
         if should_emit(&msg, events)
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
@@ -176,6 +196,9 @@ async fn stream_output(
             // Clear the live progress line so we do not leave a half-written
             // status row on stderr if the loop exits early.
             let _ = progress.clear();
+            if let Some(t) = transcript.as_mut() {
+                let _ = t.flush();
+            }
             return (ExitCode::FAILURE, changes, summary);
         }
 
@@ -197,6 +220,9 @@ async fn stream_output(
     let _ = progress.clear();
     print_turn_summary(format, &timings, Some(run_total_elapsed));
     print_run_usage(format, &usage);
+    if let Some(t) = transcript.as_mut() {
+        let _ = t.flush();
+    }
     (exit_code, changes, summary)
 }
 
@@ -254,7 +280,7 @@ fn should_emit(msg: &AgentEvent, include: &[CliEventKind]) -> bool {
     include.is_empty() || include.contains(&kind)
 }
 
-fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
+pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     match msg {
         AgentEvent::Message(MessageEvent::Text { is_complete: true, .. }) => Some(CliEventKind::Text),
         AgentEvent::Message(MessageEvent::Thought { is_complete: true, .. }) => Some(CliEventKind::Thought),
@@ -479,7 +505,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -488,7 +514,7 @@ mod tests {
     async fn stream_output_failed_turn_exits_with_failure() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -499,7 +525,7 @@ mod tests {
         tx.send(tool_result_with_file_diff("created.rs", None, Some("new"))).await.unwrap();
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -512,7 +538,7 @@ mod tests {
     async fn stream_output_reports_zero_when_nothing_changed() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -523,7 +549,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -537,7 +563,7 @@ mod tests {
         // Restrict to a different event kind so the ToolResult is not printed,
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
-        let (_code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
+        let (_code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None).await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -594,7 +620,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -614,7 +640,7 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         drop(tx);
 
-        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });

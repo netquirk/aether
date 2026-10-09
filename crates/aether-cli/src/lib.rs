@@ -23,6 +23,7 @@ pub mod settings_args;
 pub mod show_prompt;
 pub(crate) mod slash_commands;
 pub(crate) mod telemetry;
+pub mod transcript;
 pub mod version;
 pub mod workspace;
 
