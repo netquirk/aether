@@ -68,7 +68,9 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         .await
         .map_err(|e| CliError::AgentError(format!("Failed to send prompt: {e}")))?;
 
-    let (exit_code, changes) = stream_output(agent.agent_rx, config.output, &config.events, run_started_at).await;
+    let (exit_code, changes, summary) =
+        stream_output(agent.agent_rx, config.output, &config.events, run_started_at).await;
+    print_run_summary(config.output, &summary);
 
     drop(agent.agent_tx);
     agent.agent_handle.await_completion().await;
@@ -78,6 +80,14 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     }
 
     Ok(exit_code)
+}
+
+fn print_run_summary(format: OutputFormat, summary: &RunSummary) {
+    // Only text mode gets the aggregate line; machine formats already have
+    // every event on the stream.
+    if matches!(format, OutputFormat::Text) {
+        println!("{}", summary.line());
+    }
 }
 
 async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
@@ -99,12 +109,13 @@ async fn stream_output(
     format: OutputFormat,
     events: &[CliEventKind],
     run_started_at: Instant,
-) -> (ExitCode, FileChanges) {
+) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
     // Wall-clock timing of every turn seen on the stream, independent of the
     // `--events` filter so a filtered run still reports how long it ran.
     let mut timings = TurnTimings::default();
     let mut changes = FileChanges::default();
+    let mut summary = RunSummary::default();
     let mut exit_code = ExitCode::SUCCESS;
 
     while let Some(msg) = rx.recv().await {
@@ -117,6 +128,10 @@ async fn stream_output(
             _ => None,
         };
         tracker.observe(&msg);
+
+        // Counts for the end-of-run summary; independent of `--events` so a
+        // filtered run still reports how many turns and tool calls happened.
+        summary.record(&msg);
 
         match &msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
@@ -132,7 +147,7 @@ async fn stream_output(
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
             eprintln!("Failed to serialize headless event: {error}");
-            return (ExitCode::FAILURE, changes);
+            return (ExitCode::FAILURE, changes, summary);
         }
 
         if let Some(outcome) = msg.turn_outcome() {
@@ -146,7 +161,45 @@ async fn stream_output(
 
     let run_total_elapsed = run_started_at.elapsed();
     print_turn_summary(format, &timings, Some(run_total_elapsed));
-    (exit_code, changes)
+    (exit_code, changes, summary)
+}
+
+/// Per-run tally of turns started and tool calls made by `stream_output`.
+/// Counts come from `AgentEvent` matches (not `TurnTimings`/`FileChanges`)
+/// so an unmatched `TurnEvent::Ended` or any `Tool(ToolEvent::Call)` is still
+/// reflected.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunSummary {
+    turns: u32,
+    tool_calls: u32,
+}
+
+impl RunSummary {
+    fn record(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::Turn(TurnEvent::Started { .. }) => self.turns = self.turns.saturating_add(1),
+            AgentEvent::Tool(ToolEvent::Call { .. }) => self.tool_calls = self.tool_calls.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "Run finished: {} {}, {} {}",
+            self.turns,
+            turn_label(self.turns),
+            self.tool_calls,
+            tool_call_label(self.tool_calls),
+        )
+    }
+}
+
+fn turn_label(count: u32) -> &'static str {
+    if count == 1 { "turn" } else { "turns" }
+}
+
+fn tool_call_label(count: u32) -> &'static str {
+    if count == 1 { "tool call" } else { "tool calls" }
 }
 
 /// Extract the `FileDiff`-bearing metadata from a tool event, if any.
@@ -378,7 +431,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
-        let (code, changes) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -387,7 +440,7 @@ mod tests {
     async fn stream_output_failed_turn_exits_with_failure() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
-        let (code, changes) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -398,7 +451,7 @@ mod tests {
         tx.send(tool_result_with_file_diff("created.rs", None, Some("new"))).await.unwrap();
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -411,7 +464,7 @@ mod tests {
     async fn stream_output_reports_zero_when_nothing_changed() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -422,7 +475,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -436,7 +489,7 @@ mod tests {
         // Restrict to a different event kind so the ToolResult is not printed,
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
-        let (_code, changes) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
+        let (_code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now()).await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -493,8 +546,45 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, _changes) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn stream_output_counts_turns_and_tool_calls() {
+        let (tx, rx) = mpsc::channel(8);
+        // Two turns and two tool calls, interleaved with their results. The
+        // second turn emits only a tool result (no `Call`) so the tool count
+        // stays at 2 and the second turn is "passive".
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        tx.send(tool_call_msg()).await.unwrap();
+        tx.send(tool_result_msg()).await.unwrap();
+        tx.send(tool_call_msg()).await.unwrap();
+        tx.send(tool_result_msg()).await.unwrap();
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        tx.send(tool_result_msg()).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        drop(tx);
+
+        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now()).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
+        // The summary is a single line so downstream tooling can grep for it
+        // without false positives from the per-turn timing block above.
+        let line = summary.line();
+        assert_eq!(line, "Run finished: 2 turns, 2 tool calls");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn run_summary_line_pluralises_counts() {
+        // Zero, one, and many cases for both counts catch singular/plural
+        // regressions independently.
+        assert_eq!(RunSummary::default().line(), "Run finished: 0 turns, 0 tool calls");
+        assert_eq!(RunSummary { turns: 1, tool_calls: 1 }.line(), "Run finished: 1 turn, 1 tool call",);
+        assert_eq!(RunSummary { turns: 1, tool_calls: 3 }.line(), "Run finished: 1 turn, 3 tool calls",);
+        assert_eq!(RunSummary { turns: 4, tool_calls: 1 }.line(), "Run finished: 4 turns, 1 tool call",);
     }
 
     #[tokio::test]
