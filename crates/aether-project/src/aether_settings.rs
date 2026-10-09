@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use utils::variables::{VarError, Vars};
 
 /// Environment variable that overrides the per-call tool result byte cap for a
@@ -154,6 +155,11 @@ pub struct AetherSettings {
     /// overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<ToolOutputSettings>,
+    /// Run-time knobs that affect the headless CLI only. The CLI surfaces a
+    /// live one-line warning when a provider call exceeds
+    /// `providerStallWarnSeconds` and a hung turn is still in flight (TASK-24-378).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSettings>,
     /// Extra environment variables that every shell command a run starts sees
     /// — the `bash` tool of the built-in `coding` MCP server. Keys declared
     /// here are merged over the process environment for those commands: a
@@ -183,9 +189,41 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "credentialsStore",
     "telemetry",
     "toolOutput",
+    "run",
     "shellEnvironment",
     "agents",
 ];
+
+/// Settings that tune the headless CLI's behaviour during a run. Every field
+/// is optional: an unset field disables the corresponding behaviour so the
+/// existing run shape is unchanged when the block is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunSettings {
+    /// Seconds a provider call may wait before the CLI prints a one-line
+    /// stall warning naming the elapsed wait. Unset (or `0`) disables the
+    /// warning so the existing run shape is preserved when the block is
+    /// absent. Surfaced by the headless CLI while the turn is still live so a
+    /// hung turn is visible instead of silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_stall_warn_seconds: Option<u64>,
+}
+
+impl RunSettings {
+    /// Threshold as a `Duration`; `None` when unset or zero so callers can
+    /// skip the warning loop entirely on the disabled path.
+    pub fn provider_stall_warn(&self) -> Option<Duration> {
+        self.provider_stall_warn_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
+    }
+
+    // Pass-by-value matches the merge pattern on `TelemetrySettings` /
+    // `TelemetryContentSettings` even though the single-field body does not
+    // need to own `next`; the symmetry matters more than the micro-savings.
+    #[allow(clippy::needless_pass_by_value)]
+    fn merge(&mut self, next: Self) {
+        merge_field(&mut self.provider_stall_warn_seconds, next.provider_stall_warn_seconds);
+    }
+}
 
 /// Returns the keys present in `value` that [`AetherSettings`] does not
 /// declare, preserving their original ordering for stable, testable output.
@@ -413,6 +451,10 @@ impl AetherSettings {
 
         if let Some(next_tool_output) = next.tool_output {
             self.tool_output.get_or_insert_default().merge(next_tool_output);
+        }
+
+        if let Some(next_run) = next.run {
+            self.run.get_or_insert_default().merge(next_run);
         }
 
         // Project-layer shell environment wins on every shared key, so a
@@ -1858,5 +1900,95 @@ mod tests {
         let parsed: ToolOutputSettings = serde_json::from_value(value.clone()).unwrap();
         let serialized = serde_json::to_value(&parsed).unwrap();
         assert_eq!(serialized, value);
+    }
+
+    #[test]
+    fn parses_run_provider_stall_warn_seconds() {
+        let config = AetherSettings::try_from(
+            json!({
+                "run": { "providerStallWarnSeconds": 5 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+
+        let run = config.run.expect("run block parsed");
+        assert_eq!(run.provider_stall_warn_seconds, Some(5));
+        assert_eq!(run.provider_stall_warn(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn run_settings_absent_or_zero_disables_warning() {
+        // Absent: no warning.
+        let absent =
+            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
+        assert!(absent.run.is_none());
+        assert!(absent.run.as_ref().and_then(RunSettings::provider_stall_warn).is_none());
+
+        // Explicit 0 disables the warning, matching the "off" contract.
+        let zero = AetherSettings::try_from(
+            json!({
+                "run": { "providerStallWarnSeconds": 0 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+        assert_eq!(zero.run.unwrap().provider_stall_warn(), None);
+    }
+
+    #[test]
+    fn run_settings_overlay_overrides_base_value() {
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "providerStallWarnSeconds": 30 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "providerStallWarnSeconds": 5 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // Overlay wins for the only field, so each layer can tighten the
+        // warning without losing the merge surface to lower layers.
+        assert_eq!(config.run.unwrap().provider_stall_warn(), Some(Duration::from_secs(5)),);
+    }
+
+    #[test]
+    fn run_settings_merge_inherits_unspecified_field() {
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "providerStallWarnSeconds": 30 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.run.unwrap().provider_stall_warn(),
+            Some(Duration::from_secs(30)),
+            "empty overlay must inherit the base threshold",
+        );
     }
 }

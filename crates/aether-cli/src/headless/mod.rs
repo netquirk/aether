@@ -3,7 +3,7 @@ pub mod run;
 
 use aether_core::agent_spec::{AgentSpec, McpConfigSource};
 use aether_project::ToolOutputSettings;
-use aether_project::{AetherSettings, AgentCatalog, TelemetrySettings};
+use aether_project::{AetherSettings, AgentCatalog, RunSettings, TelemetrySettings};
 use aether_telemetry::AgentTraceContext;
 use error::CliError;
 use llm::{ProviderConnectionOverride, ProviderConnectionOverrides};
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::credentials::oauth_credential_store_from_config;
 use crate::mcp_config_args::McpConfigArgs;
@@ -89,6 +90,13 @@ pub struct RunConfig {
     /// built-in `coding` MCP server's `bash` tool sees them merged over the
     /// process environment.
     pub shell_environment: BTreeMap<String, String>,
+    /// Threshold after which the headless CLI prints a one-line warning
+    /// naming the elapsed wait when a provider call is still in flight
+    /// (TASK-24-378). `None` disables the warning so the existing run shape
+    /// is preserved when the setting is absent. Resolved from the top-level
+    /// `run.providerStallWarnSeconds` block before the agent starts so the
+    /// headless loop can race the deadline without re-reading settings.
+    pub provider_stall_warn: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -228,6 +236,7 @@ impl RunConfig {
         let settings_tool_output = settings.tool_output.clone();
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
+        let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
         let selection = initial_selection(args.agent, args.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -248,6 +257,7 @@ impl RunConfig {
             trace_context: None,
             settings_tool_output,
             shell_environment,
+            provider_stall_warn,
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
         })
@@ -264,6 +274,7 @@ impl RunConfig {
         let settings_tool_output = settings.tool_output.clone();
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
+        let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
         let selection = initial_selection(options.agent, options.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -289,6 +300,7 @@ impl RunConfig {
             trace_context: options.trace_context,
             settings_tool_output,
             shell_environment,
+            provider_stall_warn,
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
         })

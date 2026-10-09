@@ -14,7 +14,7 @@ pub use aether_core::core::{PromptSource, PromptSourceError};
 pub use aether_core::mcp::ToolOutputSettings;
 pub use aether_settings::{
     AETHER_TOOL_OUTPUT_MAX_BYTES_ENV, AetherSettings, AetherSettingsSource, CredentialsStoreConfig,
-    OtlpTelemetrySettings, PRAIRIE_TOOL_OUTPUT_DIR_ENV, SettingsFileSource, TelemetryContentSettings,
+    OtlpTelemetrySettings, PRAIRIE_TOOL_OUTPUT_DIR_ENV, RunSettings, SettingsFileSource, TelemetryContentSettings,
     TelemetrySettings, project_settings_exist, project_settings_path, resolve_tool_output_cap, settings_resource_root,
     tool_output_dir_from_env, tool_output_max_bytes_from_env, user_settings_exist, user_settings_path,
 };

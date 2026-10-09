@@ -103,6 +103,31 @@ attribute mapping.
 
 For an OTLP backend with exact signal URLs, set `otlp.tracesEndpoint` and `otlp.metricsEndpoint`. Aether sends each configured signal to its matching URL unchanged; an unconfigured signal uses the `/v1/traces` or `/v1/metrics` URL derived from `otlp.endpoint`.
 
+## Run-time warnings
+
+The top-level `run` block tunes the headless CLI's behaviour during a single
+run. Every field is optional; an unset field disables the corresponding
+behaviour so an absent `run` block leaves the existing run shape unchanged.
+
+`providerStallWarnSeconds` sets how long a provider call may wait before the
+CLI prints a one-line warning naming the elapsed wait. The warning fires
+once per stalled call while the turn is still live so a hung turn is
+visible instead of silent; `0` or omitted disables the warning.
+
+```json
+{
+  "run": { "providerStallWarnSeconds": 30 },
+  "agents": [
+    {
+      "name": "Build",
+      "description": "Builds features and fixes bugs",
+      "model": "anthropic:claude-sonnet-4-5-20250929",
+      "userInvocable": true
+    }
+  ]
+}
+```
+
 ## Tool output cap
 
 Aether caps the byte length of every tool result before it reaches the model. The

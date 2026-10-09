@@ -7,11 +7,10 @@ use aether_telemetry::TelemetryRuntime;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
-// `Duration` is test-only; the production loop only needs `Instant`. Keeping
-// `Duration` out of this import avoids an `unused_imports` warning from `cargo
-// build` (which doesn't compile `#[cfg(test)]` modules).
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::error;
 
 use crate::file_changes::FileChanges;
@@ -26,6 +25,7 @@ use crate::output::{
     print_turn_summary,
 };
 use crate::progress::{ToolProgressReporter, tool_progress_update};
+use crate::provider_stall::ProviderStallWatch;
 use crate::run_usage::RunUsage;
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
@@ -87,8 +87,15 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         None => None,
     };
 
-    let (exit_code, changes, summary) =
-        stream_output(agent.agent_rx, config.output, &config.events, run_started_at, transcript.as_mut()).await;
+    let (exit_code, changes, summary) = stream_output(
+        agent.agent_rx,
+        config.output,
+        &config.events,
+        run_started_at,
+        config.provider_stall_warn,
+        transcript.as_mut(),
+    )
+    .await;
     print_run_summary(config.output, &summary);
 
     drop(agent.agent_tx);
@@ -128,6 +135,7 @@ async fn stream_output(
     format: OutputFormat,
     events: &[CliEventKind],
     run_started_at: Instant,
+    provider_stall_warn: Option<Duration>,
     mut transcript: Option<&mut JsonlTranscript>,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
@@ -149,8 +157,35 @@ async fn stream_output(
     // `timings`/`usage`, it is fed every event so a `--events`-filtered run
     // still updates the status line.
     let mut progress = ToolProgressReporter::new(io::stderr());
+    // Live one-line stall warning for provider calls that exceed
+    // `provider_stall_warn`. Fed the same events as `provider_wait`. The
+    // select loop below races `rx.recv()` against the watch's deadline so a
+    // hung call prints the warning once instead of hanging silently.
+    let mut stall = ProviderStallWatch::new(provider_stall_warn, io::stderr());
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        // Race the next event against the stall deadline. When the watch is
+        // disabled (threshold `None`, no call in flight, or already warned for
+        // the current call) it returns `None` and the loop falls back to the
+        // plain `rx.recv()` path with no timer overhead.
+        let msg = if let Some(deadline) = stall.next_deadline() {
+            let tokio_deadline = TokioInstant::from_std(deadline);
+            tokio::select! {
+                biased;
+                () = sleep_until(tokio_deadline) => {
+                    if let Err(error) = stall.warn_if_stalled(Instant::now()) {
+                        eprintln!("Failed to write provider stall warning: {error}");
+                    }
+                    // Loop back; the watch self-disables once the warning has
+                    // fired, so the next iteration is a plain `recv().await`.
+                    continue;
+                }
+                maybe = rx.recv() => maybe,
+            }
+        } else {
+            rx.recv().await
+        };
+        let Some(msg) = msg else { break };
         if let AgentEvent::SessionUsage(sample) = &msg {
             usage.record(sample);
         }
@@ -184,7 +219,11 @@ async fn stream_output(
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
             AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
             AgentEvent::Turn(TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. }) => {
-                provider_wait.observe(&msg, Instant::now());
+                // Sample `now` once so the live stall warning and the per-call
+                // wait tracker agree on the elapsed time.
+                let now = Instant::now();
+                provider_wait.observe(&msg, now);
+                stall.observe(&msg, now);
             }
             _ => {}
         }
@@ -519,7 +558,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None).await;
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -528,7 +568,7 @@ mod tests {
     async fn stream_output_failed_turn_exits_with_failure() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -539,7 +579,7 @@ mod tests {
         tx.send(tool_result_with_file_diff("created.rs", None, Some("new"))).await.unwrap();
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -552,7 +592,7 @@ mod tests {
     async fn stream_output_reports_zero_when_nothing_changed() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -563,7 +603,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -577,7 +617,8 @@ mod tests {
         // Restrict to a different event kind so the ToolResult is not printed,
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
-        let (_code, changes, _summary) = stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None).await;
+        let (_code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, None).await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -634,7 +675,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
-        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, _changes, _summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -654,7 +695,7 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         drop(tx);
 
-        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None).await;
+        let (code, _changes, summary) = stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None).await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
@@ -663,6 +704,28 @@ mod tests {
         let line = summary.line();
         assert_eq!(line, "Run finished: 2 turns, 2 tool calls");
         assert_eq!(line.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_output_terminates_with_stall_threshold_configured() {
+        // A short threshold still terminates when a turn ends: the select
+        // loop must break on the `turn_ended` event, not the deadline branch.
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::LlmCallStarted {
+            purpose: llm::LlmCallPurpose::Chat,
+            model: llm::ModelIdentity::default(),
+            display_name: "primary".to_string(),
+            attempt: 0,
+            max_attempts: 3,
+        }))
+        .await
+        .unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+
+        let threshold = Duration::from_millis(50);
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), None).await;
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     #[test]
