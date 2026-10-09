@@ -1,9 +1,9 @@
 use super::{AgentRunResult, RunError};
 use crate::EvalRunError;
 use crate::git_repo::GitRepo;
-use aether_core::events::{AgentEvent, ToolEvent};
+use aether_core::events::{AgentEvent, LlmCallOutcome, ToolEvent, TurnEvent, TurnOutcome};
 use futures::{Stream, StreamExt};
-use llm::SessionUsageTotals;
+use llm::{SessionUsageTotals, TokenUsage};
 use std::fmt::{self, Debug, Display};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -69,6 +69,13 @@ pub struct ToolCall<'a> {
     /// contains a `(exit N)` tail. `None` for non-shell tools, failed calls
     /// (`ToolEvent::Error`), or results that carry no exit code.
     pub exit_code: Option<i32>,
+}
+
+/// Token usage attributed to a single completed turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnUsage {
+    pub outcome: TurnOutcome,
+    pub usage: TokenUsage,
 }
 
 #[derive(Error)]
@@ -166,6 +173,33 @@ impl Transcript {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// Token usage attributed to each completed turn, in order.
+    ///
+    /// Each `TurnUsage` is produced when a [`TurnEvent::Ended`] event is observed, summing the
+    /// `usage` carried by every [`TurnEvent::LlmCallEnded`] that completed during that turn. A
+    /// turn with no completed calls — for example, one whose only calls failed or were cancelled
+    /// — yields a zeroed `TokenUsage` rather than inheriting the previous turn's tokens.
+    pub fn turn_usage(&self) -> Vec<TurnUsage> {
+        let mut turn_usages = Vec::new();
+        let mut pending = TokenUsage::default();
+        for event in &self.events {
+            match event {
+                AgentEvent::Turn(TurnEvent::LlmCallEnded {
+                    outcome: LlmCallOutcome::Completed { usage: Some(usage), .. },
+                    ..
+                }) => {
+                    pending += *usage;
+                }
+                AgentEvent::Turn(TurnEvent::Ended { outcome }) => {
+                    turn_usages.push(TurnUsage { outcome: outcome.clone(), usage: pending });
+                    pending = TokenUsage::default();
+                }
+                _ => {}
+            }
+        }
+        turn_usages
     }
 }
 
@@ -268,9 +302,9 @@ pub(crate) fn is_terminal(event: &AgentEvent) -> bool {
 mod tests {
     use super::*;
     use crate::{Agent, FakeAgent, Task};
-    use aether_core::events::TurnEvent;
+    use aether_core::events::{LlmCallOutcome, TurnEvent, TurnOutcome};
     use llm::testing::session_usage_event;
-    use llm::{TokenUsage, ToolCallRequest, ToolCallResult};
+    use llm::{LlmCallPurpose, TokenUsage, ToolCallRequest, ToolCallResult};
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
@@ -411,6 +445,92 @@ mod tests {
         assert_eq!(usage.tokens.total_tokens().get(), 3600);
         assert_eq!(usage.unpriced_calls, 2);
         assert!(!usage.is_fully_priced());
+    }
+
+    #[test]
+    fn turn_usage_returns_one_entry_per_terminal_turn() {
+        let events = vec![
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_call_ended(TokenUsage::new(10, 2)),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_call_ended(TokenUsage::new(30, 5)),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+        ];
+        let transcript = transcript_with_events(events);
+
+        let turns = transcript.turn_usage();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].outcome, TurnOutcome::Completed);
+        assert_eq!(turns[0].usage, TokenUsage::new(10, 2));
+        assert_eq!(turns[1].outcome, TurnOutcome::Completed);
+        assert_eq!(turns[1].usage, TokenUsage::new(30, 5));
+    }
+
+    #[test]
+    fn turn_usage_averages_completed_calls_within_a_turn() {
+        let events = vec![
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_call_ended(TokenUsage::new(10, 2)),
+            llm_call_ended(TokenUsage::new(20, 3)),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+        ];
+        let transcript = transcript_with_events(events);
+
+        let turns = transcript.turn_usage();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].usage, TokenUsage::new(30, 5));
+    }
+
+    #[test]
+    fn turn_usage_yields_zeroed_usage_for_a_cancelled_turn() {
+        let events = vec![
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_call_ended(TokenUsage::new(10, 2)),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            AgentEvent::Turn(TurnEvent::LlmCallEnded {
+                purpose: LlmCallPurpose::Chat,
+                outcome: LlmCallOutcome::Cancelled,
+            }),
+            AgentEvent::turn_ended(TurnOutcome::Cancelled),
+        ];
+        let transcript = transcript_with_events(events);
+
+        let turns = transcript.turn_usage();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].usage, TokenUsage::new(10, 2));
+        assert_eq!(turns[0].outcome, TurnOutcome::Completed);
+        assert_eq!(turns[1].usage, TokenUsage::default());
+        assert_eq!(turns[1].outcome, TurnOutcome::Cancelled);
+    }
+
+    #[test]
+    fn turn_usage_ignores_session_usage_events() {
+        let events = vec![
+            AgentEvent::SessionUsage(session_usage_event(1, TokenUsage::new(1000, 100))),
+            AgentEvent::Turn(TurnEvent::Started { content: vec![] }),
+            llm_call_ended(TokenUsage::new(10, 2)),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+        ];
+        let transcript = transcript_with_events(events);
+
+        let turns = transcript.turn_usage();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].usage, TokenUsage::new(10, 2));
+    }
+
+    #[test]
+    fn turn_usage_is_empty_when_no_turn_completed() {
+        let transcript = transcript_with_events(vec![tool_call("bash"), tool_result("bash")]);
+        assert!(transcript.turn_usage().is_empty());
+    }
+
+    fn llm_call_ended(usage: TokenUsage) -> AgentEvent {
+        AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage) },
+        })
     }
 
     fn transcript_with_events(events: Vec<AgentEvent>) -> Transcript {

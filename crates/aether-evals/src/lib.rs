@@ -15,7 +15,7 @@ pub use containers::{Container, ContainerBuilder, ContainerError, ExecOutput, Im
 pub use error::{EvalRunError, WorkspaceError};
 pub use evals::{
     DiffStats, GitBundleSpec, GitDiff, GitRepoSpec, RetainedWorkspaceInfo, StartingCommit, Task, ToolCall, Transcript,
-    TranscriptError, TranscriptHeader, Workspace, WorkspaceSource, create_git_bundle,
+    TranscriptError, TranscriptHeader, TurnUsage, Workspace, WorkspaceSource, create_git_bundle,
 };
 pub use git_repo::GitRepoError;
 pub use judge::{

@@ -44,6 +44,7 @@ export {
   ToolCall,
   turnEnded,
 } from "./transcript.js";
+export type { TurnUsage } from "./transcript.js";
 export { createGitBundle, Workspace } from "./workspace.js";
 export type {
   GitBundleSpec,
