@@ -5,6 +5,7 @@ use aether_core::events::{
 use llm::LlmCallPurpose;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -14,6 +15,7 @@ pub enum OutputFormat {
     Json,
 }
 
+<<<<<<< HEAD
 /// Print a single agent event using the chosen format.
 ///
 /// `retry_note` is optional context appended to the human-readable failure line
@@ -25,6 +27,88 @@ pub(crate) fn print_message(
     message: &AgentEvent,
     retry_note: Option<&str>,
 ) -> Result<(), serde_json::Error> {
+=======
+/// Accumulates the wall-clock duration of each turn observed on the agent
+/// event stream. Callers feed `Instant::now()` to `begin` for every
+/// `TurnEvent::Started` and to `end` for every `TurnEvent::Ended`; each matched
+/// pair contributes one `Duration` to `self.durations`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TurnTimings {
+    durations: Vec<Duration>,
+    pending_start: Option<Instant>,
+}
+
+impl TurnTimings {
+    /// Record that a turn started at `now`. Any prior unmatched start is
+    /// overwritten so a missing `Ended` does not leave dangling state.
+    pub(crate) fn begin(&mut self, now: Instant) {
+        self.pending_start = Some(now);
+    }
+
+    /// Record that a turn ended at `now`. Pushes the elapsed duration and
+    /// clears the pending start. If no start is pending the call is a no-op
+    /// so an unmatched `Ended` cannot poison later measurements.
+    pub(crate) fn end(&mut self, now: Instant) {
+        if let Some(start) = self.pending_start.take() {
+            self.durations.push(now.saturating_duration_since(start));
+        }
+    }
+
+    /// True when no turn duration has been recorded.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.durations.is_empty()
+    }
+
+    /// Number of turn durations recorded so far. Test-only; not used in the
+    /// production code path, so it is gated on `cfg(test)` to keep the lib
+    /// build free of a dead-code warning.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.durations.len()
+    }
+
+    /// Sum of every recorded turn duration.
+    pub(crate) fn total(&self) -> Duration {
+        self.durations.iter().copied().sum()
+    }
+
+    /// Multi-line summary: one `Turn N took <duration>` line per turn,
+    /// followed by a total line.
+    pub(crate) fn summary(&self) -> String {
+        use std::fmt::Write as _;
+        let mut lines = String::new();
+        for (index, duration) in self.durations.iter().enumerate() {
+            let turn = index + 1;
+            let _ = writeln!(lines, "Turn {turn} took {}", format_duration(*duration));
+        }
+        let count = self.durations.len();
+        let total = format_duration(self.total());
+        if count == 1 {
+            let _ = write!(lines, "1 turn, total {total}");
+        } else {
+            let _ = write!(lines, "{count} turns, total {total}");
+        }
+        lines
+    }
+}
+
+/// Render a `Duration` as seconds with millisecond precision, e.g. `1.500s`.
+pub(crate) fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
+}
+
+/// Print a `TurnTimings` summary at the end of a run. Returns without
+/// printing when the format is not `Text` (preserving `json`/`pretty`
+/// output) or when no turn duration has been recorded.
+pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings) {
+    if !matches!(format, OutputFormat::Text) || timings.is_empty() {
+        return;
+    }
+    println!("{}", timings.summary());
+}
+
+pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent) -> Result<(), serde_json::Error> {
+>>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
     match format {
         OutputFormat::Text => {
             if let Some(text) = format_text(message, retry_note) {
@@ -393,6 +477,50 @@ mod tests {
         );
         assert_eq!(format_text(&usage_update(), None), Some("Context: 100000 / 200000 tokens (50.0%)".to_string()));
         assert_eq!(format_text(&AgentEvent::Context(ContextEvent::Cleared), None), Some("Context cleared".to_string()));
+    }
+
+    #[test]
+    fn turn_timings_records_each_turn_and_reports_the_sum() {
+        let base = Instant::now();
+        let mut timings = TurnTimings::default();
+        assert!(timings.is_empty());
+        assert_eq!(timings.len(), 0);
+        assert_eq!(timings.total(), Duration::ZERO);
+
+        // Turn 1: 1.250s
+        timings.begin(base);
+        timings.end(base + Duration::from_millis(1250));
+        // Turn 2: 2.500s
+        timings.begin(base + Duration::from_millis(1250));
+        timings.end(base + Duration::from_millis(3750));
+
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings.total(), Duration::from_millis(3750));
+
+        let summary = timings.summary();
+        assert!(summary.contains("Turn 1 took "), "missing Turn 1 line: {summary}");
+        assert!(summary.contains("Turn 2 took "), "missing Turn 2 line: {summary}");
+        assert!(summary.contains(&format_duration(Duration::from_millis(3750))), "missing total in summary: {summary}");
+        assert!(summary.contains("2 turns, total"), "missing plural total: {summary}");
+    }
+
+    #[test]
+    fn turn_timings_ignores_unmatched_end() {
+        let base = Instant::now();
+        let mut timings = TurnTimings::default();
+        timings.end(base + Duration::from_millis(500));
+        assert!(timings.is_empty());
+        assert_eq!(timings.total(), Duration::ZERO);
+    }
+
+    #[test]
+    fn turn_timings_ignores_unmatched_start() {
+        let base = Instant::now();
+        let mut timings = TurnTimings::default();
+        timings.begin(base);
+        // No matching end: nothing recorded, pending start is dropped.
+        assert!(timings.is_empty());
+        assert_eq!(timings.total(), Duration::ZERO);
     }
 
     fn tool_result() -> AgentEvent {

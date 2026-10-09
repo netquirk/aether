@@ -7,6 +7,7 @@ use aether_telemetry::TelemetryRuntime;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -15,7 +16,11 @@ use crate::workspace::warn_if_not_a_repository;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
+<<<<<<< HEAD
 use crate::output::{OutputFormat, RetryTracker, print_message};
+=======
+use crate::output::{OutputFormat, TurnTimings, print_message, print_turn_summary};
+>>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
@@ -79,6 +84,7 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
 }
 
 async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat, events: &[CliEventKind]) -> ExitCode {
+<<<<<<< HEAD
     let mut tracker = RetryTracker::default();
     while let Some(msg) = rx.recv().await {
         // Capture the note for failed turns *before* we update the tracker
@@ -90,6 +96,20 @@ async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat,
             _ => None,
         };
         tracker.observe(&msg);
+=======
+    // Wall-clock timing of every turn seen on the stream, independent of the
+    // `--events` filter so a filtered run still reports how long it ran.
+    let mut timings = TurnTimings::default();
+    let mut exit_code = ExitCode::SUCCESS;
+
+    while let Some(msg) = rx.recv().await {
+        match &msg {
+            AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
+            AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
+            _ => {}
+        }
+
+>>>>>>> 5ba5cd13 (TASK-23-337: capture the agent's working tree for rebase)
         if should_emit(&msg, events)
             && let Err(error) = print_message(format, &msg, note.as_deref())
         {
@@ -98,13 +118,16 @@ async fn stream_output(mut rx: mpsc::Receiver<AgentEvent>, format: OutputFormat,
         }
 
         if let Some(outcome) = msg.turn_outcome() {
-            return match outcome {
+            exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled => ExitCode::SUCCESS,
             };
+            break;
         }
     }
-    ExitCode::SUCCESS
+
+    print_turn_summary(format, &timings);
+    exit_code
 }
 
 fn should_emit(msg: &AgentEvent, include: &[CliEventKind]) -> bool {
@@ -335,6 +358,15 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
         let code = stream_output(rx, OutputFormat::Text, &[]).await;
         assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn stream_output_records_turn_durations() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let code = stream_output(rx, OutputFormat::Text, &[]).await;
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     fn tool_call_msg() -> AgentEvent {
