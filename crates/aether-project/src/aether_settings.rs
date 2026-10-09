@@ -154,6 +154,15 @@ pub struct AetherSettings {
     /// overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<ToolOutputSettings>,
+    /// Extra environment variables that every shell command a run starts sees
+    /// — the `bash` tool of the built-in `coding` MCP server. Keys declared
+    /// here are merged over the process environment for those commands: a
+    /// configured key can shadow `PATH`, `HOME`, or any other variable for the
+    /// duration of the spawned `bash` process. The internal gateway socket
+    /// `AETHER_MCP_IPC_SOCKET` is always written after this map so it cannot
+    /// be spoofed via config.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shell_environment: BTreeMap<String, String>,
     /// The agents defined for this project. At least one agent is required.
     #[schemars(length(min = 1))]
     pub agents: Vec<AgentConfig>,
@@ -166,8 +175,17 @@ pub struct AetherSettings {
 /// `#[derive(schemars::JsonSchema)]` definition of [`AetherSettings`]; the
 /// `known_top_level_keys_match_schema` test in this module will fail the build
 /// if they ever drift.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] =
-    &["agent", "prompts", "mcps", "providers", "credentialsStore", "telemetry", "toolOutput", "agents"];
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "agent",
+    "prompts",
+    "mcps",
+    "providers",
+    "credentialsStore",
+    "telemetry",
+    "toolOutput",
+    "shellEnvironment",
+    "agents",
+];
 
 /// Returns the keys present in `value` that [`AetherSettings`] does not
 /// declare, preserving their original ordering for stable, testable output.
@@ -396,6 +414,11 @@ impl AetherSettings {
         if let Some(next_tool_output) = next.tool_output {
             self.tool_output.get_or_insert_default().merge(next_tool_output);
         }
+
+        // Project-layer shell environment wins on every shared key, so a
+        // project file can shadow values contributed by user-level settings
+        // without dropping the user's other entries.
+        self.shell_environment.extend(next.shell_environment);
 
         for next_agent in next.agents {
             if let Some(existing) = self.agents.iter_mut().find(|agent| agent.name.trim() == next_agent.name.trim()) {

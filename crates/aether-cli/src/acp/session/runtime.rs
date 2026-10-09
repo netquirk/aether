@@ -12,6 +12,7 @@ use mcp_utils::client::{
     ElicitingOAuthHandler, McpClientEvent, McpConnectionDetails, McpError, McpServer, McpServerStatusEntry,
     OAuthHandlerFactory,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -96,6 +97,11 @@ pub(crate) struct ProductionRuntimeFactory {
     /// per-agent override and the `AETHER_TOOL_OUTPUT_MAX_BYTES` /
     /// `PRAIRIE_TOOL_OUTPUT_DIR` env vars.
     settings_tool_output: Option<ToolOutputSettings>,
+    /// Top-level `shellEnvironment` block from the loaded settings. The
+    /// factory threads it into the runtime so every shell command a run
+    /// starts (the `bash` tool of the built-in `coding` MCP server) sees
+    /// the configured variables.
+    shell_environment: BTreeMap<String, String>,
 }
 
 impl ProductionRuntimeFactory {
@@ -104,8 +110,9 @@ impl ProductionRuntimeFactory {
         client_servers: Vec<McpServer>,
         agent_deps: AgentDeps,
         settings_tool_output: Option<ToolOutputSettings>,
+        shell_environment: BTreeMap<String, String>,
     ) -> Self {
-        Self { cwd, mcp_servers: client_servers, agent_deps, settings_tool_output }
+        Self { cwd, mcp_servers: client_servers, agent_deps, settings_tool_output, shell_environment }
     }
 }
 
@@ -123,6 +130,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         let mut builder = RuntimeBuilder::from_spec(self.cwd.clone(), spec.clone())
             .extra_servers(extra_servers)
             .settings_tool_output(self.settings_tool_output.clone())
+            .shell_environment(self.shell_environment.clone())
             .agent_deps(self.agent_deps.clone());
         if let Some(last) = usage_seed {
             builder = builder.resume_usage(last);

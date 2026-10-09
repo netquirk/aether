@@ -237,6 +237,8 @@ fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result
     };
 
     let settings = config.settings_source.load_settings(cwd)?;
+    // Capture before the settings value is consumed by downstream callers.
+    let shell_environment = settings.shell_environment.clone();
     let telemetry = match build_telemetry_runtime(settings.telemetry.as_ref(), config.trace_context) {
         Ok(telemetry) => telemetry,
         Err(error @ TelemetryInitError::InvalidTraceContext(_)) => return Err(AcpRunError::Telemetry(error)),
@@ -258,6 +260,7 @@ fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result
         cwd: cwd.to_path_buf(),
         detached,
         tool_output_settings: settings.tool_output,
+        shell_environment,
     }))
 }
 

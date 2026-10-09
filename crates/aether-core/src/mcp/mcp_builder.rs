@@ -189,6 +189,12 @@ pub struct McpBuilder {
     tool_filter: ToolFilter,
     progressive_discovery_instructions: Option<String>,
     tool_output_cap: Arc<ToolOutputCap>,
+    /// Environment variables injected into every shell command a run starts
+    /// (the `bash` tool of the built-in `coding` MCP server). The internal
+    /// `AETHER_MCP_IPC_SOCKET` gateway variable is written after this map in
+    /// [`spawn`](Self::spawn) so config-supplied values can never spoof the
+    /// real socket.
+    shell_environment: BTreeMap<String, String>,
 }
 
 impl McpBuilder {
@@ -211,6 +217,7 @@ impl McpBuilder {
             tool_filter: ToolFilter::default(),
             progressive_discovery_instructions: None,
             tool_output_cap: Arc::new(ToolOutputCap::new(0, root_dir.as_ref().join(".prairie/out"))),
+            shell_environment: BTreeMap::new(),
         }
     }
 
@@ -253,6 +260,15 @@ impl McpBuilder {
 
     pub fn with_agent_deps(mut self, deps: AgentDeps) -> Self {
         self.agent_deps = deps;
+        self
+    }
+
+    /// Inject extra environment variables into every shell command a run
+    /// starts. Keys supplied here are merged over the process environment for
+    /// the `bash` tool; the internal `AETHER_MCP_IPC_SOCKET` gateway
+    /// variable is written after this map and always wins.
+    pub fn with_shell_environment(mut self, vars: BTreeMap<String, String>) -> Self {
+        self.shell_environment = vars;
         self
     }
 
@@ -315,6 +331,7 @@ impl McpBuilder {
             tool_filter,
             progressive_discovery_instructions,
             tool_output_cap,
+            shell_environment,
         } = self;
         if servers.iter().any(|server| server.tool_exposure.has_deferred_tools())
             && servers.iter().any(|server| server.name == PROGRESSIVE_DISCOVERY_INSTRUCTION_NAME)
@@ -331,12 +348,13 @@ impl McpBuilder {
         } else {
             None
         };
-        let shell_environment = gateway_transport
-            .as_ref()
-            .map(|transport| {
-                BTreeMap::from([(AETHER_MCP_IPC_SOCKET.to_string(), transport.path().to_string_lossy().into_owned())])
-            })
-            .unwrap_or_default();
+        // Config-supplied environment variables come first so the real
+        // gateway socket wins regardless of what the config might contain.
+        let mut shell_environment = shell_environment;
+        if let Some(transport) = gateway_transport.as_ref() {
+            shell_environment
+                .insert(AETHER_MCP_IPC_SOCKET.to_string(), transport.path().to_string_lossy().into_owned());
+        }
         let services = RuntimeServices { mcp: mcp.clone(), root_dir: root_dir.clone(), agent_deps, shell_environment };
         let servers = resolve_servers(servers, &factories, &services).await?;
 
@@ -471,6 +489,75 @@ mod tests {
             services.shell_environment.get(AETHER_MCP_IPC_SOCKET).expect("factory receives gateway endpoint");
         assert_eq!(Path::new(inherited), spawn.gateway_endpoint().expect("gateway endpoint exists"));
         assert!(Path::new(inherited).exists());
+    }
+
+    #[tokio::test]
+    async fn shell_environment_is_passed_through_to_in_memory_factories() {
+        let received = Arc::new(Mutex::new(None::<RuntimeServices>));
+        let factory_received = Arc::clone(&received);
+        let factory: ServerFactory = Box::new(move |_, services| {
+            *factory_received.lock().unwrap() = Some(services);
+            async move { FakeMcpServer::new().into_dyn() }.boxed()
+        });
+        let configured = BTreeMap::from([
+            ("AETHER_TASK24_FROM_CONFIG".to_string(), "yes".to_string()),
+            ("AETHER_TASK24_EXTRA".to_string(), "absent".to_string()),
+        ]);
+
+        let _spawn = McpBuilder::new("/workspace")
+            .with_shell_environment(configured.clone())
+            .register_in_memory_server("test", factory)
+            .from_mcp_config_sources(&[json_source(r#"{"servers":{"test":{"type":"in-memory"}}}"#)])
+            .unwrap()
+            .spawn()
+            .await
+            .unwrap();
+
+        let services = received.lock().unwrap().clone().expect("factory received runtime services");
+        let observed: BTreeMap<String, String> = services
+            .shell_environment
+            .iter()
+            .filter(|(name, _)| name.as_str() != AETHER_MCP_IPC_SOCKET)
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        assert_eq!(observed, configured, "config-supplied variables must reach the factory");
+    }
+
+    #[tokio::test]
+    async fn internal_gateway_socket_overrides_config_supplied_value() {
+        let received = Arc::new(Mutex::new(None::<RuntimeServices>));
+        let factory_received = Arc::clone(&received);
+        let factory: ServerFactory = Box::new(move |_, services| {
+            *factory_received.lock().unwrap() = Some(services);
+            async move { FakeMcpServer::new().into_dyn() }.boxed()
+        });
+        // A hostile config that names a known directory must not win over the
+        // real gateway socket; the runtime always inserts the bound path last.
+        let configured = BTreeMap::from([
+            (AETHER_MCP_IPC_SOCKET.to_string(), "/tmp/aether-task24-hostile.sock".to_string()),
+            ("AETHER_TASK24_OK".to_string(), "ok".to_string()),
+        ]);
+
+        let spawn = McpBuilder::new("/workspace")
+            .with_shell_environment(configured)
+            .register_in_memory_server("test", factory)
+            .from_mcp_config_sources(&[json_source(r#"{"servers":{"test":{"type":"in-memory","deferTools":true}}}"#)])
+            .unwrap()
+            .spawn()
+            .await
+            .unwrap();
+
+        let services = received.lock().unwrap().clone().expect("factory received runtime services");
+        let inherited =
+            services.shell_environment.get(AETHER_MCP_IPC_SOCKET).expect("factory receives gateway endpoint");
+        let bound = spawn.gateway_endpoint().expect("gateway endpoint exists").to_string_lossy().into_owned();
+        assert_eq!(inherited, &bound, "the bound gateway socket must win over config");
+        assert_ne!(inherited, "/tmp/aether-task24-hostile.sock", "hostile config value must be overridden");
+        assert_eq!(
+            services.shell_environment.get("AETHER_TASK24_OK").map(String::as_str),
+            Some("ok"),
+            "other config-supplied entries must still reach the factory"
+        );
     }
 
     #[tokio::test]

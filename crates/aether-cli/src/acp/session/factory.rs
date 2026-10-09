@@ -11,6 +11,7 @@ use llm::catalog::{LlmModel, get_local_models};
 use llm::types::IsoString;
 use llm::{ProviderConnectionOverrides, ReasoningEffort};
 use rmcp::model::ClientCapabilities;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -44,6 +45,11 @@ pub(crate) struct SessionFactory {
     /// passes it to the [`ProductionRuntimeFactory`] which threads it into
     /// the MCP runtime.
     tool_output_settings: Option<ToolOutputSettings>,
+    /// Top-level `shellEnvironment` block from the loaded settings. The
+    /// factory passes it to the [`ProductionRuntimeFactory`] so every shell
+    /// command a run starts (the `bash` tool of the built-in `coding` MCP
+    /// server) sees them merged over the process environment.
+    shell_environment: BTreeMap<String, String>,
 }
 
 /// The fully-built session ready to be registered with [`AcpState`](crate::acp::state::AcpState).
@@ -86,6 +92,7 @@ impl SessionFactory {
         runtime_factory: Option<Arc<dyn RuntimeFactory>>,
         detached: DetachedArgs,
         tool_output_settings: Option<ToolOutputSettings>,
+        shell_environment: BTreeMap<String, String>,
     ) -> Self {
         Self {
             settings_source,
@@ -98,6 +105,7 @@ impl SessionFactory {
             detached,
             available: OnceCell::new(),
             tool_output_settings,
+            shell_environment,
         }
     }
 
@@ -238,6 +246,7 @@ impl SessionFactory {
             map_acp_mcp_servers(mcp_servers),
             deps,
             self.tool_output_settings.clone(),
+            self.shell_environment.clone(),
         ))
     }
 

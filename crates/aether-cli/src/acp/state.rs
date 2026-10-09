@@ -23,7 +23,7 @@ use llm::catalog::{LlmModel, ModelSpec};
 use llm::{ContentBlock, ProviderConnectionOverrides};
 use mcp_utils::client::{client_capabilities, client_capabilities_for};
 use rmcp::model::ClientCapabilities;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -81,6 +81,11 @@ pub(crate) struct AcpStateConfig {
     /// the [`SessionFactory`] so the runtime's MCP layer can resolve the
     /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` cap.
     pub(crate) tool_output_settings: Option<ToolOutputSettings>,
+    /// Top-level `shellEnvironment` block from the loaded settings. Threaded
+    /// into [`SessionFactory`] which hands it to the
+    /// [`ProductionRuntimeFactory`](crate::acp::session::runtime::ProductionRuntimeFactory)
+    /// for every session that runs over ACP.
+    pub(crate) shell_environment: BTreeMap<String, String>,
 }
 
 struct SpawnedSession {
@@ -181,6 +186,7 @@ impl AcpState {
             config.runtime_factory,
             config.detached,
             config.tool_output_settings.clone(),
+            config.shell_environment.clone(),
         );
         Self {
             client_slot: ClientSlot::default(),
@@ -777,6 +783,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             detached: DetachedArgs::default(),
             tool_output_settings: None,
+            shell_environment: BTreeMap::new(),
         })
     }
 

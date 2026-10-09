@@ -156,3 +156,31 @@ An agent that disables the cap while leaving the top-level default in place:
 }
 ```
 
+## Shell environment for run commands
+
+Every shell command a run starts (the `bash` tool of the built-in `coding`
+MCP server) inherits the variables from this list, merged over the process
+environment of the running Aether process. A configured key shadows whatever
+the OS process would otherwise have seen — useful for pinning `PATH`,
+injecting a project-local SDK directory, or tagging runs with a stable
+identifier. The internal `AETHER_MCP_IPC_SOCKET` gateway variable is always
+written by the MCP runtime after this map, so config-supplied values cannot
+spoof the gateway socket.
+
+```json
+{
+  "shellEnvironment": {
+    "PATH": "/opt/build-tools/bin:${PATH}",
+    "BUILD_TAG": "staging"
+  },
+  "agents": [
+    {
+      "name": "Build",
+      "description": "Builds features and fixes bugs",
+      "model": "anthropic:claude-sonnet-4-5-20250929",
+      "userInvocable": true
+    }
+  ]
+}
+```
+

@@ -12,6 +12,7 @@ use aether_project::tool_output_max_bytes_from_env;
 use llm::{ChatMessage, SessionUsageEvent, ToolDefinition};
 use mcp_servers::McpBuilderExt;
 use mcp_utils::client::{McpClientEvent, McpConnectionDetails, McpServer, OAuthHandlerFactory};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::debug;
@@ -23,6 +24,12 @@ pub struct RuntimeBuilder {
     /// the settings file did not declare a cap; the CLI falls back to the
     /// 16 KiB default and env-var overrides.
     settings_tool_output: Option<ToolOutputSettings>,
+    /// Extra environment variables injected into every shell command a run
+    /// starts. Sourced from the top-level `shellEnvironment` block of the
+    /// loaded settings; threaded into [`McpBuilder::with_shell_environment`]
+    /// which merges them with the internal gateway socket inside
+    /// [`spawn_mcp`].
+    shell_environment: BTreeMap<String, String>,
     mcp_config_sources: Vec<McpConfigSource>,
     extra_mcp_servers: Vec<McpServer>,
     oauth_applicator: Option<Box<dyn FnOnce(McpBuilder) -> McpBuilder + Send>>,
@@ -49,6 +56,7 @@ impl RuntimeBuilder {
             cwd,
             spec,
             settings_tool_output: None,
+            shell_environment: BTreeMap::new(),
             mcp_config_sources: Vec::new(),
             extra_mcp_servers: Vec::new(),
             oauth_applicator: None,
@@ -63,6 +71,16 @@ impl RuntimeBuilder {
     /// inside [`spawn_mcp`].
     pub fn settings_tool_output(mut self, tool_output: Option<ToolOutputSettings>) -> Self {
         self.settings_tool_output = tool_output;
+        self
+    }
+
+    /// Set the top-level `shellEnvironment` block from the loaded settings.
+    /// The CLI threads it into [`McpBuilder::with_shell_environment`] inside
+    /// [`spawn_mcp`] so every shell command a run starts (the `bash` tool of
+    /// the built-in `coding` MCP server) sees the configured variables
+    /// merged over its process environment.
+    pub fn shell_environment(mut self, vars: BTreeMap<String, String>) -> Self {
+        self.shell_environment = vars;
         self
     }
 
@@ -167,7 +185,7 @@ impl RuntimeBuilder {
             builder = apply_oauth(builder);
         }
 
-        builder = builder.with_agent_deps(deps).with_builtin_servers();
+        builder = builder.with_agent_deps(deps).with_shell_environment(self.shell_environment).with_builtin_servers();
 
         if !self.extra_mcp_servers.is_empty() {
             builder = builder.with_servers(self.extra_mcp_servers);

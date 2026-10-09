@@ -33,7 +33,7 @@ use llm::testing::FakeLlmProvider;
 use llm::{ChatMessage, Context, LlmResponse, SessionUsageEvent, StreamingModelProvider};
 use llm::{MessageId, ProviderConnectionOverrides};
 use mcp_utils::client::{InMemoryServerSpec, McpServer, McpTransport, ToolExposure};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -274,6 +274,7 @@ impl AcpTestHarness {
                 cwd: PathBuf::from("/tmp"),
                 detached,
                 tool_output_settings: None,
+                shell_environment: BTreeMap::new(),
             },
             Arc::new(FakeProviderLogin),
         ));

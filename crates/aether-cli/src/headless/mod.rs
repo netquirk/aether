@@ -83,6 +83,12 @@ pub struct RunConfig {
     /// override and the `AETHER_TOOL_OUTPUT_MAX_BYTES` /
     /// `PRAIRIE_TOOL_OUTPUT_DIR` env vars.
     pub settings_tool_output: Option<ToolOutputSettings>,
+    /// Extra environment variables given to every shell command a run
+    /// starts. Threaded into the runtime via
+    /// [`crate::runtime::RuntimeBuilder::shell_environment`] so the
+    /// built-in `coding` MCP server's `bash` tool sees them merged over the
+    /// process environment.
+    pub shell_environment: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -220,6 +226,8 @@ impl RunConfig {
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
         let settings_tool_output = settings.tool_output.clone();
+        // Capture before `settings` is moved into `resolve_agent_from_settings`.
+        let shell_environment = settings.shell_environment.clone();
         let selection = initial_selection(args.agent, args.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -239,6 +247,7 @@ impl RunConfig {
             telemetry,
             trace_context: None,
             settings_tool_output,
+            shell_environment,
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
         })
@@ -253,6 +262,8 @@ impl RunConfig {
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
         let settings_tool_output = settings.tool_output.clone();
+        // Capture before `settings` is moved into `resolve_agent_from_settings`.
+        let shell_environment = settings.shell_environment.clone();
         let selection = initial_selection(options.agent, options.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -277,6 +288,7 @@ impl RunConfig {
             telemetry,
             trace_context: options.trace_context,
             settings_tool_output,
+            shell_environment,
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
         })
