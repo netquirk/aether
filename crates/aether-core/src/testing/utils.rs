@@ -50,7 +50,12 @@ pub fn mcp_instructions(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// Millisecond-scale retry delays so retry tests run fast under virtual time.
 pub fn fast_retry(max_attempts: u32) -> RetryConfig {
-    RetryConfig { max_attempts, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) }
+    RetryConfig {
+        max_attempts,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        resume_partial: true,
+    }
 }
 
 pub fn test_agent() -> TestAgentBuilder {

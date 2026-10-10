@@ -12,6 +12,7 @@ mod agent {
     mod refusal_tests;
     mod repetition_tests;
     mod replace_conversation_tests;
+    mod resume_tests;
     mod retry_tests;
     mod trace_tests;
     mod usage_tests;

@@ -155,7 +155,12 @@ async fn cancel_during_retry_wait_traces_cancelled_turn_without_starting_call() 
         failed_call(ProviderError::server("boom").with_http_status(503)),
         llm_response().text(&["never seen"]).build_results(),
     ];
-    let retry = RetryConfig { max_attempts: 5, base_delay: Duration::from_mins(1), max_delay: Duration::from_mins(1) };
+    let retry = RetryConfig {
+        max_attempts: 5,
+        base_delay: Duration::from_mins(1),
+        max_delay: Duration::from_mins(1),
+        ..RetryConfig::default()
+    };
 
     let trace = test_agent()
         .retry_config(retry)

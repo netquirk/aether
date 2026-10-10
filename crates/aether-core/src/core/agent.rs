@@ -22,6 +22,7 @@ use llm::{
 };
 use mcp_utils::client::{CallToolError, CallToolOptions, ToolCallEvent};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,6 +111,12 @@ pub struct Agent {
     active_compaction: Option<CompactionId>,
     active_model: Option<LlmModel>,
     session_usage: SessionUsageTracker,
+    /// Resumes after a mid-stream cut since the last cleanly finished model
+    /// call. Shares `retry_config.max_attempts` with plain retries.
+    stream_resumes: u32,
+    /// Set when an interrupted call is being resumed: the continuation note
+    /// that goes into the conversation once the partial iteration completes.
+    pending_resume_note: Option<String>,
     require_tool_call: bool,
 }
 
@@ -158,6 +165,8 @@ impl Agent {
             active_compaction: None,
             active_model: None,
             session_usage: config.session_usage,
+            stream_resumes: 0,
+            pending_resume_note: None,
             require_tool_call: config.require_tool_call,
         }
     }
@@ -289,7 +298,15 @@ impl Agent {
 
         // A queued user input is progress: the model has been told something
         // new, so any previous repetition streak is moot.
-        if has_queued_input {
+        // A mid-stream resume is also a continuation, not a new attempt at
+        // the same prompt: skip the repetition check so a stuck cut can
+        // still consume the configured retry budget instead of being aborted
+        // early as a "repetition loop".
+        if self.pending_resume_note.is_some() {
+            // The partial text is the cut's tail of an in-progress reply; the
+            // resume will re-issue the same context, so the next iteration's
+            // signature would be identical and trip the detector unfairly.
+        } else if has_queued_input {
             self.repetition.reset();
         } else if self.repetition.observe(signature.as_deref()) {
             let observed = self.repetition.count();
@@ -299,6 +316,12 @@ impl Agent {
             );
             self.auto_continue.reset();
             self.finish_turn(TurnOutcome::Failed { error }).await;
+            return;
+        }
+
+        if let Some(note) = self.pending_resume_note.take() {
+            self.inject_resume_note(note).await;
+            self.start_next_turn().await;
             return;
         }
 
@@ -398,6 +421,8 @@ impl Agent {
         self.auto_continue.reset();
         self.repetition.reset();
         self.turns_started = 0;
+        self.stream_resumes = 0;
+        self.pending_resume_note = None;
         self.turn_active = true;
         let content = input.content_blocks();
         self.emit(AgentEvent::Turn(TurnEvent::Started { content })).await;
@@ -466,13 +491,19 @@ impl Agent {
     }
 
     async fn on_llm_error(&mut self, error: LlmError, state: &mut IterationState) {
-        let will_retry = error.is_retryable() && state.retry_attempt < self.retry_config.max_attempts;
+        let attempts_used = state.retry_attempt + self.stream_resumes;
+        let will_retry = error.is_retryable() && attempts_used < self.retry_config.max_attempts;
         let outcome = LlmCallOutcome::from_llm_error(&error, will_retry);
         let error_message = error.to_string();
         self.finish_chat_call(outcome).await;
 
         if !will_retry {
             self.finish_turn(TurnOutcome::Failed { error: error_message }).await;
+            return;
+        }
+
+        if self.retry_config.resume_partial && state.has_partial_output() {
+            self.resume_interrupted_call(&error, state).await;
             return;
         }
 
@@ -489,6 +520,60 @@ impl Agent {
 
         self.tool_executions.retire_foreground();
         self.start_llm_stream(Some(delay), state.retry_attempt).await;
+    }
+
+    /// Keep what an interrupted call already produced instead of re-sending
+    /// the request from scratch. The partial text and reasoning are committed
+    /// as the assistant's turn, tool calls that finished streaming keep
+    /// running and their results are kept, and once they settle the model is
+    /// asked to continue from the cut. A tool call whose arguments were still
+    /// streaming never ran; its partial arguments are replayed in the note so
+    /// the model can issue it again in full.
+    async fn resume_interrupted_call(&mut self, error: &LlmError, state: &mut IterationState) {
+        self.stream_resumes += 1;
+        let attempt = state.retry_attempt + self.stream_resumes;
+
+        tracing::warn!(
+            attempt,
+            max_attempts = self.retry_config.max_attempts,
+            kept_text_bytes = state.message_content.len(),
+            kept_tool_calls = state.started_tool_calls,
+            cut_tool_calls = state.streaming_tool_calls.len(),
+            error = %error,
+            "Resuming LLM response after mid-stream interruption"
+        );
+
+        self.emit(AgentEvent::Turn(TurnEvent::RetryScheduled {
+            purpose: LlmCallPurpose::Chat,
+            attempt,
+            max_attempts: self.retry_config.max_attempts,
+            delay_ms: 0,
+        }))
+        .await;
+
+        // Drop the cut stream so nothing it still yields lands on this call.
+        self.streams.remove(&StreamKey::Llm);
+        let cut_calls = std::mem::take(&mut state.streaming_tool_calls);
+        self.pending_resume_note = Some(resume_note(state, &cut_calls));
+        // Partial reasoning is not kept: a thinking block cut before its
+        // signature is rejected by providers that verify one.
+        state.reasoning_summary_text.clear();
+        state.encrypted_reasoning = None;
+        state.llm_done = true;
+        state.stop_reason = None;
+    }
+
+    async fn inject_resume_note(&mut self, note: String) {
+        let message_id = MessageId::new();
+        let content = vec![llm::ContentBlock::text(note)];
+        self.context.add_message(ChatMessage::user_with_id(message_id.clone(), content.clone()));
+        self.emit(AgentEvent::Turn(TurnEvent::AutoContinue {
+            attempt: self.stream_resumes,
+            max_attempts: self.retry_config.max_attempts,
+            message_id,
+            content,
+        }))
+        .await;
     }
 
     fn is_busy(&self) -> bool {
@@ -572,19 +657,30 @@ impl Agent {
             }
 
             ToolRequestStart { id, name } => {
+                state.streaming_tool_calls.push(ToolCallRequest {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                });
                 let request = ToolCallRequest { id, name, arguments: String::new() };
                 self.emit(AgentEvent::Tool(ToolEvent::Call { request })).await;
             }
 
             ToolRequestArg { id, chunk } => {
+                if let Some(call) = state.streaming_tool_calls.iter_mut().find(|call| call.id == id) {
+                    call.arguments.push_str(&chunk);
+                }
                 self.emit(AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id: id, chunk })).await;
             }
 
             ToolRequestComplete { tool_call } => {
+                state.streaming_tool_calls.retain(|call| call.id != tool_call.id);
+                state.started_tool_calls += 1;
                 self.handle_tool_completion(tool_call, state).await;
             }
 
             Done { stop_reason } => {
+                self.stream_resumes = 0;
                 state.llm_done = true;
                 state.stop_reason = stop_reason;
                 self.finish_chat_call(LlmCallOutcome::Completed {
@@ -899,6 +995,44 @@ impl AutoContinue {
     }
 }
 
+/// Longest partial tool-call argument replayed in a resume note.
+const MAX_REPLAYED_ARGUMENT_BYTES: usize = 16 * 1024;
+
+fn resume_note(state: &IterationState, cut_calls: &[ToolCallRequest]) -> String {
+    let mut note = String::from(
+        "<system-notification>Your previous response was cut off by a network interruption before it finished.",
+    );
+    if !state.message_content.trim().is_empty() {
+        note.push_str(" Everything you wrote before the cut is kept above.");
+    }
+    if state.started_tool_calls > 0 {
+        note.push_str(" The tool calls that were complete before the cut ran, and their results are above.");
+    }
+    for call in cut_calls {
+        let arguments = truncate_to_boundary(&call.arguments, MAX_REPLAYED_ARGUMENT_BYTES);
+        let _ = write!(
+            note,
+            "\n\nYou were in the middle of a `{}` tool call when the cut happened, so it did NOT run. Its arguments up to the cut were:\n```\n{}\n```\nIssue that call again with its complete arguments.",
+            call.name, arguments
+        );
+    }
+    note.push_str(
+        "\n\nContinue exactly where you stopped. Do not repeat text you already wrote and do not redo work that is already done.</system-notification>",
+    );
+    note
+}
+
+fn truncate_to_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 #[derive(Debug, Default)]
 struct IterationState {
     current_message_id: Option<MessageId>,
@@ -915,6 +1049,10 @@ struct IterationState {
     stop_reason: Option<StopReason>,
     retry_attempt: u32,
     call_usage: Option<TokenUsage>,
+    /// Tool calls whose arguments are still streaming in this call.
+    streaming_tool_calls: Vec<ToolCallRequest>,
+    /// Tool calls of this call that finished streaming and were started.
+    started_tool_calls: usize,
 }
 
 impl IterationState {
@@ -926,6 +1064,18 @@ impl IterationState {
         self.stop_reason = None;
         self.call_usage = None;
         self.tool_calls.clear();
+        self.streaming_tool_calls.clear();
+        self.started_tool_calls = 0;
+    }
+
+    /// Whether an interrupted call already produced something worth keeping.
+    /// A cut before any visible output (none, or reasoning only) is retried
+    /// from scratch.
+    fn has_partial_output(&self) -> bool {
+        self.current_message_id.is_some()
+            && (!self.message_content.trim().is_empty()
+                || self.started_tool_calls > 0
+                || !self.streaming_tool_calls.is_empty())
     }
 
     fn is_complete(&self, has_foreground_tools: bool) -> bool {

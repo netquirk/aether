@@ -83,7 +83,12 @@ async fn failed_and_cancelled_calls_carry_error_attributes() -> Result<(), Box<d
         vec![Err(LlmError::from(ProviderError::server("boom".to_string()).with_http_status(503)))],
         vec![Ok(LlmResponse::Start), Ok(LlmResponse::text("never seen")), Ok(LlmResponse::done())],
     ];
-    let retry = RetryConfig { max_attempts: 5, base_delay: Duration::from_mins(1), max_delay: Duration::from_mins(1) };
+    let retry = RetryConfig {
+        max_attempts: 5,
+        base_delay: Duration::from_mins(1),
+        max_delay: Duration::from_mins(1),
+        ..RetryConfig::default()
+    };
     let trace = test_agent()
         .retry_config(retry)
         .llm_result_responses(&attempts)

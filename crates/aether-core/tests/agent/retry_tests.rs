@@ -43,9 +43,11 @@ async fn deferred_event_after_retry_clears_pending_tool_and_cancels_task() -> Re
         .with_task("stale-task", [DetailedTask::new(task, TaskPayload::Working)]);
     let server_state = server.state();
 
+    // Exercises the from-scratch retry path: resuming would keep the
+    // completed deferred call instead of retiring it.
     let result = test_agent()
         .fake_mcp_server("tasks", server)
-        .retry_config(fast_retry(1))
+        .retry_config(RetryConfig { resume_partial: false, ..fast_retry(1) })
         .llm_result_responses(&attempts)
         .user_text("go")
         .run_with_context()
@@ -278,7 +280,12 @@ async fn cancel_during_retry_wait_aborts_pending_retry() -> Result<(), Box<dyn E
     ];
 
     // Long retry delay; with virtual time it never elapses unless we advance.
-    let retry = RetryConfig { max_attempts: 5, base_delay: Duration::from_mins(1), max_delay: Duration::from_mins(1) };
+    let retry = RetryConfig {
+        max_attempts: 5,
+        base_delay: Duration::from_mins(1),
+        max_delay: Duration::from_mins(1),
+        ..RetryConfig::default()
+    };
 
     let result = test_agent()
         .retry_config(retry)

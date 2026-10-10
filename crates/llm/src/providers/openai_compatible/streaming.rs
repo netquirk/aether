@@ -58,6 +58,7 @@ pub fn process_compatible_stream<E: Into<LlmError> + Send>(
         let mut had_reasoning = false;
         let mut had_tool_calls = false;
         let mut last_stop_reason: Option<StopReason> = None;
+        let mut saw_usage = false;
 
         while let Some(result) = stream.next().await {
             match result {
@@ -65,6 +66,7 @@ pub fn process_compatible_stream<E: Into<LlmError> + Send>(
                     chunk_count += 1;
 
                     if let Some(usage) = response.usage {
+                        saw_usage = true;
                         yield Ok(LlmResponse::Usage { tokens: usage.into() });
                     }
 
@@ -145,6 +147,18 @@ pub fn process_compatible_stream<E: Into<LlmError> + Send>(
             return;
         }
 
+        // A completed response ends with a finish_reason, a usage chunk, or both.
+        // A body that stops with neither was cut (a proxy idle timeout, a dropped
+        // connection closed cleanly): accepting it as Done would end the turn on
+        // a partial or empty reply, and any half-streamed tool call would be lost.
+        // StreamInterrupted is retryable, so the agent re-issues the same request
+        // on the same context instead.
+        if last_stop_reason.is_none() && !saw_usage {
+            warn!(chunk_count, had_text, had_reasoning, had_tool_calls, "Stream ended without a finish reason or usage — treating as interrupted");
+            yield Err(ProviderError::stream_interrupted("stream ended without a finish reason").into());
+            return;
+        }
+
         info!(chunk_count, had_text, had_reasoning, had_tool_calls, "Stream completed");
 
         yield Ok(LlmResponse::Done {
@@ -212,15 +226,65 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_compatible_stream_emits_reasoning_chunks() {
-        let events = run_ok(vec![chunk(
-            ChatCompletionStreamResponseDelta { reasoning_content: Some("thinking".to_string()), ..Default::default() },
-            None,
-        )])
+        let events = run_ok(vec![
+            chunk(
+                ChatCompletionStreamResponseDelta {
+                    reasoning_content: Some("thinking".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            finish_chunk(FinishReason::Stop),
+        ])
         .await;
 
         assert!(matches!(events[0], LlmResponse::Start));
         assert!(matches!(events[1], LlmResponse::Reasoning { ref chunk } if chunk == "thinking"));
-        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: None })));
+        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) })));
+    }
+
+    #[tokio::test]
+    async fn test_stream_cut_before_finish_reason_is_retryable_interruption() {
+        let role_only = chunk(ChatCompletionStreamResponseDelta::default(), None);
+        let partial_text = chunk(
+            ChatCompletionStreamResponseDelta { content: Some("partial".to_string()), ..Default::default() },
+            None,
+        );
+        let partial_tool = chunk(
+            ChatCompletionStreamResponseDelta {
+                tool_calls: Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    tool_type: Some("function".to_string()),
+                    function: Some(FunctionCallDelta {
+                        name: Some("tool".to_string()),
+                        arguments: Some("{\"a\":".to_string()),
+                    }),
+                }]),
+                ..Default::default()
+            },
+            None,
+        );
+
+        for chunks in [vec![role_only], vec![partial_text], vec![partial_tool]] {
+            let events = run(chunks).await;
+            let last = events.last().expect("expected at least one event");
+            let err = last.as_ref().expect_err("a stream cut before its finish reason must surface as Err");
+            assert_eq!(
+                err.provider().map(|provider| provider.kind),
+                Some(crate::ProviderErrorKind::StreamInterrupted),
+                "got {err:?}"
+            );
+            assert!(err.is_retryable(), "a cut stream must be retryable so the agent re-issues the request");
+            assert!(
+                !events.iter().any(|e| matches!(e, Ok(LlmResponse::Done { .. }))),
+                "a cut stream must NOT yield Done"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, Ok(LlmResponse::ToolRequestComplete { .. }))),
+                "a half-streamed tool call must not be executed"
+            );
+        }
     }
 
     #[tokio::test]
