@@ -22,6 +22,7 @@ mod log_level;
 mod mcp_command;
 mod retry_reporting;
 mod run_init;
+mod run_log_elapsed;
 mod run_model_log;
 mod shell_environment;
 mod slash_commands;

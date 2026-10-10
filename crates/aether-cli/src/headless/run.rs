@@ -40,6 +40,11 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
         Some(path) => CliError::LogFileOpen { path, source },
         None => CliError::IoError(source),
     })?;
+    // Wall-clock start for the end-of-run `run finished` line
+    // (TASK-25-148). Captured here, after `setup_tracing`, so the
+    // bookkeeping covers the run itself rather than the file-open step
+    // the operator might already have paid.
+    let run_started_at = Instant::now();
     // Record which provider and model the run is about to answer so the line
     // appears in whatever log path `--log-file` (TASK-25-48) selected. The
     // record sits before `warn_if_not_a_repository` and the agent/MCP build so
@@ -52,6 +57,13 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
     let result = run_agent(config, telemetry.clone()).await;
+    // Whole-run wall-clock duration the log carries (TASK-25-148). Emitted
+    // unconditionally — `result` is bound rather than `?`-propagated — so a
+    // failed run (refused provider call, MCP failure, build error) still
+    // records the elapsed time. `as_secs()` reports whole seconds,
+    // matching the task's default; sub-second runs log `0` rather than a
+    // fractional value.
+    info!(elapsed_seconds = run_started_at.elapsed().as_secs(), "run finished");
 
     if let Some(telemetry) = telemetry {
         telemetry.shutdown_or_log();
