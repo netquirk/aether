@@ -15,6 +15,7 @@ mod headless_system_prompt;
 mod list_profiles;
 mod list_tools;
 mod log_file;
+mod log_format;
 mod log_level;
 mod mcp_command;
 mod retry_reporting;

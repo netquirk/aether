@@ -35,12 +35,11 @@ use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     let log_file = config.log_file.clone();
-    setup_tracing(resolve_log_level(config.log_level, config.verbose), config.log_file.as_deref()).map_err(
-        |source| match log_file {
-            Some(path) => CliError::LogFileOpen { path, source },
-            None => CliError::IoError(source),
-        },
-    )?;
+    setup_tracing(resolve_log_level(config.log_level, config.verbose), config.log_file.as_deref(), config.log_format)
+        .map_err(|source| match log_file {
+        Some(path) => CliError::LogFileOpen { path, source },
+        None => CliError::IoError(source),
+    })?;
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
@@ -602,7 +601,11 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     }
 }
 
-pub(crate) fn setup_tracing(level: LogLevel, log_file: Option<&Path>) -> std::io::Result<()> {
+pub(crate) fn setup_tracing(
+    level: LogLevel,
+    log_file: Option<&Path>,
+    format: crate::log_format::LogFormat,
+) -> std::io::Result<()> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
@@ -611,25 +614,46 @@ pub(crate) fn setup_tracing(level: LogLevel, log_file: Option<&Path>) -> std::io
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = EnvFilter::new(level.directive());
-    // Gate the fmt layer's ANSI on the same `NO_COLOR` signal the live
-    // progress line honours: a `NO_COLOR=1` run emits log records to stderr
-    // in plain text, matching the rest of the colour-free output. When the
-    // operator has redirected the log to a file (TASK-25-48), ANSI is
-    // unconditionally disabled so the on-disk log is readable in a log
-    // viewer regardless of `NO_COLOR`. `BoxMakeWriter` erases the writer
-    // type so both branches converge on a single layer type.
-    let layer = match log_file {
-        None => fmt::layer()
-            .with_writer(BoxMakeWriter::new(io::stderr))
-            .with_ansi(crate::color::color_enabled())
-            .with_filter(filter),
+    // Converge the two writers onto a single `BoxMakeWriter` so the
+    // `format` match below can use a single concrete writer type. The
+    // writer's behaviour matches the pre-existing `setup_tracing` exactly:
+    // missing parent directories still fail the run; the file is opened
+    // in append mode (TASK-25-48) so an operator's existing log is
+    // preserved across runs.
+    let writer = match log_file {
+        None => BoxMakeWriter::new(io::stderr),
         Some(path) => {
             let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-            fmt::layer().with_writer(BoxMakeWriter::new(file)).with_ansi(false).with_filter(filter)
+            BoxMakeWriter::new(file)
         }
     };
+    // Gate the `Text` layer's ANSI on the same `NO_COLOR` signal the live
+    // progress line honours: a `NO_COLOR=1` run emits log records to
+    // stderr in plain text, matching the rest of the colour-free output.
+    // When the operator has redirected the log to a file (TASK-25-48), or
+    // selected the JSON format (TASK-25-99), ANSI is unconditionally
+    // disabled so the on-disk / on-stderr log is a stable format.
+    let ansi = log_file.is_none() && crate::color::color_enabled();
 
-    let _ = tracing_subscriber::registry().with(layer).try_init();
+    match format {
+        // The JSON formatter (TASK-25-99) emits one JSON object per line
+        // with top-level `timestamp`, `level`, `message`, and `target`
+        // fields. `flatten_event(true)` hoists the message up to the
+        // top level instead of nesting it under a `fields` key, so the
+        // emitted object matches the task's "level / message / timestamp"
+        // contract directly. A separate `match` arm keeps the two layer
+        // types (text vs json) from having to unify into one.
+        crate::log_format::LogFormat::Json => {
+            let layer =
+                fmt::layer().json().flatten_event(true).with_writer(writer).with_ansi(false).with_filter(filter);
+            let _ = tracing_subscriber::registry().with(layer).try_init();
+        }
+        crate::log_format::LogFormat::Text => {
+            let layer = fmt::layer().with_writer(writer).with_ansi(ansi).with_filter(filter);
+            let _ = tracing_subscriber::registry().with(layer).try_init();
+        }
+    }
+
     Ok(())
 }
 

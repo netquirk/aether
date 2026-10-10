@@ -9,6 +9,7 @@ pub(crate) mod file_changes;
 pub mod generate_command;
 pub mod headless;
 pub mod init;
+pub mod log_format;
 pub mod log_level;
 pub mod mcp_command;
 pub mod mcp_config_args;

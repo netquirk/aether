@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::credentials::oauth_credential_store_from_config;
+use crate::log_format::LogFormat;
 use crate::log_level::{LogLevel, resolve as resolve_log_level};
 use crate::mcp_config_args::McpConfigArgs;
 use crate::output::OutputFormat;
@@ -76,6 +77,14 @@ pub struct RunConfig {
     /// existing log is preserved across runs; the task only requires
     /// creating PATH if missing, not replacing it.
     pub log_file: Option<std::path::PathBuf>,
+    /// Output format for the run's tracing log (TASK-25-99). `Text`
+    /// (the default) preserves the pre-existing `fmt` layer; `Json`
+    /// switches to the structured `tracing-subscriber` JSON formatter
+    /// so each log line is a JSON object with top-level `level`,
+    /// `message`, and `timestamp`. The format applies whether the
+    /// writer is stderr or the file from `log_file`. The default is
+    /// unchanged so every pre-existing caller's output is preserved.
+    pub log_format: LogFormat,
     /// When true, the headless loop does not write the live per-tool progress
     /// line on stderr. Warnings and errors (including the provider-stall
     /// warning, `eprintln!` failure messages, and `tracing` warnings/errors)
@@ -179,12 +188,11 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // `--dry-run` short-circuit still writes the log to the file, and any
     // IO error opening the path fails the run before the agent starts.
     let log_file = args.log_file.clone();
-    run::setup_tracing(resolve_log_level(args.log_level, args.verbose), args.log_file.as_deref()).map_err(
-        |source| match log_file {
+    run::setup_tracing(resolve_log_level(args.log_level, args.verbose), args.log_file.as_deref(), args.log_format)
+        .map_err(|source| match log_file {
             Some(path) => CliError::LogFileOpen { path, source },
             None => CliError::IoError(source),
-        },
-    )?;
+        })?;
     if args.dry_run {
         // Short-circuit before any prompt resolution, session construction,
         // MCP setup, telemetry runtime, or provider call: --dry-run only
@@ -266,6 +274,16 @@ pub struct HeadlessArgs {
     #[arg(long = "log-file", value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
+    /// Format of the run's tracing log: `text` (default, unchanged) or
+    /// `json` (TASK-25-99). With `json`, each log line is a single JSON
+    /// object carrying at least `level`, `message`, and `timestamp`. The
+    /// default is `text`, which matches the pre-existing `fmt` layer
+    /// exactly, so callers that never pass `--log-format` see no change.
+    /// Composes with `--log-file` — the JSON formatter writes to the same
+    /// destination the text formatter would have.
+    #[arg(long = "log-format", value_name = "FORMAT", default_value = "text")]
+    pub log_format: LogFormat,
+
     /// Suppress the live per-tool progress line on stderr. Warnings and
     /// errors (including the provider-stall warning and `tracing` diagnostics)
     /// are still printed. Has no effect on `--events` filtering or on
@@ -334,6 +352,11 @@ impl RunConfig {
             verbose: args.verbose,
             log_level: args.log_level,
             log_file: args.log_file,
+            // `--log-format json` is opted into via the flag; absent means
+            // `text` (the pre-existing `setup_tracing` output). The default
+            // is preserved on the `LogFormat` enum so this matches the
+            // `default_value = "text"` clap attribute above.
+            log_format: args.log_format,
             quiet: args.quiet,
             events: args.events,
             oauth_credential_store,
@@ -386,6 +409,10 @@ impl RunConfig {
             // `--options-json` callers (TASK-25-48) do not expose
             // `--log-file` either; the run logs to stderr as before.
             log_file: None,
+            // `--options-json` callers do not expose `--log-format` either
+            // (TASK-25-99); the run logs in the pre-existing text format
+            // regardless of what the harness's other flags set.
+            log_format: LogFormat::Text,
             quiet: options.quiet.unwrap_or(false),
             events: options.events.unwrap_or_default(),
             oauth_credential_store,
@@ -730,6 +757,49 @@ mod tests {
 
         let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("absent --log-file parses").args;
         assert!(parsed.log_file.is_none(), "absent --log-file must be None, not a default");
+    }
+
+    #[test]
+    fn log_format_flag_parses_each_accepted_value() {
+        // The clap-level check (TASK-25-99): every value listed in the help
+        // text must round-trip to the right `LogFormat` variant so a missing
+        // `ValueEnum` derive or a future rename shows up as a unit-test
+        // failure rather than a runtime surprise.
+        use clap::Parser as _;
+        let cases = [("text", LogFormat::Text), ("json", LogFormat::Json)];
+        for (raw, expected) in cases {
+            let parsed = QuietHarness::try_parse_from(["aether", "--log-format", raw, "hello"])
+                .unwrap_or_else(|error| panic!("--log-format {raw} must parse: {error}"))
+                .args;
+            assert_eq!(parsed.log_format, expected, "--log-format {raw} round-trip");
+        }
+    }
+
+    #[test]
+    fn log_format_flag_defaults_to_text_when_absent() {
+        // The absent-flag path must stay `Text` so every pre-existing caller
+        // (and every test that does not pass `--log-format`) sees the
+        // pre-existing `fmt` layer output. This is the regression anchor
+        // for the "default text format unchanged" requirement.
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("no --log-format parses").args;
+        assert_eq!(parsed.log_format, LogFormat::Text, "absent --log-format must default to Text, not the unset state");
+    }
+
+    #[test]
+    fn log_format_flag_rejects_unknown_values() {
+        // clap surfaces a parse error; the diagnostic must name both the
+        // offending input and the allowed set so a caller typing
+        // `--log-format xml` learns the legal values.
+        use clap::Parser as _;
+        let error = QuietHarness::try_parse_from(["aether", "--log-format", "xml", "hello"])
+            .err()
+            .expect("--log-format xml must be rejected by clap");
+        let rendered = error.to_string();
+        assert!(rendered.contains("xml"), "diagnostic must name the rejected value: {rendered}");
+        for allowed in ["text", "json"] {
+            assert!(rendered.contains(allowed), "diagnostic must list `{allowed}` as an accepted value: {rendered}");
+        }
     }
 
     #[test]
