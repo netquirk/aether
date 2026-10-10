@@ -8,6 +8,7 @@ mod acp_remote;
 mod acp_session_lifecycle;
 mod acp_stdio;
 mod acp_workspace_move;
+mod config_flag;
 mod dry_run;
 mod headless_system_prompt;
 mod list_tools;

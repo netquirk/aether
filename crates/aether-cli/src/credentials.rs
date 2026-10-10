@@ -23,7 +23,7 @@ mod tests {
     use std::path::Path;
 
     fn credentials_config_from_json(json: &str) -> Option<CredentialsStoreConfig> {
-        let source = SettingsSourceArgs { settings_json: Some(json.to_string()), settings_file: None };
+        let source = SettingsSourceArgs { settings_json: Some(json.to_string()), config: None, settings_file: None };
         source.load_settings(Path::new(".")).unwrap().credentials_store
     }
 
