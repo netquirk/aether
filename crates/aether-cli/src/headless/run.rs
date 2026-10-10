@@ -744,6 +744,7 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
         AgentEvent::Tool(ToolEvent::Refused { .. }) => Some(CliEventKind::ToolRefused),
         AgentEvent::Turn(TurnEvent::AutoContinue { .. }) => Some(CliEventKind::AutoContinue),
         AgentEvent::Model(ModelEvent::Switched { .. }) => Some(CliEventKind::ModelSwitched),
+        AgentEvent::Model(ModelEvent::Fallback { .. }) => Some(CliEventKind::ModelFallback),
         AgentEvent::Tool(
             ToolEvent::Progress { .. }
             | ToolEvent::DisplayUpdate { .. }
@@ -992,6 +993,14 @@ mod tests {
             (
                 AgentEvent::Model(ModelEvent::Switched { previous: "a".to_string(), new: "b".to_string() }),
                 CliEventKind::ModelSwitched,
+            ),
+            (
+                AgentEvent::Model(ModelEvent::Fallback {
+                    from: "primary".to_string(),
+                    to: "secondary".to_string(),
+                    reason: "503".to_string(),
+                }),
+                CliEventKind::ModelFallback,
             ),
             (tool_progress(1.0, None, None), CliEventKind::ToolProgress),
             (

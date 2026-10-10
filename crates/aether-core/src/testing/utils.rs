@@ -207,6 +207,17 @@ struct ProviderTestConfig {
     model: Option<LlmModel>,
     context_window: Option<u32>,
     pause: Option<(usize, usize, Arc<Notify>)>,
+    /// Scripted responses and a display name for the secondary provider
+    /// installed via `AgentBuilder::fallback_provider` (TASK-25-465). The
+    /// display name is distinct from the primary's "Fake LLM" so the
+    /// `ModelEvent::Fallback { to, .. }` event can assert which provider
+    /// took over. `None` means no fallback is configured.
+    fallback: Option<FallbackProviderTestConfig>,
+}
+
+struct FallbackProviderTestConfig {
+    responses: Vec<Vec<Result<LlmResponse, LlmError>>>,
+    display_name: String,
 }
 
 struct AgentTestConfig {
@@ -247,7 +258,13 @@ impl Default for TestAgentBuilder {
 impl TestAgentBuilder {
     pub fn new() -> Self {
         Self {
-            provider: ProviderTestConfig { responses: Vec::new(), model: None, context_window: None, pause: None },
+            provider: ProviderTestConfig {
+                responses: Vec::new(),
+                model: None,
+                context_window: None,
+                pause: None,
+                fallback: None,
+            },
             agent: AgentTestConfig {
                 context_window_override: None,
                 timeout: None,
@@ -288,6 +305,32 @@ impl TestAgentBuilder {
 
     pub fn llm_result_responses(mut self, llm_responses: &[Vec<Result<LlmResponse, LlmError>>]) -> Self {
         self.provider.responses = Vec::from(llm_responses);
+        self
+    }
+
+    /// Script the secondary provider installed via
+    /// [`AgentBuilder::fallback_provider`](crate::core::AgentBuilder::fallback_provider)
+    /// (TASK-25-465). The fallback uses a distinct display name
+    /// (`"Fallback LLM"` by default; pass `display_name` to override) so
+    /// the `ModelEvent::Fallback { to, .. }` event in the transcript
+    /// names the provider that took over, satisfying the
+    /// "naming the provider used" requirement. Calling this twice
+    /// replaces the previously configured script.
+    pub fn fallback_llm_result_responses(mut self, llm_responses: &[Vec<Result<LlmResponse, LlmError>>]) -> Self {
+        self.provider.fallback = Some(FallbackProviderTestConfig {
+            responses: Vec::from(llm_responses),
+            display_name: "Fallback LLM".to_string(),
+        });
+        self
+    }
+
+    /// Override the display name used by the fallback provider set via
+    /// [`TestAgentBuilder::fallback_llm_result_responses`]. Defaults to
+    /// `"Fallback LLM"`.
+    pub fn fallback_provider_display_name(mut self, name: impl Into<String>) -> Self {
+        if let Some(fallback) = self.provider.fallback.as_mut() {
+            fallback.display_name = name.into();
+        }
         self
     }
 
@@ -437,6 +480,15 @@ impl TestAgentBuilder {
         }
         let captured_contexts = llm.captured_contexts();
 
+        // Build the secondary provider the agent will swap in when the
+        // primary fails with a 5xx (TASK-25-465). The display name is
+        // intentionally distinct from the primary's "Fake LLM" so the
+        // resulting `ModelEvent::Fallback { to, .. }` event names the
+        // provider that took over.
+        let fallback_llm = provider.fallback.map(|fallback| {
+            Arc::new(FakeLlmProvider::from_results(fallback.responses).with_display_name(&fallback.display_name))
+        });
+
         let mut mcp_spawn = match config.mcp_server {
             Some((name, server)) => {
                 Some(mcp("/workspace").with_fake_mcp(name, server).spawn().await.map_err(AgentError::from)?)
@@ -445,6 +497,9 @@ impl TestAgentBuilder {
         };
 
         let mut builder = agent(llm);
+        if let Some(fallback) = fallback_llm {
+            builder = builder.fallback_provider(fallback);
+        }
         if let Some(spawn) = &mut mcp_spawn {
             let snapshot = spawn.block_until_ready().await.expect("bootstrap completes");
             builder = builder.tools(spawn.handle().clone(), snapshot.tool_definitions());

@@ -271,6 +271,7 @@ fn format_text(message: &AgentEvent, retry_note: Option<&str>) -> Option<String>
         AgentEvent::Model(ModelEvent::Switched { previous, new }) => {
             Some(format!("Model switched: {previous} -> {new}"))
         }
+        AgentEvent::Model(ModelEvent::Fallback { from, to, .. }) => Some(format!("Provider fallback: {from} -> {to}")),
         AgentEvent::Tool(ToolEvent::Progress { request, progress, total, message }) => {
             let bar = match total {
                 Some(total) => format!("{progress}/{total}"),

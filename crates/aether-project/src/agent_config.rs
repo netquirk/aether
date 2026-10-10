@@ -18,6 +18,16 @@ pub struct AgentConfig {
     /// comma-separated alloy of specs to round-robin across turns.
     #[schemars(length(min = 1))]
     pub model: String,
+    /// Optional fallback model spec the agent swaps in when the primary
+    /// fails with a server (5xx) error (TASK-25-465). A bare
+    /// `provider:model-id` is parsed the same way as `model`; an empty
+    /// string is treated as "no fallback". The swap is recorded as a
+    /// `ModelEvent::Fallback` in the run transcript, naming the
+    /// provider that took over. Omit the field (or set it to an empty
+    /// string) to keep the pre-existing retry-then-fail behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub fallback_model: Option<String>,
     /// Reasoning level for the LLM. Uses provider default when not explicitly set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,

@@ -5,6 +5,7 @@ mod agent {
     mod compaction_tests;
     mod context_window_tests;
     mod error_recovery_tests;
+    mod fallback_tests;
     mod harness_tests;
     mod model_switch_tests;
     mod prompt_cache_tests;

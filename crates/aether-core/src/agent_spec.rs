@@ -46,6 +46,15 @@ pub struct AgentSpec {
     /// both single models (`provider:model`) and alloy specs
     /// (`provider1:model1,provider2:model2`).
     pub model: String,
+    /// Optional fallback model spec the agent swaps in when the primary
+    /// fails with a server (5xx) error (TASK-25-465). The agent takes this
+    /// over for the rest of the run and emits a `ModelEvent::Fallback` so
+    /// the transcript names the provider that took over. A bare
+    /// `provider:model` is parsed the same way as `model`; an empty
+    /// string is treated as "no fallback". `None` means no fallback is
+    /// configured and the run fails exactly as it does today when the
+    /// primary errors out.
+    pub fallback_model: Option<String>,
     /// Optional reasoning effort level for models that support it.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Sampling controls applied to this agent's model calls.
@@ -83,6 +92,7 @@ impl AgentSpec {
             name: "__default__".to_string(),
             description: "Default agent".to_string(),
             model: model.to_string(),
+            fallback_model: None,
             reasoning_effort,
             model_settings: ModelSettings::default(),
             context_window: None,

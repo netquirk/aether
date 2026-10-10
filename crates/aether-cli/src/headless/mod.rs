@@ -38,6 +38,7 @@ pub enum CliEventKind {
     ToolError,
     AutoContinue,
     ModelSwitched,
+    ModelFallback,
     ToolProgress,
     ContextCompactionStarted,
     ContextCompactionEnded,

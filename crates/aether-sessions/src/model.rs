@@ -90,7 +90,7 @@ impl SessionEvent {
                     | ContextEvent::UsageUpdated { .. }
                     | ContextEvent::Cleared,
                 )
-                | AgentEvent::Model(ModelEvent::Switched { .. })
+                | AgentEvent::Model(ModelEvent::Switched { .. } | ModelEvent::Fallback { .. })
                 | AgentEvent::SessionUsage(_) => true,
                 AgentEvent::Tool(
                     ToolEvent::CallUpdate { .. }

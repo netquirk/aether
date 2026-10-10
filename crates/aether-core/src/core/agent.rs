@@ -17,8 +17,8 @@ use crate::mcp::McpHandle;
 use futures::Stream;
 use llm::{
     AssistantReasoning, ChatMessage, Context, EncryptedReasoningContent, LlmCallPurpose, LlmError, LlmModel,
-    LlmResponse, MessageId, ModelIdentity, StopReason, StreamingModelProvider, TokenUsage, ToolCallError,
-    ToolCallRequest, ToolCallResult,
+    LlmResponse, MessageId, ModelIdentity, ProviderErrorKind, StopReason, StreamingModelProvider, TokenUsage,
+    ToolCallError, ToolCallRequest, ToolCallResult,
 };
 use mcp_utils::client::{CallToolError, CallToolOptions, ToolCallEvent};
 use std::collections::VecDeque;
@@ -58,6 +58,12 @@ enum StreamKey {
 
 pub(crate) struct AgentConfig {
     pub llm: Arc<dyn StreamingModelProvider>,
+    /// Optional secondary provider used when the primary fails with a
+    /// server (5xx) error. Consumed on the first matching failure (see
+    /// `on_llm_error`) and emitted as a [`ModelEvent::Fallback`] so the
+    /// transcript names the provider that took over. `None` keeps the
+    /// pre-existing retry-then-fail behaviour unchanged.
+    pub fallback: Option<Arc<dyn StreamingModelProvider>>,
     pub context: Context,
     pub mcp: Option<McpHandle>,
     pub tool_timeout: Duration,
@@ -84,6 +90,12 @@ pub(crate) struct AgentConfig {
 
 pub struct Agent {
     llm: Arc<dyn StreamingModelProvider>,
+    /// Optional secondary provider the agent swaps in for the rest of the
+    /// run when the primary fails with a 5xx. `take`n on the first matching
+    /// failure (so a 5xx later in the same run does not trigger a second
+    /// fallback) and emitted as [`ModelEvent::Fallback`] before the next
+    /// LLM call starts. `None` disables the path entirely.
+    fallback: Option<Arc<dyn StreamingModelProvider>>,
     context: Context,
     mcp: Option<McpHandle>,
     message_tx: mpsc::Sender<AgentEvent>,
@@ -141,6 +153,7 @@ impl Agent {
 
         Self {
             llm: config.llm,
+            fallback: config.fallback,
             context: config.context,
             mcp: config.mcp,
             message_tx,
@@ -459,6 +472,24 @@ impl Agent {
         self.emit(self.context_usage_message()).await;
     }
 
+    /// Swap the configured fallback provider in as the active LLM. Mirrors
+    /// `on_switch_model` (token-tracker reset, context-limit update,
+    /// context-usage event) but emits a [`ModelEvent::Fallback`] so the
+    /// transcript names the provider that took over and the reason the
+    /// swap happened. Called from `on_llm_error` after a 5xx failure;
+    /// the fallback is removed from the agent via `take` so the swap
+    /// happens at most once per run.
+    async fn install_fallback_provider(&mut self, fallback: Arc<dyn StreamingModelProvider>, error: &LlmError) {
+        let from = self.llm.display_name();
+        let new_context_limit = self.context_window.or_else(|| fallback.context_window());
+        self.llm = fallback;
+        self.token_tracker.reset_current_usage();
+        self.token_tracker.set_context_limit(new_context_limit);
+        let to = self.llm.display_name();
+        self.emit(AgentEvent::Model(ModelEvent::Fallback { from, to, reason: error.to_string() })).await;
+        self.emit(self.context_usage_message()).await;
+    }
+
     async fn start_llm_stream(&mut self, delay: Option<Duration>, attempt: u32) {
         self.refresh_prompt_cache_key();
         self.streams.remove(&StreamKey::Llm);
@@ -496,6 +527,24 @@ impl Agent {
         let outcome = LlmCallOutcome::from_llm_error(&error, will_retry);
         let error_message = error.to_string();
         self.finish_chat_call(outcome).await;
+
+        // A server (5xx) failure on the primary is the trigger for the
+        // configured fallback (TASK-25-465). We take() the slot so a 5xx
+        // later in the same run does not trigger a second fallback — the
+        // doc on `ModelEvent::Fallback` records "exactly once per run, on
+        // the first server error". The check is placed before the
+        // `!will_retry` early-return so a 5xx with `max_attempts = 0` (no
+        // retries configured) still routes to the secondary instead of
+        // failing the turn. Non-5xx retryable errors (rate limit, timeout,
+        // network) keep the pre-existing retry path so the primary still
+        // gets its full attempt budget on transient hiccups.
+        if is_server_error(&error)
+            && let Some(fallback) = self.fallback.take()
+        {
+            self.install_fallback_provider(fallback, &error).await;
+            self.start_llm_stream(None, 0).await;
+            return;
+        }
 
         if !will_retry {
             self.finish_turn(TurnOutcome::Failed { error: error_message }).await;
@@ -979,6 +1028,16 @@ impl Agent {
             max_attempts: self.retry_config.max_attempts,
         })
     }
+}
+
+/// True iff `error` is a provider-side 5xx failure. Used to gate the
+/// configured fallback (TASK-25-465) so only the failures the user can
+/// realistically route around (an upstream service is down) trigger the
+/// swap; rate limits, timeouts, and network blips keep the pre-existing
+/// retry path. `ProviderErrorKind::Server` is the normalized form the
+/// provider layer uses for `from_http_status(500..600)`.
+fn is_server_error(error: &LlmError) -> bool {
+    matches!(error.provider().map(|p| p.kind), Some(ProviderErrorKind::Server))
 }
 
 pub(crate) struct AutoContinue {

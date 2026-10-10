@@ -71,6 +71,7 @@ pub fn fake_spec(name: &str, exposure: AgentSpecExposure) -> AgentSpec {
         name: name.to_string(),
         description: format!("{name} agent"),
         model: DEFAULT_MODEL.to_string(),
+        fallback_model: None,
         reasoning_effort: None,
         model_settings: ModelSettings::default(),
         context_window: None,

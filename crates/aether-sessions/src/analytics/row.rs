@@ -158,6 +158,9 @@ impl From<&AgentEvent> for EventProjection {
             AgentEvent::Model(ModelEvent::Switched { new, .. }) => {
                 Self { model_name: Some(new.clone()), ..Self::new("agent", "model_switched") }
             }
+            AgentEvent::Model(ModelEvent::Fallback { to, .. }) => {
+                Self { model_name: Some(to.clone()), ..Self::new("agent", "model_fallback") }
+            }
             AgentEvent::SessionUsage(usage) => Self::from_session_usage(usage),
         }
     }

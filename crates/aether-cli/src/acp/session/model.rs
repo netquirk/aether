@@ -272,6 +272,7 @@ mod tests {
             name: name.to_string(),
             description: name.to_lowercase(),
             model: model.to_string(),
+            fallback_model: None,
             reasoning_effort: effort,
             model_settings: llm::ModelSettings::default(),
             context_window: None,

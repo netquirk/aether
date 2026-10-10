@@ -37,6 +37,10 @@ impl AgentHandle {
 
 pub struct AgentBuilder {
     llm: Arc<dyn StreamingModelProvider>,
+    /// Optional secondary provider the agent swaps in when the primary
+    /// fails with a 5xx (TASK-25-465). `None` keeps the pre-existing
+    /// retry-then-fail behaviour unchanged.
+    fallback: Option<Arc<dyn StreamingModelProvider>>,
     prompts: Vec<Prompt>,
     tool_definitions: Vec<ToolDefinition>,
     initial_messages: Vec<ChatMessage>,
@@ -61,6 +65,7 @@ impl AgentBuilder {
     pub fn new(llm: Arc<dyn StreamingModelProvider>) -> Self {
         Self {
             llm,
+            fallback: None,
             prompts: Vec::new(),
             tool_definitions: Vec::new(),
             initial_messages: Vec::new(),
@@ -98,6 +103,20 @@ impl AgentBuilder {
             .max_turns(spec.max_turns)
             .model_settings(spec.model_settings.clone())
             .session_usage(SessionUsageTracker::new(&spec.name));
+
+        // Optional fallback provider used when the primary fails with a 5xx
+        // (TASK-25-465). A bare `provider:model` is parsed the same way as
+        // `spec.model`; an alloy is not supported here because the fallback
+        // is a single second-chance provider. Empty / whitespace strings are
+        // treated as "no fallback" so a config can carry the field as
+        // documentation without enabling the path.
+        if let Some(fallback_model) = spec.fallback_model.as_deref() {
+            let trimmed = fallback_model.trim();
+            if !trimmed.is_empty() {
+                let (fallback_provider, _) = parser.parse(trimmed).await?;
+                builder = builder.fallback_provider(Arc::from(fallback_provider));
+            }
+        }
 
         if let Some(key) = &deps.session_affinity_key {
             builder = builder.session_affinity_key(key.clone());
@@ -221,6 +240,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Install a fallback provider the agent swaps in when the primary
+    /// fails with a server (5xx) error. The agent records the swap as a
+    /// [`ModelEvent::Fallback`] in the run transcript, naming the
+    /// provider that took over. The fallback is consumed on the first
+    /// matching failure — a 5xx later in the same run does not trigger
+    /// a second swap. `None` (the default) keeps the pre-existing
+    /// retry-then-fail behaviour.
+    pub fn fallback_provider(mut self, provider: Arc<dyn StreamingModelProvider>) -> Self {
+        self.fallback = Some(provider);
+        self
+    }
+
     /// Configure retry behavior for transient LLM provider failures.
     pub fn retry(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
@@ -327,6 +358,7 @@ impl AgentBuilder {
 
         let config = AgentConfig {
             llm: self.llm,
+            fallback: self.fallback,
             context,
             mcp: self.mcp,
             tool_timeout: self.tool_timeout,
@@ -392,6 +424,7 @@ mod tests {
             name: "alloy".to_string(),
             description: "alloy".to_string(),
             model: "ollama:llama3.2,llamacpp:local".to_string(),
+            fallback_model: None,
             reasoning_effort: None,
             model_settings: settings.clone(),
             context_window: Some(200_000),
@@ -419,6 +452,7 @@ mod tests {
             name: "alloy".to_string(),
             description: "alloy".to_string(),
             model: "ollama:llama3.2,llamacpp:local".to_string(),
+            fallback_model: None,
             reasoning_effort: None,
             model_settings: ModelSettings::default(),
             context_window: None,

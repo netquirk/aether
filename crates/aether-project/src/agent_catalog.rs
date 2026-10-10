@@ -200,6 +200,11 @@ fn resolve_agent_entry(
     model
         .validate_reasoning_effort(entry.reasoning_effort)
         .map_err(|source| SettingsError::InvalidReasoningEffort { agent: name.clone(), source })?;
+    if let Some(fallback) = entry.fallback_model.as_deref()
+        && !fallback.trim().is_empty()
+    {
+        parse_model(&name, fallback)?;
+    }
     if entry.context_window == Some(0) {
         return Err(SettingsError::InvalidContextWindow { agent: name.clone(), context_window: 0 });
     }
@@ -228,6 +233,10 @@ fn resolve_agent_entry(
         name,
         description,
         model: model.to_string(),
+        fallback_model: entry.fallback_model.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }),
         reasoning_effort: entry.reasoning_effort,
         model_settings: entry.model_settings,
         context_window: entry.context_window,

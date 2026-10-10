@@ -120,6 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(AgentEvent::Model(ModelEvent::Switched { previous, new })) => {
                 println!("Model switched: {previous} -> {new}");
             }
+            Some(AgentEvent::Model(ModelEvent::Fallback { from, to, reason })) => {
+                println!("Provider fallback: {from} -> {to} ({reason})");
+            }
             Some(AgentEvent::Context(ContextEvent::Cleared)) => {
                 println!("Context cleared");
             }

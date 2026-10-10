@@ -164,7 +164,7 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
             | ToolEvent::DefinitionsUpdated { .. }
             | ToolEvent::SubAgentProgress { .. },
         )
-        | AgentEvent::Model(ModelEvent::Switched { .. })
+        | AgentEvent::Model(ModelEvent::Switched { .. } | ModelEvent::Fallback { .. })
         | AgentEvent::SessionUsage(_) => None,
     }
 }
