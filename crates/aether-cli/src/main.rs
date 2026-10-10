@@ -142,6 +142,20 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // `--config`/`--settings-file` written before the subcommand (or with no
+    // subcommand at all) land on the top-level `Cli`, which the run paths do
+    // not read for any command other than `--check-config` / `--list-profiles`.
+    // Without this check a mistyped or unreadable path would be silently
+    // ignored. Reusing `load_settings` here means the same path-naming error
+    // is reported whether the flag was placed on the subcommand or on the
+    // top-level `Cli`. A no-op when neither flag was supplied, so the check
+    // does not apply when a subcommand's own `--config` is the one being
+    // validated.
+    if let Err(error) = cli.settings_source.verify_explicit_source() {
+        eprintln!("Error: {error}");
+        return ExitCode::FAILURE;
+    }
+
     // Copy the top-level flag out before `cli.command` is moved into the
     // `match` below. The subcommand path (`aether headless --log-level …`) is
     // the documented placement, but accepting the flag before the subcommand

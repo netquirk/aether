@@ -63,6 +63,28 @@ impl SettingsSourceArgs {
         }
     }
 
+    /// Verify that a settings file named explicitly on the command line
+    /// (`--config` / `--settings-file`) can actually be read.
+    ///
+    /// `--config` and `--settings-file` are flattened onto `Cli` itself as well
+    /// as onto the subcommands that consume them. The top-level placement —
+    /// `aether --config <path> headless …` or even bare `aether --config <path>` —
+    /// parses into `Cli.settings_source`, which the run paths ignore for any
+    /// command other than `--check-config` / `--list-profiles`. Without this
+    /// check an unreadable or mistyped path is silently dropped. Reusing
+    /// `load_settings` means the failure message names the offending path the
+    /// same way the subcommand path already does, so the user sees a single
+    /// consistent diagnostic regardless of where the flag was placed. A no-op
+    /// when neither flag was supplied.
+    pub fn verify_explicit_source(&self) -> Result<(), SettingsError> {
+        if self.config.is_none() && self.settings_file.is_none() {
+            return Ok(());
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.load_settings(&cwd)?;
+        Ok(())
+    }
+
     /// The profile (agent) names defined in the loaded settings, in config order.
     ///
     /// Reads the raw `AetherSettings` rather than going through
@@ -190,6 +212,61 @@ mod tests {
         let expected_path = missing_for_assert.to_string_lossy().into_owned();
 
         assert!(rendered.contains(&expected_path), "error {rendered:?} must name the path {expected_path:?}");
+    }
+
+    /// `verify_explicit_source` must surface the same path-naming error the
+    /// subcommand path already produces for a `--config` that cannot be read,
+    /// so the top-level placement (`aether --config <bad> headless …`) is
+    /// reported instead of silently ignored.
+    #[test]
+    fn verify_explicit_source_names_a_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.json");
+        let missing_for_assert = missing.clone();
+
+        let args = SettingsSourceArgs { settings_json: None, config: Some(missing), settings_file: None };
+
+        let error = args.verify_explicit_source().expect_err("explicit --config pointing at a missing file must fail");
+        let rendered = error.to_string();
+        let expected_path = missing_for_assert.to_string_lossy().into_owned();
+
+        assert!(rendered.contains(&expected_path), "error {rendered:?} must name the path {expected_path:?}");
+    }
+
+    /// The same behaviour for `--settings-file`, which is the alternative
+    /// spelling of `--config`; both flags build the same loader source.
+    #[test]
+    fn verify_explicit_source_names_a_missing_settings_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-settings.json");
+        let missing_for_assert = missing.clone();
+
+        let args = SettingsSourceArgs { settings_json: None, config: None, settings_file: Some(missing) };
+
+        let error =
+            args.verify_explicit_source().expect_err("explicit --settings-file pointing at a missing file must fail");
+        let rendered = error.to_string();
+        let expected_path = missing_for_assert.to_string_lossy().into_owned();
+
+        assert!(rendered.contains(&expected_path), "error {rendered:?} must name the path {expected_path:?}");
+    }
+
+    /// When neither `--config` nor `--settings-file` is supplied, the eager
+    /// check must be a no-op: it must not attempt to load settings (which
+    /// would touch user/project files on the test host) and must return
+    /// `Ok(())` for both the default `SettingsSourceArgs` and for the
+    /// `--settings-json` alternative.
+    #[test]
+    fn verify_explicit_source_is_a_noop_without_an_explicit_file() {
+        let args = SettingsSourceArgs::default();
+        args.verify_explicit_source().expect("verify_explicit_source must be a no-op when neither flag is set");
+
+        let args = SettingsSourceArgs {
+            settings_json: Some(r#"{"agents":[]}"#.to_string()),
+            config: None,
+            settings_file: None,
+        };
+        args.verify_explicit_source().expect("verify_explicit_source must be a no-op when only --settings-json is set");
     }
 
     /// Write a settings document with one or more user-invocable agents that
