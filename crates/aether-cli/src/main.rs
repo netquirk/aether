@@ -7,6 +7,7 @@ use aether_cli::headless::{HeadlessArgs, run_headless};
 use aether_cli::init::{InitError, InitOutcome, InitRequest, next_steps_message, run_init};
 use aether_cli::mcp_command::{McpArgs, McpCommandError, run as run_mcp_command};
 use aether_cli::settings::SettingsCommand;
+use aether_cli::settings_args::SettingsSourceArgs;
 use aether_cli::show_prompt::{PromptArgs, run_prompt};
 use aether_project::{AgentCatalog, project_settings_path, user_settings_path};
 use clap::{Parser, Subcommand};
@@ -62,6 +63,18 @@ struct Cli {
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
 
+    /// List the profile (agent) names defined in the loaded config and exit.
+    ///
+    /// Reads the same settings the subcommands do (defaults, or the file
+    /// named by `--config`/`--settings-file`/the inline `--settings-json`).
+    /// Prints each agent name on its own line and exits 0, including when
+    /// the config defines zero agents.
+    #[arg(long = "list-profiles")]
+    list_profiles: bool,
+
+    #[command(flatten)]
+    settings_source: SettingsSourceArgs,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -107,34 +120,44 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let rt = Runtime::new().expect("Failed to create tokio runtime");
-    let result: Result<ExitCode, MainError> = match cli.command {
-        Some(Command::Headless(args)) => rt.block_on(run_headless(args)).map_err(Into::into),
+    let result: Result<ExitCode, MainError> = if cli.list_profiles {
+        list_profiles(&cli.settings_source).map(|()| ExitCode::SUCCESS)
+    } else {
+        let rt = Runtime::new().expect("Failed to create tokio runtime");
+        match cli.command {
+            Some(Command::Headless(args)) => rt.block_on(run_headless(args)).map_err(Into::into),
 
-        Some(Command::Generate(args)) => rt.block_on(run_generate_command(args)).map_err(Into::into),
+            Some(Command::Generate(args)) => rt.block_on(run_generate_command(args)).map_err(Into::into),
 
-        Some(Command::Acp(args)) => rt
-            .block_on(run_acp(args))
-            .map(|outcome| match outcome {
-                AcpRunOutcome::CleanDisconnect => ExitCode::SUCCESS,
-            })
-            .map_err(Into::into),
+            Some(Command::Acp(args)) => rt
+                .block_on(run_acp(args))
+                .map(|outcome| match outcome {
+                    AcpRunOutcome::CleanDisconnect => ExitCode::SUCCESS,
+                })
+                .map_err(Into::into),
 
-        Some(Command::Server(args)) => rt.block_on(run_server(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into),
+            Some(Command::Server(args)) => {
+                rt.block_on(run_server(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
+            }
 
-        Some(Command::Client(args)) => rt.block_on(run_client(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into),
+            Some(Command::Client(args)) => {
+                rt.block_on(run_client(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
+            }
 
-        Some(Command::ShowPrompt(args)) => {
-            rt.block_on(run_prompt(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
+            Some(Command::ShowPrompt(args)) => {
+                rt.block_on(run_prompt(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
+            }
+
+            Some(Command::Mcp(args)) => {
+                rt.block_on(run_mcp_command(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
+            }
+
+            Some(Command::Settings(SettingsCommand::Init(args))) => rt.block_on(run_init_command(args.into())),
+
+            Some(Command::Lspd(args)) => aether_lspd::run_lspd(args).map(|()| ExitCode::SUCCESS).map_err(Into::into),
+
+            None => rt.block_on(run_default_command(cli.model)),
         }
-
-        Some(Command::Mcp(args)) => rt.block_on(run_mcp_command(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into),
-
-        Some(Command::Settings(SettingsCommand::Init(args))) => rt.block_on(run_init_command(args.into())),
-
-        Some(Command::Lspd(args)) => aether_lspd::run_lspd(args).map(|()| ExitCode::SUCCESS).map_err(Into::into),
-
-        None => rt.block_on(run_default_command(cli.model)),
     };
 
     match result {
@@ -218,6 +241,20 @@ fn default_status_line() -> StatusLineSettings {
             StatusLineSegmentConfig::ServerHealth,
         ]),
     }
+}
+
+/// Print every profile (agent) name from the loaded config, one per line, and
+/// return success even when the config defines zero agents. Reads the raw
+/// `AetherSettings` rather than going through `AgentCatalog`: the catalog
+/// requires a user-invocable agent and would refuse an empty one with
+/// `NoUserInvocableAgents`, which the task's "no profiles" case rejects.
+fn list_profiles(source: &SettingsSourceArgs) -> Result<(), MainError> {
+    let cwd = current_dir()?;
+    let settings = source.load_settings(&cwd).map_err(|e| MainError::Settings(e.to_string()))?;
+    for agent in &settings.agents {
+        println!("{}", agent.name);
+    }
+    Ok(())
 }
 fn invalid_settings_message(paths: &[std::path::PathBuf], error: impl std::fmt::Display) -> String {
     format!(

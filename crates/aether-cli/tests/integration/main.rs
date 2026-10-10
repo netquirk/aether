@@ -11,6 +11,7 @@ mod acp_workspace_move;
 mod config_flag;
 mod dry_run;
 mod headless_system_prompt;
+mod list_profiles;
 mod list_tools;
 mod mcp_command;
 mod retry_reporting;

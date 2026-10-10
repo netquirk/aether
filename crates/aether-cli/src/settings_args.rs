@@ -63,6 +63,18 @@ impl SettingsSourceArgs {
         }
     }
 
+    /// The profile (agent) names defined in the loaded settings, in config order.
+    ///
+    /// Reads the raw `AetherSettings` rather than going through
+    /// [`AgentCatalog::from_settings`]: this lists every agent the config
+    /// declares (including non-user-invocable ones), needs no prompt/model
+    /// resolution, and a config with zero agents is a clean empty `Vec`
+    /// rather than a "no user-invocable agents" error.
+    pub fn profile_names(&self, cwd: &Path) -> Result<Vec<String>, SettingsError> {
+        let settings = self.load_settings(cwd)?;
+        Ok(settings.agents.into_iter().map(|agent| agent.name).collect())
+    }
+
     pub fn load_agent_catalog(&self, cwd: &Path) -> Result<AgentCatalog, SettingsError> {
         let settings = self.load_settings(cwd)?;
         AgentCatalog::from_settings_or_empty(cwd, settings)
@@ -178,5 +190,58 @@ mod tests {
         let expected_path = missing_for_assert.to_string_lossy().into_owned();
 
         assert!(rendered.contains(&expected_path), "error {rendered:?} must name the path {expected_path:?}");
+    }
+
+    /// Write a settings document with one or more user-invocable agents that
+    /// point at a `PROMPT.md` (created alongside it) so prompt resolution
+    /// succeeds. Mirrors the helper used by the `--config` integration test.
+    fn write_settings_with_named_agents(dir: &std::path::Path, names: &[&str]) -> Result<PathBuf, std::io::Error> {
+        std::fs::write(dir.join("PROMPT.md"), "Be helpful\n")?;
+        let agents_json = names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{
+                            "name": "{name}",
+                            "description": "{name} agent",
+                            "model": "anthropic:claude-sonnet-4-5",
+                            "userInvocable": true,
+                            "prompts": ["PROMPT.md"]
+                        }}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let body = format!(
+            r#"{{
+                "credentialsStore": {{ "type": "memory" }},
+                "agents": [{agents_json}]
+            }}"#
+        );
+        let path = dir.join("settings.json");
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn profile_names_lists_each_configured_agent_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = write_settings_with_named_agents(dir.path(), &["alpha", "beta"]).expect("write settings");
+
+        let args = SettingsSourceArgs { settings_json: None, config: Some(config_path), settings_file: None };
+
+        let names = args.profile_names(dir.path()).expect("profile_names must succeed");
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn profile_names_is_empty_when_config_defines_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = write_settings_with_named_agents(dir.path(), &[]).expect("write settings");
+
+        let args = SettingsSourceArgs { settings_json: None, config: Some(config_path), settings_file: None };
+
+        let names = args.profile_names(dir.path()).expect("profile_names must succeed even with zero agents");
+        assert!(names.is_empty(), "expected zero profiles, got {names:?}");
     }
 }
