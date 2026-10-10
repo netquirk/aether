@@ -29,7 +29,7 @@ struct ServerCli {
 fn server_args_defaults_and_overrides() {
     let defaults = ServerCli::parse_from(["server"]).args;
     assert_eq!(defaults.listen, "127.0.0.1:8765".parse().unwrap());
-    assert_eq!(defaults.cwd, PathBuf::from("."));
+    assert_eq!(defaults.acp.cwd, PathBuf::from("."));
     assert!(defaults.prompt.is_none());
     assert!(defaults.detached.output.is_none());
     assert!(defaults.detached.idle_after.is_none());
@@ -55,14 +55,14 @@ fn server_args_defaults_and_overrides() {
     ])
     .args;
     assert_eq!(args.listen, "0.0.0.0:9000".parse().unwrap());
-    assert_eq!(args.cwd, PathBuf::from("/workspace"));
+    assert_eq!(args.acp.cwd, PathBuf::from("/workspace"));
     assert_eq!(args.acp.agent.as_deref(), Some("Build"));
     assert_eq!(args.acp.log_dir, Some(PathBuf::from("/logs")));
     assert_eq!(args.prompt.as_deref(), Some("start now"));
     assert_eq!(args.detached.output, Some(aether_cli::output::OutputFormat::Json));
     assert_eq!(args.detached.idle_after, Some(300));
     assert_eq!(args.detached.on_idle.as_deref(), Some("echo idle"));
-    assert_eq!(ServerCli::parse_from(["server", "--cwd", "/other"]).args.cwd, PathBuf::from("/other"));
+    assert_eq!(ServerCli::parse_from(["server", "--cwd", "/other"]).args.acp.cwd, PathBuf::from("/other"));
 }
 
 #[test]

@@ -27,7 +27,6 @@ use agent_client_protocol::Stdio;
 use llm::catalog::{ReasoningEffortError, validate_reasoning_effort};
 use llm::{ProviderConnectionOverride, ProviderConnectionOverrides, ReasoningEffort};
 use std::collections::BTreeMap;
-use std::env::current_dir;
 use std::io;
 use std::sync::Arc;
 use std::{
@@ -80,6 +79,12 @@ pub struct AcpArgs {
     #[command(flatten)]
     pub settings_source: SettingsSourceArgs,
 
+    /// Directory the session is rooted at. Defaults to the current working directory
+    /// when the flag is absent. The directory is canonicalized before use so file
+    /// tools can resolve paths under it.
+    #[arg(short = 'C', long = "cwd", value_name = "DIR", default_value = ".")]
+    pub cwd: PathBuf,
+
     /// How much the run logs: one of `error`, `warn`, `info`, or `debug`
     /// (TASK-25-41). When set, replaces the default `warn` filter applied
     /// to the per-day log file. The flag is also accepted before the
@@ -92,6 +97,8 @@ pub struct AcpArgs {
 #[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AcpOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +145,9 @@ pub enum AcpRunError {
     #[error("Failed to initialize workspace manager: {0}")]
     WorkspaceManager(#[source] io::Error),
 
+    #[error("Invalid session directory {path}: {source}")]
+    Workspace { path: PathBuf, source: io::Error },
+
     #[error("Failed to initialize telemetry: {0}")]
     Telemetry(#[source] TelemetryInitError),
 }
@@ -160,7 +170,7 @@ pub async fn run_acp(args: AcpArgs) -> Result<AcpRunOutcome, AcpRunError> {
     eprintln!("{}", crate::version::startup_line());
     info!("Starting Aether ACP server");
 
-    let cwd = current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = resolve_session_root(&args)?;
     warn_if_not_a_repository(&cwd);
     let state = Arc::new(create_acp_state(args, &cwd, DetachedArgs::default())?);
     let connect_result = state.serve(Stdio::new(), state.stop_token()).await;
@@ -169,6 +179,28 @@ pub async fn run_acp(args: AcpArgs) -> Result<AcpRunOutcome, AcpRunError> {
     match connect_result {
         Ok(()) => Ok(AcpRunOutcome::CleanDisconnect),
         Err(err) => Err(AcpRunError::Protocol(err)),
+    }
+}
+
+/// Resolve and canonicalize the directory the session is rooted at. When
+/// `--options-json` carries an explicit `cwd` it wins; otherwise the
+/// `-C/--cwd` flag is used (default `.`). The resolved path is canonicalized
+/// so file tools downstream can resolve paths under it as absolute paths.
+fn resolve_session_root(args: &AcpArgs) -> Result<PathBuf, AcpRunError> {
+    let requested = match args.options_json.as_deref() {
+        Some(json) => serde_json::from_str::<AcpOptions>(json)
+            .map_err(AcpOptionsJsonError::from)?
+            .cwd
+            .unwrap_or_else(|| args.cwd.clone()),
+        None => args.cwd.clone(),
+    };
+    match std::fs::canonicalize(&requested) {
+        Ok(canonical) if canonical.is_dir() => Ok(canonical),
+        Ok(_) => {
+            let source = io::Error::new(io::ErrorKind::NotADirectory, "workspace must be a directory");
+            Err(AcpRunError::Workspace { path: requested, source })
+        }
+        Err(source) => Err(AcpRunError::Workspace { path: requested, source }),
     }
 }
 

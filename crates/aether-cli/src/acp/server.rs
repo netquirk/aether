@@ -27,10 +27,6 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub listen: SocketAddr,
 
-    /// Server workspace used to resolve settings and as the default session directory.
-    #[arg(short = 'C', long, default_value = ".")]
-    pub cwd: PathBuf,
-
     /// Initial prompt to run.
     #[arg(long)]
     pub prompt: Option<String>,
@@ -76,7 +72,7 @@ pub enum ServerRunError {
 }
 
 pub async fn run_server(args: ServerArgs) -> Result<(), ServerRunError> {
-    let cwd = canonicalize(&args.cwd)
+    let cwd = canonicalize(&args.acp.cwd)
         .and_then(|cwd| {
             if cwd.is_dir() {
                 Ok(cwd)
@@ -84,7 +80,7 @@ pub async fn run_server(args: ServerArgs) -> Result<(), ServerRunError> {
                 Err(io::Error::new(io::ErrorKind::NotADirectory, "workspace must be a directory"))
             }
         })
-        .map_err(|source| ServerRunError::Workspace { path: args.cwd, source })?;
+        .map_err(|source| ServerRunError::Workspace { path: args.acp.cwd.clone(), source })?;
 
     let prompt = prompt_or_stdin(args.prompt).map_err(ServerRunError::PromptStdin)?;
     let state = Arc::new(create_acp_state(args.acp, &cwd, args.detached)?);
