@@ -1,4 +1,6 @@
-use llm::{ContentBlock, LlmCallPurpose, LlmError, MessageId, ModelIdentity, StopReason, TokenUsage};
+use llm::{
+    ContentBlock, LlmCallPurpose, LlmError, MessageId, ModelIdentity, ProviderErrorKind, StopReason, TokenUsage,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +38,14 @@ pub enum LlmCallOutcome {
         provider_request_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_error_code: Option<String>,
+        /// Normalized provider failure classification carried over from the
+        /// original [`LlmError`]. `None` for client-side errors (missing API
+        /// key, OAuth flow, argument validation, etc.) and for the legacy
+        /// `failed` constructor; the headless CLI uses
+        /// `Some(ProviderErrorKind::Authentication)` to pick a distinct exit
+        /// code when the model *rejected* the credential (HTTP 401/403).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ProviderErrorKind>,
     },
     Cancelled,
 }
@@ -48,6 +58,7 @@ impl LlmCallOutcome {
             http_status: None,
             provider_request_id: None,
             provider_error_code: None,
+            kind: None,
         }
     }
 
@@ -61,6 +72,7 @@ impl LlmCallOutcome {
             http_status: provider.http_status,
             provider_request_id: provider.request_id.clone(),
             provider_error_code: provider.code.clone(),
+            kind: Some(provider.kind),
         }
     }
 }
@@ -117,6 +129,54 @@ impl TurnEvent {
                 Some(RetryInfo { attempt: *attempt, max_attempts: *max_attempts, delay_ms: *delay_ms })
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use llm::ProviderError;
+
+    use super::*;
+
+    #[test]
+    fn from_llm_error_carries_provider_kind_for_authorization_failures() {
+        // `ProviderError::authentication(...)` is the canonical shape an HTTP
+        // 401/403 surfaces through the reqwest/openai adapters: the runtime
+        // uses it to gate the distinct auth exit code, so the mapping has to
+        // land `kind = Some(ProviderErrorKind::Authentication)`.
+        let outcome = LlmCallOutcome::from_llm_error(&LlmError::from(ProviderError::authentication("bad key")), false);
+        match outcome {
+            LlmCallOutcome::Failed { kind, will_retry, .. } => {
+                assert_eq!(kind, Some(ProviderErrorKind::Authentication));
+                assert!(!will_retry);
+            }
+            other => panic!("expected Failed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_llm_error_carries_provider_kind_for_generic_api_failures() {
+        // Non-auth provider failures still carry their kind so callers can
+        // classify `Timeout`/`RateLimit`/`Server`/etc. without string-matching
+        // the error message.
+        let outcome = LlmCallOutcome::from_llm_error(&LlmError::from(ProviderError::api("boom")), false);
+        match outcome {
+            LlmCallOutcome::Failed { kind, .. } => assert_eq!(kind, Some(ProviderErrorKind::Api)),
+            other => panic!("expected Failed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_llm_error_leaves_kind_none_for_client_side_errors() {
+        // `MissingApiKey` is a client-side "you forgot to configure it"
+        // failure: it must NOT be mapped to the auth exit code, so the kind
+        // is intentionally `None` and the headless CLI treats it as a
+        // generic task failure.
+        let outcome = LlmCallOutcome::from_llm_error(&LlmError::MissingApiKey("OPENAI_API_KEY".into()), false);
+        match outcome {
+            LlmCallOutcome::Failed { kind, .. } => assert_eq!(kind, None),
+            other => panic!("expected Failed outcome, got {other:?}"),
         }
     }
 }

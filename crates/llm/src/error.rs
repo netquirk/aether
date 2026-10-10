@@ -1,5 +1,7 @@
 use std::fmt;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[doc = include_str!("docs/llm_error.md")]
@@ -60,7 +62,8 @@ pub enum LlmError {
     InvalidArgument(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
     Authentication,
     Api,

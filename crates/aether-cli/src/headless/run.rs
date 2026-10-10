@@ -1,6 +1,6 @@
 use aether_core::core::{AgentDeps, Prompt};
 use aether_core::events::{
-    AgentEvent, Command, ContextEvent, MessageEvent, ModelEvent, ToolEvent, TurnEvent, TurnOutcome,
+    AgentEvent, Command, ContextEvent, LlmCallOutcome, MessageEvent, ModelEvent, ToolEvent, TurnEvent, TurnOutcome,
 };
 use aether_core::mcp::McpHandle;
 use aether_telemetry::TelemetryRuntime;
@@ -20,6 +20,7 @@ use crate::run_timeout::{RunTimeoutWatch, TIMEOUT_EXIT_CODE};
 use crate::telemetry::build_telemetry_runtime;
 use crate::transcript::JsonlTranscript;
 use crate::workspace::warn_if_not_a_repository;
+use llm::ProviderErrorKind;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
@@ -32,6 +33,26 @@ use crate::provider_stall::ProviderStallWatch;
 use crate::run_usage::RunUsage;
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
+
+/// Distinct exit code the headless CLI returns when the model provider
+/// rejects the credential (HTTP 401/403). Distinct from
+/// [`std::process::ExitCode::SUCCESS`] (`0`), [`std::process::ExitCode::FAILURE`]
+/// (`1`), clap arg-parsing errors (`2`), and the timeout code 124
+/// ([`crate::run_timeout::TIMEOUT_EXIT_CODE`]). Mirrors `sysexits.h`'s
+/// `EX_NOPERM` (77), an established "permission denied" code in POSIX tooling,
+/// so callers that already key off it (or log it verbatim) recognise the
+/// condition without extra wiring.
+pub(crate) const AUTH_EXIT_CODE: u8 = 77;
+
+/// One-line, caller-facing message printed when the run ends in
+/// [`AUTH_EXIT_CODE`]. Names the credential as the cause so a user can tell
+/// an authentication failure apart from a generic task failure without
+/// inspecting the log file. Pinned by `authentication_failure_line_names_credential`
+/// in the tests so a regression in phrasing shows up immediately.
+pub(crate) fn authentication_failure_line() -> String {
+    "Authentication failed: the model provider rejected the credential. Check the API key or sign-in for this provider."
+        .to_string()
+}
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     let log_file = config.log_file.clone();
@@ -179,8 +200,11 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
 // `stream_output` takes 8 positional parameters: the addition of the
 // caller-capped run timeout (TASK-25-18) brought it from 7 to 8. Bundling
 // them into a config struct would obscure the call sites without reducing
-// total surface area, so silence the threshold-crossing lint.
-#[allow(clippy::too_many_arguments)]
+// total surface area, so silence the threshold-crossing lint. The function
+// is also intentionally long: it owns the whole event loop (deadline race,
+// per-event bookkeeping, progress line, transcript write, exit-code mapping)
+// and splitting it would just shuffle the same code across two callers.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn stream_output<W: io::Write>(
     mut rx: mpsc::Receiver<AgentEvent>,
     format: OutputFormat,
@@ -235,6 +259,14 @@ async fn stream_output<W: io::Write>(
     // `io::stderr()` (same as the stall warning) so machine `--output json`
     // streams stay clean.
     let mut timeout = RunTimeoutWatch::new(run_timeout, run_started_at, io::stderr());
+    // Tracks the `ProviderErrorKind` of the most recent failed LLM call so
+    // the turn-outcome match can pick a distinct exit code when the model
+    // *rejected* the credential. `None` for any failure kind that isn't
+    // `Authentication`, including client-side errors (`MissingApiKey`,
+    // `OAuthError`) and rate limits / server errors. Authentication is
+    // non-retryable, so the last `LlmCallEnded` before `TurnEnded` is the
+    // terminal cause to act on.
+    let mut failed_call_kind: Option<ProviderErrorKind> = None;
 
     loop {
         // Race the next event against the stall deadline and the caller-capped
@@ -265,6 +297,21 @@ async fn stream_output<W: io::Write>(
         let msg: &AgentEvent = &event;
         if let AgentEvent::SessionUsage(sample) = msg {
             usage.record(sample);
+        }
+
+        // Remember the most recent failed LLM call's classification so the
+        // turn-outcome branch can pick the auth exit code when the model
+        // rejected the credential. Authentication is non-retryable, so by the
+        // time `Turn(TurnEvent::Ended)` is observed the value here is the
+        // terminal cause to act on; any non-auth kind overwrites it back to
+        // its own value so a rate-limit-after-auth sequence still falls
+        // through to `FAILURE` rather than reporting an auth exit.
+        if let AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            outcome: LlmCallOutcome::Failed { kind: Some(call_kind), .. },
+            ..
+        }) = msg
+        {
+            failed_call_kind = Some(*call_kind);
         }
 
         // Capture the note for failed turns *before* we update the tracker
@@ -337,6 +384,14 @@ async fn stream_output<W: io::Write>(
 
         if let Some(outcome) = msg.turn_outcome() {
             exit_code = match outcome {
+                TurnOutcome::Failed { .. } if failed_call_kind == Some(ProviderErrorKind::Authentication) => {
+                    // The model rejected the credential (HTTP 401/403). Print
+                    // a credential-naming line so a caller can tell this from
+                    // a generic task failure, and exit with the dedicated code
+                    // rather than the generic `FAILURE` (1).
+                    eprintln!("{}", authentication_failure_line());
+                    ExitCode::from(AUTH_EXIT_CODE)
+                }
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled | TurnOutcome::MaxTurnsReached { .. } => {
                     ExitCode::SUCCESS
@@ -936,6 +991,87 @@ mod tests {
             stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
+    }
+
+    /// When the most recent failed LLM call before `Turn(TurnEvent::Ended)`
+    /// carries `kind = Some(ProviderErrorKind::Authentication)`, the loop
+    /// surfaces the distinct auth exit code (77, mirroring `sysexits.h`'s
+    /// `EX_NOPERM`) and *not* the generic `FAILURE` (1). A non-auth kind
+    /// (here `Api`) below proves the mapping is scoped to `Authentication`
+    /// alone and a generic task failure still exits `FAILURE`.
+    #[tokio::test]
+    async fn stream_output_auth_failure_uses_distinct_exit_code() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: llm::LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Failed {
+                error: "Authentication error: bad key (status 401)".into(),
+                will_retry: false,
+                http_status: Some(401),
+                provider_request_id: None,
+                provider_error_code: None,
+                kind: Some(ProviderErrorKind::Authentication),
+            },
+        }))
+        .await
+        .unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "Authentication error: bad key".into() }))
+            .await
+            .unwrap();
+
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+
+        assert_eq!(code, ExitCode::from(AUTH_EXIT_CODE), "auth failure must surface the distinct exit code");
+        assert_ne!(code, ExitCode::FAILURE, "auth exit code must differ from a generic task failure");
+        assert_ne!(code, ExitCode::SUCCESS, "auth exit code must differ from a clean run");
+        assert_ne!(
+            code,
+            ExitCode::from(crate::run_timeout::TIMEOUT_EXIT_CODE),
+            "auth exit code must differ from the timeout code"
+        );
+    }
+
+    /// Companion test: a non-auth `ProviderErrorKind` (here `Api`) keeps the
+    /// generic `FAILURE` exit path so the auth mapping doesn't accidentally
+    /// swallow every provider failure.
+    #[tokio::test]
+    async fn stream_output_non_auth_provider_failure_keeps_failure_exit_code() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::LlmCallEnded {
+            purpose: llm::LlmCallPurpose::Chat,
+            outcome: LlmCallOutcome::Failed {
+                error: "API error: bad request (status 400)".into(),
+                will_retry: false,
+                http_status: Some(400),
+                provider_request_id: None,
+                provider_error_code: None,
+                kind: Some(ProviderErrorKind::Api),
+            },
+        }))
+        .await
+        .unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "API error: bad request".into() })).await.unwrap();
+
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+
+        assert_eq!(code, ExitCode::FAILURE, "non-auth failure must keep the generic FAILURE code");
+        assert_ne!(code, ExitCode::from(AUTH_EXIT_CODE), "non-auth failure must not be promoted to auth");
+    }
+
+    /// The credential-naming line is the caller-facing diagnostic for the
+    /// auth exit code; pin its exact phrasing so a future copy-edit that
+    /// removes the credential wording surfaces as a unit-test failure. The
+    /// line is grep-friendly and contains both "Authentication" and
+    /// "credential" — words a caller (or a log-searching operator) would key
+    /// off when distinguishing auth failures from generic task failures.
+    #[test]
+    fn authentication_failure_line_names_credential() {
+        let line = authentication_failure_line();
+        assert!(line.starts_with("Authentication"), "line must start with the noun: {line:?}");
+        assert!(line.contains("credential"), "line must name the credential as the cause: {line:?}");
+        assert!(!line.ends_with('\n'), "the line is rendered via `eprintln!`, no trailing newline here");
     }
 
     #[tokio::test]

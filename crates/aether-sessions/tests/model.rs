@@ -120,6 +120,7 @@ fn failed_call_diagnostics_survive_session_json_round_trip() {
             http_status: Some(200),
             provider_request_id: Some("req-1".into()),
             provider_error_code: Some("server_error".into()),
+            kind: None,
         },
     }));
 

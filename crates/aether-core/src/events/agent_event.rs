@@ -130,6 +130,7 @@ mod tests {
                 http_status: Some(200),
                 provider_request_id: Some("req-1".into()),
                 provider_error_code: Some("server_error".into()),
+                kind: None,
             },
         });
         assert_eq!(
@@ -161,6 +162,7 @@ mod tests {
         assert!(outcome.get("http_status").is_none());
         assert!(outcome.get("provider_request_id").is_none());
         assert!(outcome.get("provider_error_code").is_none());
+        assert!(outcome.get("kind").is_none(), "absent provider kind must stay out of the serialized shape: {value:?}");
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), minimal);
     }
 
