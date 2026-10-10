@@ -143,6 +143,16 @@ pub struct RunConfig {
     /// `stream_output` is reached the run is already inside the part the
     /// caller cares about timing.
     pub timeout: Option<Duration>,
+    /// Caller-capped number of tool calls for the run (TASK-25-260). When
+    /// set, the headless event loop returns the distinct
+    /// [`crate::run_max_tool_calls::MAX_TOOL_CALLS_EXIT_CODE`] (125) the
+    /// first time `summary.tool_calls` reaches the limit, regardless of
+    /// whether the agent is still streaming events. `None` preserves the
+    /// previous behaviour (no cap). The cap applies to the event loop only;
+    /// it does not cap MCP setup or the pre-loop agent build because by
+    /// the time `stream_output` is reached the run is already inside the
+    /// part the caller cares about bounding.
+    pub max_tool_calls: Option<u32>,
     /// Per-run tool denylist (TASK-25-123). Each entry is a model-visible
     /// tool name the headless run withholds from the model. Names go through
     /// the same `ToolFilter::deny` machinery the agent's `tools` block uses,
@@ -333,6 +343,16 @@ pub struct HeadlessArgs {
     #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_timeout)]
     pub timeout: Option<Duration>,
 
+    /// Cap the number of tool calls this run makes (TASK-25-260). Once the
+    /// run has issued N tool calls the headless loop ends it, prints one
+    /// line naming `--max-tool-calls`, and exits with
+    /// [`crate::run_max_tool_calls::MAX_TOOL_CALLS_EXIT_CODE`] (125).
+    /// Accepts a bare non-negative integer (`<n>`). Zero/empty/non-numeric
+    /// values are rejected at parse time. Without `--max-tool-calls` the
+    /// run shape is preserved (no cap).
+    #[arg(long = "max-tool-calls", value_name = "N", value_parser = parse_max_tool_calls)]
+    pub max_tool_calls: Option<u32>,
+
     /// Withhold a model-visible tool from this run by name (TASK-25-123).
     /// Repeatable to drop more than one tool in a single invocation
     /// (`--disable-tool bash --disable-tool grep`). Names are matched against
@@ -392,6 +412,7 @@ impl RunConfig {
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
             timeout: args.timeout,
+            max_tool_calls: args.max_tool_calls,
             disable_tools: args.disable_tools,
         })
     }
@@ -449,6 +470,9 @@ impl RunConfig {
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
             timeout: None,
+            // `--max-tool-calls` (TASK-25-260) is similarly reserved for
+            // the inline CLI; `--options-json` callers cannot pass it.
+            max_tool_calls: None,
             // `--options-json` callers (TASK-25-123) do not expose
             // `--disable-tool`; the run sees no per-run withholds, matching
             // the pre-existing behaviour.
@@ -497,6 +521,25 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
         return Err("timeout must be greater than zero (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
     }
     Ok(Duration::from_millis(total_ms))
+}
+
+/// Parse the `--max-tool-calls` value into a non-zero [`u32`]. Bare
+/// non-negative integers only; empty, zero, and non-numeric values are
+/// rejected with a message naming `--max-tool-calls` so `--max-tool-calls
+/// 0` / `--max-tool-calls abc` fail at parse time rather than producing a
+/// silently-disabled cap or a confusingly-capped run. The flag does not
+/// accept suffixes (it is a count, not a duration), matching the help text.
+fn parse_max_tool_calls(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("--max-tool-calls must not be empty (expected a positive integer)".to_string());
+    }
+    let parsed: u32 =
+        trimmed.parse().map_err(|_| format!("--max-tool-calls '{value}' is not a non-negative integer"))?;
+    if parsed == 0 {
+        return Err("--max-tool-calls must be greater than zero (expected a positive integer)".to_string());
+    }
+    Ok(parsed)
 }
 
 /// Resolve the system prompt from either an inline string or a file path.
@@ -902,6 +945,80 @@ mod tests {
             let rendered = error.to_string();
             assert!(
                 rendered.contains("timeout") || rendered.contains(raw),
+                "diagnostic missing context for {raw:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_max_tool_calls_accepts_positive_integers() {
+        // The parse_max_tool_calls parser is the gateway through which
+        // `--max-tool-calls 3` reaches the run; every accepted shape it
+        // advertises in the help text must round-trip back to the expected
+        // u32 so a typo (e.g. a stray space) cannot turn a 3-call cap into
+        // a silently-disabled cap or a runaway run.
+        let cases = [
+            ("1", 1u32),
+            ("3", 3u32),
+            ("100", 100u32),
+            ("  5  ", 5u32),          // surrounding whitespace is fine
+            ("4294967295", u32::MAX), // full u32 range accepted
+        ];
+        for (raw, expected) in cases {
+            let parsed = parse_max_tool_calls(raw).unwrap_or_else(|error| panic!("{raw:?} must parse: {error}"));
+            assert_eq!(parsed, expected, "raw {raw:?} -> {parsed} != {expected}");
+        }
+    }
+
+    #[test]
+    fn parse_max_tool_calls_rejects_zero_empty_and_non_numeric() {
+        // Zero would otherwise silently disable the watch (the constructor
+        // coerces zero to disabled); empty / non-numeric values must not
+        // be a "successful" parse of an unintended count.
+        let cases = ["0", "", "   ", "abc", "-1", "3.5", "1e3", "three"];
+        for raw in cases {
+            let error = parse_max_tool_calls(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw:?} must be rejected by parse_max_tool_calls"));
+            assert!(!error.is_empty(), "{raw:?}: rejection message must not be empty");
+        }
+    }
+
+    #[test]
+    fn max_tool_calls_flag_is_parsed_by_clap() {
+        // End-to-end check: clap sees `--max-tool-calls 3`, applies the
+        // `parse_max_tool_calls` value parser, and the resulting
+        // `HeadlessArgs` carries the expected `Some(3)`. This guards
+        // against a future change that swaps the parser out or removes
+        // the flag; the smaller `parse_max_tool_calls` unit tests above
+        // cover the parser alone.
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "--max-tool-calls", "3", "hello"])
+            .expect("--max-tool-calls 3 parses")
+            .args;
+        assert_eq!(parsed.max_tool_calls, Some(3));
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+
+        // Absent flag means no cap, matching the pre-existing behaviour.
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("no --max-tool-calls parses").args;
+        assert_eq!(parsed.max_tool_calls, None);
+    }
+
+    #[test]
+    fn max_tool_calls_flag_rejects_invalid_values_at_parse_time() {
+        // clap surfaces `parse_max_tool_calls`'s error to the user; assert
+        // the production parser is wired so an `--max-tool-calls 0` /
+        // `--max-tool-calls abc` arg fails with a non-empty diagnostic
+        // naming the flag instead of falling through to a
+        // silently-disabled cap.
+        use clap::Parser as _;
+        for raw in ["0", "abc", ""] {
+            let error = QuietHarness::try_parse_from(["aether", "--max-tool-calls", raw, "hello"])
+                .err()
+                .unwrap_or_else(|| panic!("--max-tool-calls {raw:?} must be rejected by clap"));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("max-tool-calls") || rendered.contains(raw),
                 "diagnostic missing context for {raw:?}: {rendered}"
             );
         }

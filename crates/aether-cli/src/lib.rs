@@ -20,6 +20,7 @@ pub mod provider_connection_args;
 pub(crate) mod provider_stall;
 pub mod resolve;
 pub(crate) mod run_max_tokens;
+pub(crate) mod run_max_tool_calls;
 pub(crate) mod run_timeout;
 pub(crate) mod run_usage;
 pub mod runtime;

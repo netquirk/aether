@@ -16,6 +16,7 @@ use tracing::{error, info};
 
 use crate::file_changes::FileChanges;
 use crate::log_level::{LogLevel, resolve as resolve_log_level};
+use crate::run_max_tool_calls::{MAX_TOOL_CALLS_EXIT_CODE, MaxToolCallsWatch};
 use crate::run_timeout::{RunTimeoutWatch, TIMEOUT_EXIT_CODE};
 use crate::telemetry::build_telemetry_runtime;
 use crate::transcript::JsonlTranscript;
@@ -159,21 +160,28 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         io::stderr(),
         transcript.as_mut(),
         config.timeout,
+        config.max_tool_calls,
     )
     .await;
     print_run_summary(config.output, &summary);
 
-    let timed_out = exit_code == ExitCode::from(TIMEOUT_EXIT_CODE);
+    // A run that ended early (the headless loop fired one of the early-exit
+    // branches) needs the agent handle aborted so its background task
+    // unwinds instead of being awaited indefinitely. The early-exit branches
+    // are the wall-clock timeout (`TIMEOUT_EXIT_CODE`, 124) and the
+    // per-run tool-call cap (`MAX_TOOL_CALLS_EXIT_CODE`, 125); both stop the
+    // loop mid-stream, in which case an in-flight provider call is the most
+    // likely reason the loop never saw a `turn_ended` event.
+    let stopped_early =
+        exit_code == ExitCode::from(TIMEOUT_EXIT_CODE) || exit_code == ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE);
     drop(agent.agent_tx);
-    if timed_out {
-        // The headless loop returned because the run deadline passed; an
-        // in-flight provider call is the most likely reason it never
-        // returned a turn outcome. Call [`AgentHandle::abort`] so the
-        // background task unwinds instead of being awaited indefinitely,
-        // then wait briefly for it to acknowledge the cancel. The
-        // bounded wait matches the spirit of the caller-capped timeout:
-        // a `--timeout` is meant to cap the entire run, not just the
-        // event loop.
+    if stopped_early {
+        // Call [`AgentHandle::abort`] so the background task unwinds instead
+        // of being awaited indefinitely, then wait briefly for it to
+        // acknowledge the cancel. The bounded wait matches the spirit of the
+        // caller-capped timeout: a `--timeout` is meant to cap the entire
+        // run, not just the event loop. The same logic applies to a
+        // `--max-tool-calls` cap because the cap also stops the run mid-turn.
         agent.agent_handle.abort();
         let _ = tokio::time::timeout(Duration::from_secs(5), agent.agent_handle.await_completion()).await;
     } else {
@@ -209,13 +217,14 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
-// `stream_output` takes 8 positional parameters: the addition of the
-// caller-capped run timeout (TASK-25-18) brought it from 7 to 8. Bundling
-// them into a config struct would obscure the call sites without reducing
-// total surface area, so silence the threshold-crossing lint. The function
-// is also intentionally long: it owns the whole event loop (deadline race,
-// per-event bookkeeping, progress line, transcript write, exit-code mapping)
-// and splitting it would just shuffle the same code across two callers.
+// `stream_output` takes 9 positional parameters: the addition of the
+// caller-capped tool-call cap (TASK-25-260) brought it from 8 to 9.
+// Bundling them into a config struct would obscure the call sites without
+// reducing total surface area, so silence the threshold-crossing lint.
+// The function is also intentionally long: it owns the whole event loop
+// (deadline race, per-event bookkeeping, progress line, transcript write,
+// exit-code mapping) and splitting it would just shuffle the same code
+// across two callers.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn stream_output<W: io::Write>(
     mut rx: mpsc::Receiver<AgentEvent>,
@@ -227,6 +236,7 @@ async fn stream_output<W: io::Write>(
     progress_writer: W,
     mut transcript: Option<&mut JsonlTranscript>,
     run_timeout: Option<Duration>,
+    max_tool_calls: Option<u32>,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
     // Wall-clock timing of every turn seen on the stream, independent of the
@@ -279,6 +289,19 @@ async fn stream_output<W: io::Write>(
     // non-retryable, so the last `LlmCallEnded` before `TurnEnded` is the
     // terminal cause to act on.
     let mut failed_call_kind: Option<ProviderErrorKind> = None;
+    // Per-run cap on the number of tool calls the headless loop emits
+    // (TASK-25-260). Unlike `--timeout`, the cap fires on the event loop
+    // *after* `RunSummary::record` counts the most recent tool call, so
+    // `--max-tool-calls 3` stops the run the moment `summary.tool_calls`
+    // reaches 3. The sink is `io::stderr()` (same as the stall warning
+    // and the run-timeout line) so machine `--output json` streams stay
+    // clean. The post-loop bookkeeping (clear progress, print summaries,
+    // flush transcript) shares the `finish_run` helper with the
+    // `--timeout` branch; the cap returns `MAX_TOOL_CALLS_EXIT_CODE` (125)
+    // so a caller observing the exit code can distinguish "the run was
+    // capped" from "the run timed out" (`TIMEOUT_EXIT_CODE`, 124) and
+    // from a normal completion (`SUCCESS`, 0).
+    let mut tool_cap = MaxToolCallsWatch::new(max_tool_calls, io::stderr());
 
     loop {
         // Race the next event against the stall deadline and the caller-capped
@@ -291,7 +314,7 @@ async fn stream_output<W: io::Write>(
         let maybe_event = match next {
             NextEvent::Received(event) => event,
             NextEvent::TimedOut => {
-                return finish_run_timed_out(
+                return finish_run(
                     &mut progress,
                     format,
                     &timings,
@@ -301,6 +324,7 @@ async fn stream_output<W: io::Write>(
                     run_started_at,
                     changes,
                     summary,
+                    ExitCode::from(TIMEOUT_EXIT_CODE),
                 );
             }
             NextEvent::Loop => continue,
@@ -339,6 +363,48 @@ async fn stream_output<W: io::Write>(
         // Counts for the end-of-run summary; independent of `--events` so a
         // filtered run still reports how many turns and tool calls happened.
         summary.record(msg);
+
+        // Per-run tool-call cap (TASK-25-260). When the count `summary`
+        // tracks crosses the cap the watch writes the line and returns
+        // `Ok(true)`; the loop exits through `finish_run` with the distinct
+        // `MAX_TOOL_CALLS_EXIT_CODE` (125) so a caller observing the exit
+        // code can distinguish "the run was capped" from "the run timed
+        // out" (`TIMEOUT_EXIT_CODE`, 124) and from a normal completion
+        // (`SUCCESS`, 0). The IO error branch returns the same exit code
+        // because the cap has effectively fired even if the line did not
+        // reach stderr.
+        match tool_cap.stop_if_reached(summary.tool_calls) {
+            Ok(true) => {
+                return finish_run(
+                    &mut progress,
+                    format,
+                    &timings,
+                    &provider_wait,
+                    &usage,
+                    &mut transcript,
+                    run_started_at,
+                    changes,
+                    summary,
+                    ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Failed to write max tool calls line: {error}");
+                return finish_run(
+                    &mut progress,
+                    format,
+                    &timings,
+                    &provider_wait,
+                    &usage,
+                    &mut transcript,
+                    run_started_at,
+                    changes,
+                    summary,
+                    ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE),
+                );
+            }
+        }
 
         // Update the live stderr progress line (Text mode only — Json/Pretty
         // are machine-readable and must not be polluted with control codes).
@@ -428,10 +494,11 @@ async fn stream_output<W: io::Write>(
 
 /// Wrap the post-loop bookkeeping (clear the live progress line, print the
 /// per-turn / run / provider-wait / usage summaries, flush the transcript)
-/// the timeout branch shares with the natural loop end. Returns the distinct
-/// exit code so `stream_output`'s single call site stays uniform.
+/// the timeout and the `--max-tool-calls` branches share with the natural
+/// loop end. Returns the supplied exit code so `stream_output`'s single
+/// helper serves both early-exit paths.
 #[allow(clippy::too_many_arguments)]
-fn finish_run_timed_out<W: io::Write>(
+fn finish_run<W: io::Write>(
     progress: &mut ToolProgressReporter<W>,
     format: OutputFormat,
     timings: &TurnTimings,
@@ -441,6 +508,7 @@ fn finish_run_timed_out<W: io::Write>(
     run_started_at: Instant,
     changes: FileChanges,
     summary: RunSummary,
+    exit_code: ExitCode,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let run_total_elapsed = run_started_at.elapsed();
     // Erase the live progress line so it does not bleed into the turn/run
@@ -452,7 +520,7 @@ fn finish_run_timed_out<W: io::Write>(
     if let Some(t) = transcript.as_mut() {
         let _ = t.flush();
     }
-    (ExitCode::from(TIMEOUT_EXIT_CODE), changes, summary)
+    (exit_code, changes, summary)
 }
 
 /// Outcome of one iteration of `stream_output`'s timer race.
@@ -990,7 +1058,8 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -1000,7 +1069,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -1032,7 +1101,7 @@ mod tests {
             .unwrap();
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
 
         assert_eq!(code, ExitCode::from(AUTH_EXIT_CODE), "auth failure must surface the distinct exit code");
         assert_ne!(code, ExitCode::FAILURE, "auth exit code must differ from a generic task failure");
@@ -1066,7 +1135,7 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "API error: bad request".into() })).await.unwrap();
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
 
         assert_eq!(code, ExitCode::FAILURE, "non-auth failure must keep the generic FAILURE code");
         assert_ne!(code, ExitCode::from(AUTH_EXIT_CODE), "non-auth failure must not be promoted to auth");
@@ -1093,7 +1162,7 @@ mod tests {
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -1107,7 +1176,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -1131,7 +1200,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -1148,7 +1217,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 1, tool_calls: 0 });
     }
@@ -1163,7 +1232,7 @@ mod tests {
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -1178,7 +1247,8 @@ mod tests {
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
         let (_code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -1236,7 +1306,7 @@ mod tests {
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -1257,7 +1327,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
@@ -1279,7 +1349,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None, None).await;
         assert!(sink.windows(3).any(|w| w == b"\xe2\x8f\xba"), "non-quiet must draw the progress line: {sink:?}");
 
         // Quiet: no progress bytes at all.
@@ -1287,7 +1357,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None, None, None).await;
         assert!(sink.is_empty(), "quiet must not write progress bytes: {sink:?}");
     }
 
@@ -1317,7 +1387,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None, None).await;
         sink
     }
 
@@ -1399,9 +1469,19 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
 
         let threshold = Duration::from_millis(50);
-        let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), false, io::sink(), None, None)
-                .await;
+        let (code, _changes, _summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &[],
+            Instant::now(),
+            Some(threshold),
+            false,
+            io::sink(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -1424,7 +1504,7 @@ mod tests {
             .checked_sub(limit + Duration::from_secs(1))
             .expect("`Instant - 31s` must remain representable on the test runtime");
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], started, None, false, io::sink(), None, Some(limit)).await;
+            stream_output(rx, OutputFormat::Text, &[], started, None, false, io::sink(), None, Some(limit), None).await;
         assert_eq!(
             code,
             ExitCode::from(crate::run_timeout::TIMEOUT_EXIT_CODE),
@@ -1432,6 +1512,58 @@ mod tests {
         );
         assert_ne!(code, ExitCode::FAILURE, "timeout exit code must differ from generic failure");
         assert_ne!(code, ExitCode::SUCCESS, "timeout exit code must differ from a successful run");
+    }
+
+    /// TASK-25-260: `--max-tool-calls` halts the run after the supplied
+    /// number of tool calls. Five synthetic `tool_call_msg` events are sent
+    /// before a `turn_ended`; with `max_tool_calls = Some(3)` the loop must
+    /// fire the cap branch right after the third call. The remaining two
+    /// `tool_call_msg` events stay in the channel (`summary.tool_calls`
+    /// is exactly 3) so the test fails loudly if a future regression lets
+    /// the loop drain past the cap or returns the wrong exit code.
+    #[tokio::test]
+    async fn stream_output_stops_after_max_tool_calls() {
+        let (tx, rx) = mpsc::channel(8);
+        for _ in 0..5 {
+            tx.send(tool_call_msg()).await.unwrap();
+        }
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        drop(tx);
+
+        let (code, _changes, summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, Some(3))
+                .await;
+
+        assert_eq!(code, ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE), "loop must exit with the distinct cap exit code");
+        assert_ne!(code, ExitCode::FAILURE, "cap exit code must differ from generic failure");
+        assert_ne!(code, ExitCode::SUCCESS, "cap exit code must differ from a successful run");
+        // Distinct from the wall-clock timeout so a caller observing the
+        // exit code can tell them apart.
+        assert_ne!(code, ExitCode::from(TIMEOUT_EXIT_CODE), "cap exit code must differ from the timeout exit code");
+        assert_eq!(summary.tool_calls, 3, "summary must record exactly the cap-capped count");
+        assert_eq!(summary.turns, 0, "no turn was started in this synthetic stream");
+    }
+
+    /// Same as the cap-exit-code test above, but pinned to the lower-level
+    /// `--max-tool-calls 2` limit. Three synthetic `tool_call_msg` events
+    /// are sent; the loop must halt on the second one and leave the third
+    /// in the channel. The `summary.tool_calls` must be exactly 2 so a
+    /// regression that lets the loop drain past the cap shows up as a
+    /// failed assertion rather than a silently-dropped event.
+    #[tokio::test]
+    async fn stream_output_cap_with_two_tool_calls_halts_on_second() {
+        let (tx, rx) = mpsc::channel(4);
+        for _ in 0..3 {
+            tx.send(tool_call_msg()).await.unwrap();
+        }
+        drop(tx);
+
+        let (code, _changes, summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, Some(2))
+                .await;
+
+        assert_eq!(code, ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE));
+        assert_eq!(summary.tool_calls, 2);
     }
 
     #[test]
