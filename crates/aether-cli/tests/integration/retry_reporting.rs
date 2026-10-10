@@ -7,7 +7,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 fn fast_retry_config() -> RetryConfig {
-    RetryConfig { max_attempts: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) }
+    RetryConfig {
+        max_attempts: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        // Mid-stream resume is irrelevant for the retry-counting tests below;
+        // the fake provider always returns a complete (single-shot) response,
+        // so disable it to keep the assertions focused on attempt counts.
+        resume_partial: false,
+    }
 }
 
 async fn drive_to_completion(

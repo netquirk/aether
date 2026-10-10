@@ -5,6 +5,7 @@ use aether_core::events::{
 use aether_core::mcp::McpHandle;
 use aether_telemetry::TelemetryRuntime;
 use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,13 @@ use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
-    setup_tracing(resolve_log_level(config.log_level, config.verbose));
+    let log_file = config.log_file.clone();
+    setup_tracing(resolve_log_level(config.log_level, config.verbose), config.log_file.as_deref()).map_err(
+        |source| match log_file {
+            Some(path) => CliError::LogFileOpen { path, source },
+            None => CliError::IoError(source),
+        },
+    )?;
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
@@ -595,20 +602,35 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     }
 }
 
-pub(crate) fn setup_tracing(level: LogLevel) {
+pub(crate) fn setup_tracing(level: LogLevel, log_file: Option<&Path>) -> std::io::Result<()> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = EnvFilter::new(level.directive());
     // Gate the fmt layer's ANSI on the same `NO_COLOR` signal the live
     // progress line honours: a `NO_COLOR=1` run emits log records to stderr
-    // in plain text, matching the rest of the colour-free output.
-    let layer = fmt::layer().with_writer(io::stderr).with_ansi(crate::color::color_enabled()).with_filter(filter);
+    // in plain text, matching the rest of the colour-free output. When the
+    // operator has redirected the log to a file (TASK-25-48), ANSI is
+    // unconditionally disabled so the on-disk log is readable in a log
+    // viewer regardless of `NO_COLOR`. `BoxMakeWriter` erases the writer
+    // type so both branches converge on a single layer type.
+    let layer = match log_file {
+        None => fmt::layer()
+            .with_writer(BoxMakeWriter::new(io::stderr))
+            .with_ansi(crate::color::color_enabled())
+            .with_filter(filter),
+        Some(path) => {
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            fmt::layer().with_writer(BoxMakeWriter::new(file)).with_ansi(false).with_filter(filter)
+        }
+    };
 
     let _ = tracing_subscriber::registry().with(layer).try_init();
+    Ok(())
 }
 
 #[cfg(test)]

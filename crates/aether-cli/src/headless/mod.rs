@@ -68,6 +68,14 @@ pub struct RunConfig {
     /// `--verbose` callers keep their `debug` level while new runs can pick
     /// `error`/`warn`/`info`/`debug` directly.
     pub log_level: Option<LogLevel>,
+    /// File the run's tracing log is redirected to (TASK-25-48). When
+    /// `Some`, `setup_tracing` opens the path in append mode (creating it
+    /// if missing) and points the `fmt` layer's writer at the resulting
+    /// `File` instead of stderr. `None` preserves the pre-existing
+    /// stderr behaviour. Opened with `append(true)` so an operator's
+    /// existing log is preserved across runs; the task only requires
+    /// creating PATH if missing, not replacing it.
+    pub log_file: Option<std::path::PathBuf>,
     /// When true, the headless loop does not write the live per-tool progress
     /// line on stderr. Warnings and errors (including the provider-stall
     /// warning, `eprintln!` failure messages, and `tracing` warnings/errors)
@@ -166,8 +174,17 @@ pub struct HeadlessOptions {
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // Settings loading can emit `tracing::warn!` for unrecognised keys, so
     // initialise the tracing subscriber before the load (the subscriber is
-    // re-installed at the proper verbosity inside `run::run`).
-    run::setup_tracing(resolve_log_level(args.log_level, args.verbose));
+    // re-installed at the proper verbosity inside `run::run`). When
+    // `--log-file` is set (TASK-25-48) the redirection happens here so a
+    // `--dry-run` short-circuit still writes the log to the file, and any
+    // IO error opening the path fails the run before the agent starts.
+    let log_file = args.log_file.clone();
+    run::setup_tracing(resolve_log_level(args.log_level, args.verbose), args.log_file.as_deref()).map_err(
+        |source| match log_file {
+            Some(path) => CliError::LogFileOpen { path, source },
+            None => CliError::IoError(source),
+        },
+    )?;
     if args.dry_run {
         // Short-circuit before any prompt resolution, session construction,
         // MCP setup, telemetry runtime, or provider call: --dry-run only
@@ -239,6 +256,16 @@ pub struct HeadlessArgs {
     #[arg(long = "log-level", value_name = "LEVEL")]
     pub log_level: Option<LogLevel>,
 
+    /// Write the run's tracing log to PATH instead of stderr (TASK-25-48).
+    /// PATH is created if missing; parent directories are not created —
+    /// opening PATH fails the run before the agent starts. Useful for
+    /// keeping a persistent run log without piping the terminal. When
+    /// omitted, the run logs to stderr as before. ANSI colour codes are
+    /// disabled in the file so the contents stay readable in a log
+    /// viewer.
+    #[arg(long = "log-file", value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
     /// Suppress the live per-tool progress line on stderr. Warnings and
     /// errors (including the provider-stall warning and `tracing` diagnostics)
     /// are still printed. Has no effect on `--events` filtering or on
@@ -306,6 +333,7 @@ impl RunConfig {
             output: args.output,
             verbose: args.verbose,
             log_level: args.log_level,
+            log_file: args.log_file,
             quiet: args.quiet,
             events: args.events,
             oauth_credential_store,
@@ -355,6 +383,9 @@ impl RunConfig {
             // inherit the `verbose`-derived default (warn / debug) by
             // leaving this `None` so `LogLevel::resolve` falls back.
             log_level: None,
+            // `--options-json` callers (TASK-25-48) do not expose
+            // `--log-file` either; the run logs to stderr as before.
+            log_file: None,
             quiet: options.quiet.unwrap_or(false),
             events: options.events.unwrap_or_default(),
             oauth_credential_store,
@@ -681,6 +712,24 @@ mod tests {
         for allowed in ["error", "warn", "info", "debug"] {
             assert!(rendered.contains(allowed), "diagnostic must list `{allowed}` as an accepted value: {rendered}");
         }
+    }
+
+    #[test]
+    fn log_file_flag_round_trips_through_clap() {
+        // The clap-level check (TASK-25-48): `--log-file PATH` must round-trip
+        // into `HeadlessArgs.log_file` as `Some(PathBuf)` so the redirection
+        // reaches `setup_tracing` unchanged. The absent-flag case must stay
+        // `None` so the existing stderr behaviour is preserved for every
+        // pre-existing caller.
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "--log-file", "/tmp/aether.log", "hello"])
+            .expect("--log-file PATH parses")
+            .args;
+        assert_eq!(parsed.log_file.as_deref(), Some(std::path::Path::new("/tmp/aether.log")));
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("absent --log-file parses").args;
+        assert!(parsed.log_file.is_none(), "absent --log-file must be None, not a default");
     }
 
     #[test]

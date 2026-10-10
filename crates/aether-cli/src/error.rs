@@ -25,6 +25,8 @@ pub enum CliError {
     McpError(String),
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
+    #[error("failed to open log file {path}: {source}")]
+    LogFileOpen { path: PathBuf, source: io::Error },
     #[error("failed to read system prompt from {path}: {source}")]
     SystemPromptFile { path: PathBuf, source: io::Error },
     #[error("Agent error: {0}")]
