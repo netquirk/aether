@@ -71,6 +71,22 @@ impl RunUsage {
         self.models.is_empty()
     }
 
+    /// Sum of every model's reported input + output tokens across the whole
+    /// run (TASK-25-45). This is the same total the end-of-run usage block
+    /// renders, so the `--max-tokens` cap and the report can read the same
+    /// figure without re-summing. Cache / audio / reasoning dimensions are
+    /// not counted: the cap tracks the same input/output pair the existing
+    /// `Token usage by model:` block already prints.
+    pub(crate) fn total_tokens(&self) -> u64 {
+        let mut total: u64 = 0;
+        for entry in &self.models {
+            total = total
+                .saturating_add(entry.tokens.input_tokens.get())
+                .saturating_add(entry.tokens.output_tokens.get());
+        }
+        total
+    }
+
     /// `true` when at least one model has an accumulated price — the run as a
     /// whole is "priced" when any model is, and that is when dollars render.
     fn any_priced(&self) -> bool {
@@ -207,6 +223,26 @@ mod tests {
         let usage = RunUsage::default();
         assert!(usage.is_empty());
         assert_eq!(usage.format_text(), None);
+    }
+
+    #[test]
+    fn run_usage_total_tokens_sums_input_and_output_per_model() {
+        // Acceptance for `--max-tokens` (TASK-25-45): the cap reads the same
+        // input+output total the end-of-run usage block renders, so the
+        // cap and the report agree. Two models, each fed two samples, must
+        // sum to the per-model running totals — the figure the format_text
+        // path also prints.
+        let mut usage = RunUsage::default();
+        usage.record(&sample("m1", 10, 2));
+        usage.record(&sample("m1", 5, 3));
+        usage.record(&sample("m2", 7, 1));
+
+        // 15+5 (m1) + 7+1 (m2) = 28
+        assert_eq!(usage.total_tokens(), 28);
+
+        // An empty accumulator must report zero so a no-usage run can't
+        // accidentally trip the cap.
+        assert_eq!(RunUsage::default().total_tokens(), 0);
     }
 
     #[test]
