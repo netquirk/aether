@@ -11,7 +11,9 @@ use aether_project::tool_output_dir_from_env;
 use aether_project::tool_output_max_bytes_from_env;
 use llm::{ChatMessage, SessionUsageEvent, ToolDefinition};
 use mcp_servers::McpBuilderExt;
-use mcp_utils::client::{McpClientEvent, McpConnectionDetails, McpServer, OAuthHandlerFactory};
+use mcp_utils::client::{
+    McpClientEvent, McpConnectionDetails, McpServer, OAuthHandlerFactory, ToolFilter, ToolMatcher,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -35,6 +37,11 @@ pub struct RuntimeBuilder {
     oauth_applicator: Option<Box<dyn FnOnce(McpBuilder) -> McpBuilder + Send>>,
     agent_deps: AgentDeps,
     usage_seed: Option<SessionUsageEvent>,
+    /// Per-run tool denylist added on top of the agent's own `tools` block
+    /// (TASK-25-123). Names go through [`ToolMatcher::name`] so the existing
+    /// `with_tool_filter` deny list controls what reaches the model. Empty by
+    /// default so pre-existing callers see no change.
+    disable_tools: Vec<String>,
 }
 
 pub struct Runtime {
@@ -62,6 +69,7 @@ impl RuntimeBuilder {
             oauth_applicator: None,
             agent_deps: AgentDeps::default(),
             usage_seed: None,
+            disable_tools: Vec::new(),
         }
     }
 
@@ -109,6 +117,18 @@ impl RuntimeBuilder {
 
     pub fn oauth_handler_factory(mut self, factory: OAuthHandlerFactory) -> Self {
         self.oauth_applicator = Some(Box::new(|builder| builder.with_oauth_handler_factory(factory)));
+        self
+    }
+
+    /// Per-run tool denylist (TASK-25-123). Each entry is matched against the
+    /// model-facing tool name through [`ToolMatcher::name`]; an entry that
+    /// does not match any tool is a silent no-op so unknown names fail
+    /// gracefully. Names accumulate on top of the agent's configured `deny`
+    /// list — a name already denied stays denied — and do not interact with
+    /// the `allow` list (the surrounding `ToolFilter::is_tool_allowed` keeps
+    /// that decision authoritative).
+    pub fn disable_tools(mut self, names: Vec<String>) -> Self {
+        self.disable_tools = names;
         self
     }
 
@@ -179,7 +199,9 @@ impl RuntimeBuilder {
 
     async fn spawn_mcp(self) -> Result<(AgentSpec, McpSession), CliError> {
         let deps = self.agent_deps.clone();
-        let mut builder = mcp(&self.cwd).with_tool_filter(self.spec.tools.clone());
+        let mut filter = self.spec.tools.clone();
+        apply_disabled_tools(&mut filter, &self.disable_tools);
+        let mut builder = mcp(&self.cwd).with_tool_filter(filter);
 
         if let Some(apply_oauth) = self.oauth_applicator {
             builder = apply_oauth(builder);
@@ -217,6 +239,16 @@ impl RuntimeBuilder {
     }
 }
 
+/// Merge the per-run `--disable-tool NAME` denylist into the agent's own
+/// `ToolFilter` (TASK-25-123). Each entry is wrapped in
+/// [`ToolMatcher::name`] so the resulting deny list applies through the same
+/// glob-aware machinery [`ToolFilter::is_tool_allowed`] already uses.
+/// `pub(crate)` so the integration test path can also exercise it without
+/// fetching the names out of the in-memory `with_tool_filter` plumbing.
+pub(crate) fn apply_disabled_tools(filter: &mut ToolFilter, names: &[String]) {
+    filter.deny.extend(names.iter().cloned().map(ToolMatcher::name));
+}
+
 async fn spawn_agent(
     spec: &AgentSpec,
     deps: &AgentDeps,
@@ -230,4 +262,66 @@ async fn spawn_agent(
         .tools(mcp, tool_definitions);
 
     configure(builder).spawn().await.map_err(|error| CliError::AgentError(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm::ToolDefinition;
+    use serde_json::json;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition::new(name, "test tool", json!({"type": "object"}))
+    }
+
+    #[test]
+    fn apply_disabled_tools_adds_name_matchers_to_deny() {
+        // The helper appends one `ToolMatcher::Name` per input string; an
+        // empty filter plus two names is the canonical wiring check. We don't
+        // inspect `filter.deny` directly (it is the deny that matters at
+        // runtime, not a particular equality); `is_tool_allowed` is the
+        // observable contract downstream code relies on.
+        let mut filter = ToolFilter::default();
+        apply_disabled_tools(&mut filter, &["coding__bash".to_string(), "coding__read_file".to_string()]);
+
+        assert_eq!(filter.deny.len(), 2);
+        assert!(!filter.is_tool_allowed(&tool("coding__bash")));
+        assert!(!filter.is_tool_allowed(&tool("coding__read_file")));
+        // The helper preserves any pre-existing deny entries.
+        let mut filter = ToolFilter { deny: vec![ToolMatcher::name("preexisting")], ..ToolFilter::default() };
+        apply_disabled_tools(&mut filter, &["coding__bash".to_string()]);
+        assert_eq!(filter.deny.len(), 2);
+        assert!(!filter.is_tool_allowed(&tool("preexisting")));
+        assert!(!filter.is_tool_allowed(&tool("coding__bash")));
+    }
+
+    #[test]
+    fn apply_disabled_tools_empty_keeps_filter_intact() {
+        // The empty path is a no-op so a run without `--disable-tool` does
+        // not see any denylist changes. Baseline allows every tool.
+        let mut filter = ToolFilter::default();
+        apply_disabled_tools(&mut filter, &[]);
+        assert!(filter.is_tool_allowed(&tool("anything")));
+        assert!(filter.deny.is_empty());
+    }
+
+    #[test]
+    fn apply_disabled_tools_unknown_name_is_silent_no_op() {
+        // A name that matches no tool leaves the allow-check intact for the
+        // tools that do exist; the test pins the no-op-on-unknown contract
+        // so callers don't have to special-case it.
+        let mut filter = ToolFilter::default();
+        apply_disabled_tools(&mut filter, &["does-not-exist".to_string()]);
+        assert!(filter.is_tool_allowed(&tool("coding__bash")));
+    }
+
+    #[test]
+    fn apply_disabled_tools_leaves_sibling_tools_allowed() {
+        // Withholding one tool must not affect the rest of the model's view.
+        let mut filter = ToolFilter::default();
+        apply_disabled_tools(&mut filter, &["coding__bash".to_string()]);
+        assert!(!filter.is_tool_allowed(&tool("coding__bash")));
+        assert!(filter.is_tool_allowed(&tool("coding__read_file")));
+        assert!(filter.is_tool_allowed(&tool("coding__grep")));
+    }
 }

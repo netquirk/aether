@@ -11,6 +11,7 @@ mod acp_stdio;
 mod acp_workspace_move;
 mod check_config;
 mod config_flag;
+mod disable_tool;
 mod dry_run;
 mod headless_system_prompt;
 mod list_profiles;

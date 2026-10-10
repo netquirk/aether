@@ -73,6 +73,7 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         .mcp_sources(config.mcp_config_sources)
         .settings_tool_output(config.settings_tool_output.clone())
         .shell_environment(config.shell_environment.clone())
+        .disable_tools(config.disable_tools.clone())
         .agent_deps(deps)
         .build_ready(vec![])
         .await?;

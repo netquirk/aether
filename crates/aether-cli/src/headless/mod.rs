@@ -136,6 +136,13 @@ pub struct RunConfig {
     /// `stream_output` is reached the run is already inside the part the
     /// caller cares about timing.
     pub timeout: Option<Duration>,
+    /// Per-run tool denylist (TASK-25-123). Each entry is a model-visible
+    /// tool name the headless run withholds from the model. Names go through
+    /// the same `ToolFilter::deny` machinery the agent's `tools` block uses,
+    /// so an entry that does not match any tool is a silent no-op. Threaded
+    /// into the runtime via
+    /// [`crate::runtime::RuntimeBuilder::disable_tools`].
+    pub disable_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -318,6 +325,16 @@ pub struct HeadlessArgs {
     /// `--timeout` the run shape is preserved (no cap).
     #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_timeout)]
     pub timeout: Option<Duration>,
+
+    /// Withhold a model-visible tool from this run by name (TASK-25-123).
+    /// Repeatable to drop more than one tool in a single invocation
+    /// (`--disable-tool bash --disable-tool grep`). Names are matched against
+    /// the model-facing name (e.g. `coding__bash` for the built-in coding
+    /// server's shell tool); unknown names exit 0 and leave the rest of the
+    /// set intact, which mirrors the deny-list semantics the agent's
+    /// configured `tools` block already uses.
+    #[arg(long = "disable-tool", value_name = "NAME")]
+    pub disable_tools: Vec<String>,
 }
 
 impl RunConfig {
@@ -368,6 +385,7 @@ impl RunConfig {
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
             timeout: args.timeout,
+            disable_tools: args.disable_tools,
         })
     }
 
@@ -424,6 +442,10 @@ impl RunConfig {
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
             timeout: None,
+            // `--options-json` callers (TASK-25-123) do not expose
+            // `--disable-tool`; the run sees no per-run withholds, matching
+            // the pre-existing behaviour.
+            disable_tools: Vec::new(),
         })
     }
 }

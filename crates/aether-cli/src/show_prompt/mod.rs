@@ -27,6 +27,12 @@ pub struct PromptArgs {
     /// Print each model-visible tool name (one per line) and exit
     #[arg(long = "list-tools")]
     pub list_tools: bool,
+
+    /// Withhold a model-visible tool from the prompt inspection (TASK-25-123).
+    /// Repeatable to drop more than one tool. Same matching rules as the
+    /// headless `--disable-tool` flag.
+    #[arg(long = "disable-tool", value_name = "NAME")]
+    pub disable_tools: Vec<String>,
 }
 
 pub use run::run_prompt;

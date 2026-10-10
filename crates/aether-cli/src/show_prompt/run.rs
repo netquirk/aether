@@ -17,6 +17,7 @@ pub async fn run_prompt(args: PromptArgs) -> Result<(), CliError> {
     let info = RuntimeBuilder::from_spec(cwd.clone(), spec)
         .agent_deps(AgentDeps::default().with_agent_registry(registry))
         .mcp_sources(args.mcp_config.sources(&cwd))
+        .disable_tools(args.disable_tools.clone())
         .build_prompt_info()
         .await?;
 
