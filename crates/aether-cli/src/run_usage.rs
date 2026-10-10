@@ -129,46 +129,58 @@ struct ModelUsageJson<'a> {
 }
 
 pub(crate) fn print_run_usage(format: OutputFormat, usage: &RunUsage) {
+    if let Some(rendered) = render(format, usage) {
+        println!("{rendered}");
+    }
+}
+
+/// Pure renderer for the end-of-run usage block. Returns the bytes the CLI
+/// would print for `format`, or `None` when the provider reported no usage
+/// (so the caller prints nothing extra). Text and JSON both share the same
+/// emptiness check: an accumulator that recorded no `SessionUsageEvent`
+/// yields no summary at all.
+pub(crate) fn render(format: OutputFormat, usage: &RunUsage) -> Option<String> {
     if usage.is_empty() {
-        return;
+        return None;
     }
     match format {
-        OutputFormat::Text | OutputFormat::Pretty => {
-            if let Some(text) = usage.format_text() {
-                println!("{text}");
-            }
-        }
-        OutputFormat::Json => {
-            let models: Vec<ModelUsageJson<'_>> = usage
+        OutputFormat::Text | OutputFormat::Pretty => usage.format_text(),
+        OutputFormat::Json => render_json(usage),
+    }
+}
+
+fn render_json(usage: &RunUsage) -> Option<String> {
+    if usage.is_empty() {
+        return None;
+    }
+    let models: Vec<ModelUsageJson<'_>> = usage
+        .models
+        .iter()
+        .map(|entry| ModelUsageJson {
+            model: &entry.model,
+            input_tokens: entry.tokens.input_tokens.get(),
+            output_tokens: entry.tokens.output_tokens.get(),
+            estimated_cost_usd: entry.cost.map(|cost| cost.total_usd.get()),
+        })
+        .collect();
+    let total_cost: Option<f64> = if usage.any_priced() {
+        Some(
+            usage
                 .models
                 .iter()
-                .map(|entry| ModelUsageJson {
-                    model: &entry.model,
-                    input_tokens: entry.tokens.input_tokens.get(),
-                    output_tokens: entry.tokens.output_tokens.get(),
-                    estimated_cost_usd: entry.cost.map(|cost| cost.total_usd.get()),
-                })
-                .collect();
-            let total_cost: Option<f64> = if usage.any_priced() {
-                Some(
-                    usage
-                        .models
-                        .iter()
-                        .filter_map(|entry| entry.cost)
-                        .fold(Usd::ZERO, |running, cost| running + cost.total_usd)
-                        .get(),
-                )
-            } else {
-                None
-            };
-            let payload = if let Some(total) = total_cost {
-                serde_json::json!({ "type": "run_usage", "models": models, "total_cost_usd": total })
-            } else {
-                serde_json::json!({ "type": "run_usage", "models": models })
-            };
-            println!("{payload}");
-        }
-    }
+                .filter_map(|entry| entry.cost)
+                .fold(Usd::ZERO, |running, cost| running + cost.total_usd)
+                .get(),
+        )
+    } else {
+        None
+    };
+    let payload = if let Some(total) = total_cost {
+        serde_json::json!({ "type": "run_usage", "models": models, "total_cost_usd": total })
+    } else {
+        serde_json::json!({ "type": "run_usage", "models": models })
+    };
+    Some(payload.to_string())
 }
 
 #[cfg(test)]
@@ -269,5 +281,60 @@ mod tests {
         event.model =
             ModelIdentity { provider: Some("test".into()), model_id: Some(model.into()), pricing: Some(*pricing) };
         event
+    }
+
+    /// Feeds a provider usage payload (the kind the headless stream carries in
+    /// `AgentEvent::SessionUsage`) and asserts the rendered text names the
+    /// exact input and output token counts. This is the acceptance test for
+    /// "the CLI prints the input and output token counts the provider
+    /// reported" — it bypasses the per-model grouping and the priced /
+    /// unpriced branch by using a single, known model and a known payload.
+    #[test]
+    fn render_text_carries_provider_reported_token_counts() {
+        let mut usage = RunUsage::default();
+        // A realistic two-call sample for one model: 1,234 input / 56 output,
+        // then 78 input / 90 output. The provider-reported sum is what the CLI
+        // must print at end-of-run, not the per-call split.
+        usage.record(&sample("gpt-test", 1_234, 56));
+        usage.record(&sample("gpt-test", 78, 90));
+
+        let rendered = render(OutputFormat::Text, &usage).expect("non-empty usage must render");
+        assert!(
+            rendered.contains("gpt-test: 1312 in, 146 out"),
+            "rendered text must carry the summed input/output token counts, got: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("Token usage by model:"),
+            "rendered text must open with the usage header, got: {rendered:?}"
+        );
+    }
+
+    /// Same guarantee for the JSON output format the run can be configured to
+    /// produce. `render` returns a JSON document that lists each model with
+    /// the provider-reported `input_tokens` / `output_tokens` totals; an empty
+    /// accumulator yields no document at all.
+    #[test]
+    fn render_json_carries_provider_reported_token_counts() {
+        let mut usage = RunUsage::default();
+        usage.record(&sample("gpt-test", 1_234, 56));
+        usage.record(&sample("gpt-test", 78, 90));
+
+        let rendered = render(OutputFormat::Json, &usage).expect("non-empty usage must render JSON");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("rendered output is valid JSON");
+        assert_eq!(value["type"], "run_usage");
+        let models = value["models"].as_array().expect("models is an array");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["model"], "gpt-test");
+        assert_eq!(models[0]["input_tokens"], 1_312);
+        assert_eq!(models[0]["output_tokens"], 146);
+        assert!(
+            value.get("total_cost_usd").is_none(),
+            "no pricing was supplied, so the JSON document must omit total_cost_usd: {rendered:?}"
+        );
+
+        // Empty usage must render nothing for either format.
+        let empty = RunUsage::default();
+        assert_eq!(render(OutputFormat::Text, &empty), None);
+        assert_eq!(render(OutputFormat::Json, &empty), None);
     }
 }

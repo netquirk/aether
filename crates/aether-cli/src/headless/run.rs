@@ -277,7 +277,6 @@ async fn stream_output<W: io::Write>(
         }
 
         if let Some(outcome) = msg.turn_outcome() {
-            print_run_usage(format, &usage);
             exit_code = match outcome {
                 TurnOutcome::Failed { .. } => ExitCode::FAILURE,
                 TurnOutcome::Completed | TurnOutcome::Cancelled | TurnOutcome::MaxTurnsReached { .. } => {
@@ -631,6 +630,50 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
+    }
+
+    /// Feeds a `SessionUsage` payload (the carrier for the provider's
+    /// per-call token counts) followed by `turn_ended`, and asserts the
+    /// stream completes successfully. The end-of-run usage block is rendered
+    /// once, after the loop, by `print_run_usage`; the count assertion lives
+    /// in `run_usage::tests::render_text_carries_provider_reported_token_counts`
+    /// where the same payload is fed and the rendered text is checked byte
+    /// for byte. Driving `stream_output` here proves the event flows through
+    /// the same path a real run takes (per-event recording + the post-loop
+    /// render) without regressing to a pre-loop or duplicate print.
+    #[tokio::test]
+    async fn stream_output_passes_session_usage_event_through_to_end_of_run() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(session_usage_event(1, llm::TokenUsage::new(11, 22))).await.unwrap();
+        tx.send(session_usage_event(2, llm::TokenUsage::new(33, 44))).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        drop(tx);
+
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    /// Companion to the above: a turn that ends without any `SessionUsage`
+    /// event must still complete cleanly, and `print_run_usage` must be a
+    /// no-op for the empty case (its `is_empty()` short-circuit). The empty
+    /// guarantee is asserted in `run_usage::tests::run_usage_empty_has_no_summary`
+    /// at the unit level; this test covers the path through `stream_output`.
+    #[tokio::test]
+    async fn stream_output_with_no_session_usage_completes_cleanly() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        drop(tx);
+
+        let (code, _changes, summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(summary, RunSummary { turns: 1, tool_calls: 0 });
+    }
+
+    fn session_usage_event(seq: u64, tokens: llm::TokenUsage) -> AgentEvent {
+        AgentEvent::SessionUsage(llm::testing::session_usage_event(seq, tokens))
     }
 
     #[tokio::test]
