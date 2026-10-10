@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Instant as TokioInstant, sleep_until};
-use tracing::error;
+use tracing::{error, info};
 
 use crate::file_changes::FileChanges;
 use crate::log_level::{LogLevel, resolve as resolve_log_level};
@@ -40,6 +40,14 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
         Some(path) => CliError::LogFileOpen { path, source },
         None => CliError::IoError(source),
     })?;
+    // Record which provider and model the run is about to answer so the line
+    // appears in whatever log path `--log-file` (TASK-25-48) selected. The
+    // record sits before `warn_if_not_a_repository` and the agent/MCP build so
+    // it is the first thing each run writes about itself, even when the
+    // resolved spec later resolves to an alloy list (the first entry is the
+    // model in use; `AlloyedModelProvider` only swaps providers on failure).
+    let (provider, model_id) = run_model_identity(&config.spec.model);
+    info!(provider = %provider, model_id = %model_id, "run starting");
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
@@ -601,6 +609,28 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     }
 }
 
+/// Split the resolved model spec into the `(provider, model_id)` pair the
+/// run-start log line names (TASK-25-119). The spec is canonical
+/// (`provider:model`) or an alloy list (`p1:m1,p2:m2`); the first entry is
+/// the model in use, mirroring `ModelProviderParser::parse` which threads the
+/// first identity through `AlloyedModelProvider` as the default and only
+/// swaps providers on a failed call. When the spec entry parses as a
+/// catalogued `LlmModel` the answer comes from the catalog's own
+/// `provider()` / `model_id()` accessors; otherwise the raw `provider:model`
+/// split is the fallback so unknown or local-only specs still surface a
+/// sensible `(provider, model_id)` pair in the log.
+fn run_model_identity(model_spec: &str) -> (String, String) {
+    let first = model_spec.split(',').next().unwrap_or(model_spec);
+    let first = first.trim();
+    match first.parse::<llm::LlmModel>() {
+        Ok(model) => (model.provider().to_string(), model.model_id().into_owned()),
+        Err(_) => {
+            let (provider, model_id) = first.split_once(':').unwrap_or(("", first));
+            (provider.to_string(), model_id.to_string())
+        }
+    }
+}
+
 pub(crate) fn setup_tracing(
     level: LogLevel,
     log_file: Option<&Path>,
@@ -687,6 +717,49 @@ mod tests {
     #[test]
     fn event_kind_turn_ended_is_filterable() {
         assert_eq!(event_kind(&AgentEvent::turn_ended(TurnOutcome::Completed)), Some(CliEventKind::TurnEnded));
+    }
+
+    #[test]
+    fn run_model_identity_splits_canonical_spec() {
+        // Canonical `provider:model` form goes through the catalogued
+        // `LlmModel` parser, so the answer must use the catalog's own
+        // `provider()` / `model_id()` accessors rather than the raw split.
+        assert_eq!(run_model_identity("ollama:llama3.2"), ("ollama".to_string(), "llama3.2".to_string()));
+    }
+
+    #[test]
+    fn run_model_identity_picks_first_entry_in_alloy_spec() {
+        // Alloy specs are stored verbatim as comma-separated entries; the
+        // first entry is the model in use (see
+        // `ModelProviderParser::parse` which threads the first identity
+        // through `AlloyedModelProvider` as the default), so the log line
+        // names that one regardless of how many follow.
+        assert_eq!(
+            run_model_identity("anthropic:claude-sonnet-4-5,ollama:llama3.2"),
+            ("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn run_model_identity_trims_whitespace_around_first_entry() {
+        // `ModelProviderParser::parse` trims each entry before parsing, and
+        // the resolved spec on `AgentSpec` reflects that trim. The helper
+        // re-trims defensively so a future caller that hands it a less-clean
+        // string still gets the right pair in the log line.
+        assert_eq!(
+            run_model_identity(" ollama:llama3.2 ,anthropic:claude-sonnet-4-5"),
+            ("ollama".to_string(), "llama3.2".to_string())
+        );
+    }
+
+    #[test]
+    fn run_model_identity_falls_back_to_raw_split_for_unknown_specs() {
+        // Custom / dynamic specs that the catalog parser rejects still need a
+        // `(provider, model_id)` pair in the log; the raw `split(':')`
+        // fallback keeps that observable working without forcing the run to
+        // fail before any provider work happens.
+        assert_eq!(run_model_identity("custom:my-local-model"), ("custom".to_string(), "my-local-model".to_string()));
+        assert_eq!(run_model_identity("plain-no-colon"), ("".to_string(), "plain-no-colon".to_string()));
     }
 
     #[test]
