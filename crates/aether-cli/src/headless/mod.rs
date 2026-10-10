@@ -103,6 +103,16 @@ pub struct RunConfig {
     /// `run.providerStallWarnSeconds` block before the agent starts so the
     /// headless loop can race the deadline without re-reading settings.
     pub provider_stall_warn: Option<Duration>,
+    /// Caller-capped wall-clock budget for the run (TASK-25-18). When set,
+    /// the headless event loop returns the distinct
+    /// [`crate::run_timeout::TIMEOUT_EXIT_CODE`] the first time
+    /// `started + timeout` passes, regardless of whether the agent is still
+    /// streaming events. `None` preserves the previous behaviour (no
+    /// timeout). The limit applies to the event loop only; it does not cap
+    /// MCP setup or the pre-loop agent build because by the time
+    /// `stream_output` is reached the run is already inside the part the
+    /// caller cares about timing.
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -237,6 +247,16 @@ pub struct HeadlessArgs {
     /// `--transcript-jsonl`.
     #[arg(long = "transcript-max-bytes", value_name = "BYTES")]
     pub transcript_max_bytes: Option<u64>,
+
+    /// Wall-clock run timeout (TASK-25-18). When the run has been going for
+    /// longer than this the headless event loop ends it, prints one line
+    /// naming the limit, and exits with [`crate::run_timeout::TIMEOUT_EXIT_CODE`]
+    /// (`124`). Accepts the same suffixes as `--transcript-max-bytes`-style
+    /// durations: `<n>ms`, `<n>s`, `<n>m`, `<n>h`, or a bare number of
+    /// seconds. Zero/empty values are rejected at parse time. Without
+    /// `--timeout` the run shape is preserved (no cap).
+    #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_timeout)]
+    pub timeout: Option<Duration>,
 }
 
 impl RunConfig {
@@ -279,6 +299,7 @@ impl RunConfig {
             provider_stall_warn,
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
+            timeout: args.timeout,
         })
     }
 
@@ -323,6 +344,7 @@ impl RunConfig {
             provider_stall_warn,
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
+            timeout: None,
         })
     }
 }
@@ -330,6 +352,43 @@ impl RunConfig {
 fn resolve_prompt(args: &HeadlessArgs) -> Result<String, CliError> {
     let explicit = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
     prompt_or_stdin(explicit).map_err(CliError::IoError)?.ok_or(CliError::NoPrompt)
+}
+
+/// Parse the `--timeout` value into a [`Duration`]. Accepts `<n>ms`,
+/// `<n>s`, `<n>m`, `<n>h`, and a bare `<n>` (interpreted as seconds). Empty,
+/// zero, negative, non-numeric, and unknown-suffix values are rejected with a
+/// message naming the offending input so `--timeout 0s` / `--timeout abc`
+/// fail at parse time rather than producing a silently-disabled timeout or a
+/// confusingly-hung run.
+///
+/// Avoids depending on `humantime` to keep the workspace's dependency surface
+/// stable for what is conceptually a four-line parser.
+fn parse_timeout(value: &str) -> Result<Duration, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("timeout must not be empty (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
+    }
+    let (number, suffix) = match trimmed.find(|c: char| !c.is_ascii_digit()) {
+        Some(index) => (&trimmed[..index], &trimmed[index..]),
+        None => (trimmed, "s"),
+    };
+    if number.is_empty() {
+        return Err(format!("timeout '{value}' has no numeric prefix"));
+    }
+    let magnitude: u64 = number.parse().map_err(|_| format!("timeout '{value}' is not a non-negative integer"))?;
+    let multiplier: u64 = match suffix {
+        "" | "s" | "ms" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        other => return Err(format!("timeout '{value}' uses unknown suffix '{other}' (expected ms, s, m, or h)")),
+    };
+    let total_ms = magnitude
+        .checked_mul(if suffix == "ms" { 1 } else { multiplier * 1_000 })
+        .ok_or_else(|| format!("timeout '{value}' overflows"))?;
+    if total_ms == 0 {
+        return Err("timeout must be greater than zero (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
+    }
+    Ok(Duration::from_millis(total_ms))
 }
 
 /// Resolve the system prompt from either an inline string or a file path.
@@ -552,6 +611,82 @@ mod tests {
         let parsed = QuietHarness::try_parse_from(["aether", "--quiet", "hello"]).unwrap().args;
         assert!(parsed.quiet, "--quiet must set the flag alongside a positional prompt");
         assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn parse_timeout_accepts_common_suffixes_and_bare_seconds() {
+        // The parse_timeout parser is the gateway through which
+        // `--timeout 30s` reaches the run; every accepted shape it advertises
+        // in the help text must round-trip back to the expected Duration so a
+        // typo (e.g. suffix drop) cannot turn a 30-second cap into a 30
+        // microsecond one.
+        let cases = [
+            ("30s", Duration::from_secs(30)),
+            ("500ms", Duration::from_millis(500)),
+            ("2m", Duration::from_secs(120)),
+            ("1h", Duration::from_secs(3600)),
+            ("45", Duration::from_secs(45)),
+            ("  10s  ", Duration::from_secs(10)), // surrounding whitespace is fine
+        ];
+        for (raw, expected) in cases {
+            let parsed = parse_timeout(raw).unwrap_or_else(|error| panic!("{raw:?} must parse: {error}"));
+            assert_eq!(parsed, expected, "raw {raw:?} -> {parsed:?} != {expected:?}");
+        }
+    }
+
+    #[test]
+    fn parse_timeout_rejects_zero_empty_unknown_suffix_and_negative() {
+        // The four shapes the parser explicitly rejects. Zero would otherwise
+        // silently disable the watch (the constructor coerces zero to
+        // disabled); empty / non-numeric / unknown-suffix values must not be
+        // a "successful" parse of an unintended duration.
+        let cases = ["0s", "0", "0m", "0h", "0ms", "", "   ", "abc", "-1s", "30x", "30days"];
+        for raw in cases {
+            let error = parse_timeout(raw).err().unwrap_or_else(|| panic!("{raw:?} must be rejected by parse_timeout"));
+            assert!(!error.is_empty(), "{raw:?}: rejection message must not be empty");
+        }
+    }
+
+    #[test]
+    fn timeout_flag_is_parsed_by_clap() {
+        // End-to-end check: clap sees `--timeout 30s`, applies the
+        // `parse_timeout` value parser, and the resulting `HeadlessArgs`
+        // carries the expected Duration. This guards against a future change
+        // that swaps the parser out or removes the flag; the smaller
+        // `parse_timeout` unit tests above cover the parser alone.
+        use clap::Parser as _;
+        let parsed =
+            QuietHarness::try_parse_from(["aether", "--timeout", "30s", "hello"]).expect("--timeout 30s parses").args;
+        assert_eq!(parsed.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+
+        let parsed = QuietHarness::try_parse_from(["aether", "--timeout", "500ms", "hello"])
+            .expect("--timeout 500ms parses")
+            .args;
+        assert_eq!(parsed.timeout, Some(Duration::from_millis(500)));
+
+        // Absent flag means no timeout, matching the pre-existing behaviour.
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("no --timeout parses").args;
+        assert_eq!(parsed.timeout, None);
+    }
+
+    #[test]
+    fn timeout_flag_rejects_invalid_values_at_parse_time() {
+        // clap surfaces `parse_timeout`'s error to the user; assert the
+        // production parser is wired so an `--timeout 0s` / `--timeout abc`
+        // arg fails with a non-empty diagnostic instead of falling through to
+        // a silently-disabled timeout.
+        use clap::Parser as _;
+        for raw in ["0s", "abc", ""] {
+            let error = QuietHarness::try_parse_from(["aether", "--timeout", raw, "hello"])
+                .err()
+                .unwrap_or_else(|| panic!("--timeout {raw:?} must be rejected by clap"));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("timeout") || rendered.contains(raw),
+                "diagnostic missing context for {raw:?}: {rendered}"
+            );
+        }
     }
 
     #[test]

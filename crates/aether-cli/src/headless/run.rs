@@ -14,6 +14,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::error;
 
 use crate::file_changes::FileChanges;
+use crate::run_timeout::{RunTimeoutWatch, TIMEOUT_EXIT_CODE};
 use crate::telemetry::build_telemetry_runtime;
 use crate::transcript::JsonlTranscript;
 use crate::workspace::warn_if_not_a_repository;
@@ -96,12 +97,27 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         config.quiet,
         io::stderr(),
         transcript.as_mut(),
+        config.timeout,
     )
     .await;
     print_run_summary(config.output, &summary);
 
+    let timed_out = exit_code == ExitCode::from(TIMEOUT_EXIT_CODE);
     drop(agent.agent_tx);
-    agent.agent_handle.await_completion().await;
+    if timed_out {
+        // The headless loop returned because the run deadline passed; an
+        // in-flight provider call is the most likely reason it never
+        // returned a turn outcome. Call [`AgentHandle::abort`] so the
+        // background task unwinds instead of being awaited indefinitely,
+        // then wait briefly for it to acknowledge the cancel. The
+        // bounded wait matches the spirit of the caller-capped timeout:
+        // a `--timeout` is meant to cap the entire run, not just the
+        // event loop.
+        agent.agent_handle.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent.agent_handle.await_completion()).await;
+    } else {
+        agent.agent_handle.await_completion().await;
+    }
 
     if config.output == OutputFormat::Text {
         println!("{}", changes.summary());
@@ -132,10 +148,10 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
-// `stream_output` already takes 7 positional parameters before `--quiet`
-// landed; adding the `quiet` flag and a generic progress writer pushes it to
-// 8. Bundling them into a config struct would obscure the call sites without
-// reducing total surface area, so silence the threshold-crossing lint.
+// `stream_output` takes 8 positional parameters: the addition of the
+// caller-capped run timeout (TASK-25-18) brought it from 7 to 8. Bundling
+// them into a config struct would obscure the call sites without reducing
+// total surface area, so silence the threshold-crossing lint.
 #[allow(clippy::too_many_arguments)]
 async fn stream_output<W: io::Write>(
     mut rx: mpsc::Receiver<AgentEvent>,
@@ -146,6 +162,7 @@ async fn stream_output<W: io::Write>(
     quiet: bool,
     progress_writer: W,
     mut transcript: Option<&mut JsonlTranscript>,
+    run_timeout: Option<Duration>,
 ) -> (ExitCode, FileChanges, RunSummary) {
     let mut tracker = RetryTracker::default();
     // Wall-clock timing of every turn seen on the stream, independent of the
@@ -180,31 +197,45 @@ async fn stream_output<W: io::Write>(
     // `--quiet` intentionally does not gate the stall warning: it is a
     // problem-reporting line the task asks to keep.
     let mut stall = ProviderStallWatch::new(provider_stall_warn, io::stderr());
+    // Caller-capped wall-clock run timeout (TASK-25-18). Unlike the stall
+    // watch, this one fires on the run, not per-LLM-call: the headless
+    // event loop races the run deadline against the stall deadline and
+    // `rx.recv()`, and the earliest of the three wakes the loop. When the
+    // run deadline is the earliest the loop exits through the timeout
+    // branch, leaving the post-loop bookkeeping in a state that returns
+    // `TIMEOUT_EXIT_CODE` instead of `FAILURE`/`SUCCESS`. The sink is
+    // `io::stderr()` (same as the stall warning) so machine `--output json`
+    // streams stay clean.
+    let mut timeout = RunTimeoutWatch::new(run_timeout, run_started_at, io::stderr());
 
     loop {
-        // Race the next event against the stall deadline. When the watch is
-        // disabled (threshold `None`, no call in flight, or already warned for
-        // the current call) it returns `None` and the loop falls back to the
-        // plain `rx.recv()` path with no timer overhead.
-        let msg = if let Some(deadline) = stall.next_deadline() {
-            let tokio_deadline = TokioInstant::from_std(deadline);
-            tokio::select! {
-                biased;
-                () = sleep_until(tokio_deadline) => {
-                    if let Err(error) = stall.warn_if_stalled(Instant::now()) {
-                        eprintln!("Failed to write provider stall warning: {error}");
-                    }
-                    // Loop back; the watch self-disables once the warning has
-                    // fired, so the next iteration is a plain `recv().await`.
-                    continue;
-                }
-                maybe = rx.recv() => maybe,
+        // Race the next event against the stall deadline and the caller-capped
+        // run deadline. The earliest of the three wakes the loop; when none of
+        // them is due (no in-flight call, no timeout set, or the timeout has
+        // already fired) the loop falls back to the plain `rx.recv()` path
+        // with no timer overhead. Extracted to keep `stream_output` under the
+        // `clippy::too_many_lines` pedantic threshold.
+        let next = await_with_deadlines(&mut rx, &mut stall, &mut timeout).await;
+        let maybe_event = match next {
+            NextEvent::Received(event) => event,
+            NextEvent::TimedOut => {
+                return finish_run_timed_out(
+                    &mut progress,
+                    format,
+                    &timings,
+                    &provider_wait,
+                    &usage,
+                    &mut transcript,
+                    run_started_at,
+                    changes,
+                    summary,
+                );
             }
-        } else {
-            rx.recv().await
+            NextEvent::Loop => continue,
         };
-        let Some(msg) = msg else { break };
-        if let AgentEvent::SessionUsage(sample) = &msg {
+        let Some(event) = maybe_event else { break };
+        let msg: &AgentEvent = &event;
+        if let AgentEvent::SessionUsage(sample) = msg {
             usage.record(sample);
         }
 
@@ -212,15 +243,15 @@ async fn stream_output<W: io::Write>(
         // with the event we are about to print. Observing the `Ended` event
         // for a failed turn does not change the count or provider, so the
         // value is identical before and after the observation.
-        let note = match &msg {
+        let note = match msg {
             AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { .. } }) => Some(tracker.failure_note()),
             _ => None,
         };
-        tracker.observe(&msg);
+        tracker.observe(msg);
 
         // Counts for the end-of-run summary; independent of `--events` so a
         // filtered run still reports how many turns and tool calls happened.
-        summary.record(&msg);
+        summary.record(msg);
 
         // Update the live stderr progress line (Text mode only — Json/Pretty
         // are machine-readable and must not be polluted with control codes).
@@ -231,26 +262,26 @@ async fn stream_output<W: io::Write>(
         // reporter is never set active in quiet mode.
         if !quiet
             && matches!(format, OutputFormat::Text)
-            && let Some(update) = tool_progress_update(&msg)
+            && let Some(update) = tool_progress_update(msg)
             && let Err(error) = progress.apply(update)
         {
             eprintln!("Failed to write tool progress: {error}");
         }
 
-        match &msg {
+        match msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
             AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
             AgentEvent::Turn(TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. }) => {
                 // Sample `now` once so the live stall warning and the per-call
                 // wait tracker agree on the elapsed time.
                 let now = Instant::now();
-                provider_wait.observe(&msg, now);
-                stall.observe(&msg, now);
+                provider_wait.observe(msg, now);
+                stall.observe(msg, now);
             }
             _ => {}
         }
 
-        if let Some(meta) = tool_result_meta(&msg) {
+        if let Some(meta) = tool_result_meta(msg) {
             changes.record(meta);
         }
 
@@ -258,13 +289,13 @@ async fn stream_output<W: io::Write>(
         // here, not as a corrupt half-line on stdout. The writer ignores
         // events with no CLI event kind (streaming fragments, CallUpdate).
         if let Some(t) = transcript.as_mut()
-            && let Err(error) = t.record(&msg)
+            && let Err(error) = t.record(msg)
         {
             eprintln!("Failed to write transcript: {error}");
         }
 
-        if should_emit(&msg, events)
-            && let Err(error) = print_message(format, &msg, note.as_deref())
+        if should_emit(msg, events)
+            && let Err(error) = print_message(format, msg, note.as_deref())
         {
             eprintln!("Failed to serialize headless event: {error}");
             // Clear the live progress line so we do not leave a half-written
@@ -298,6 +329,175 @@ async fn stream_output<W: io::Write>(
         let _ = t.flush();
     }
     (exit_code, changes, summary)
+}
+
+/// Wrap the post-loop bookkeeping (clear the live progress line, print the
+/// per-turn / run / provider-wait / usage summaries, flush the transcript)
+/// the timeout branch shares with the natural loop end. Returns the distinct
+/// exit code so `stream_output`'s single call site stays uniform.
+#[allow(clippy::too_many_arguments)]
+fn finish_run_timed_out<W: io::Write>(
+    progress: &mut ToolProgressReporter<W>,
+    format: OutputFormat,
+    timings: &TurnTimings,
+    provider_wait: &ProviderWaitTracker,
+    usage: &RunUsage,
+    transcript: &mut Option<&mut JsonlTranscript>,
+    run_started_at: Instant,
+    changes: FileChanges,
+    summary: RunSummary,
+) -> (ExitCode, FileChanges, RunSummary) {
+    let run_total_elapsed = run_started_at.elapsed();
+    // Erase the live progress line so it does not bleed into the turn/run
+    // summary printed just below; clear() is a no-op when no line is active.
+    let _ = progress.clear();
+    print_turn_summary(format, timings, Some(run_total_elapsed));
+    print_provider_wait(format, provider_wait);
+    print_run_usage(format, usage);
+    if let Some(t) = transcript.as_mut() {
+        let _ = t.flush();
+    }
+    (ExitCode::from(TIMEOUT_EXIT_CODE), changes, summary)
+}
+
+/// Outcome of one iteration of `stream_output`'s timer race.
+///
+/// The headless event loop arms a stall deadline (when a provider call is
+/// in flight and not yet warned about) and a run deadline (when `--timeout`
+/// is set); both can be unset, in which case the loop falls back to a plain
+/// `recv()`. Extracted into an enum so the helper that owns the timer race
+/// can talk to the loop without an `Option`/`Result` dance.
+enum NextEvent {
+    /// `rx.recv()` produced an event (or `None` if the channel closed). The
+    /// payload is boxed so the bare variants (`TimedOut` / `Loop`) do not
+    /// enlarge the enum by the size of [`AgentEvent`].
+    Received(Option<Box<AgentEvent>>),
+    /// The caller-capped run deadline fired; the loop must exit with the
+    /// distinct timeout exit code.
+    TimedOut,
+    /// A watch latched (the stall warning fired) without reaching the run
+    /// deadline; the loop should re-arm the timers and `continue`.
+    Loop,
+}
+
+/// Wait for the next agent event while racing both watches' deadlines.
+///
+/// Falls back to `rx.recv().await` when neither deadline is set. When the
+/// earliest deadline is the stall one, `warn_if_stalled` latches the watch
+/// and the helper returns [`NextEvent::Loop`] so the caller can `continue`
+/// without re-reading. When the earliest deadline is the run timeout,
+/// `expire_if_due` writes the timeout line and the helper returns
+/// [`NextEvent::TimedOut`]; the caller exits the loop with
+/// [`crate::run_timeout::TIMEOUT_EXIT_CODE`].
+#[allow(clippy::too_many_arguments)]
+/// Either a channel event (or `None` if the channel closed) or one of the
+/// two deadlines woke the loop. Used to keep the `tokio::select!` arms in
+/// `await_with_deadlines` structurally homogeneous; without it the
+/// "deadline fired" arms need a sentinel payload to satisfy the macro's
+/// type constraint.
+enum RaceOutcome {
+    /// `rx.recv()` produced an event (or `None` if the channel closed).
+    EventReceived(Option<Box<AgentEvent>>),
+    /// The caller-capped run deadline fired; the loop must exit with the
+    /// distinct timeout exit code.
+    TimedOut,
+    /// The provider-stall deadline fired; the loop should re-arm the
+    /// timers and `continue`.
+    StallWarned,
+}
+
+async fn await_with_deadlines<W: io::Write, T: io::Write>(
+    rx: &mut mpsc::Receiver<AgentEvent>,
+    stall: &mut ProviderStallWatch<W>,
+    timeout: &mut RunTimeoutWatch<T>,
+) -> NextEvent {
+    fn received(opt: Option<AgentEvent>) -> RaceOutcome {
+        RaceOutcome::EventReceived(opt.map(Box::new))
+    }
+
+    fn try_poll_after<W: io::Write, T: io::Write>(
+        stall: &mut ProviderStallWatch<W>,
+        timeout: &mut RunTimeoutWatch<T>,
+        now: Instant,
+    ) -> Option<RaceOutcome> {
+        if timeout.expire_if_due(now).unwrap_or(false) {
+            return Some(RaceOutcome::TimedOut);
+        }
+        if stall.warn_if_stalled(now).unwrap_or(false) {
+            return Some(RaceOutcome::StallWarned);
+        }
+        None
+    }
+
+    let stall_d = stall.next_deadline();
+    let timeout_d = timeout.deadline();
+    let outcome = match (stall_d, timeout_d) {
+        (None, None) => received(rx.recv().await),
+        (Some(stall_d), None) => {
+            let tokio_deadline = TokioInstant::from_std(stall_d);
+            tokio::select! {
+                biased;
+                () = sleep_until(tokio_deadline) => {
+                    if let Err(error) = stall.warn_if_stalled(Instant::now()) {
+                        eprintln!("Failed to write provider stall warning: {error}");
+                    }
+                    RaceOutcome::StallWarned
+                }
+                maybe = rx.recv() => received(maybe),
+            }
+        }
+        (None, Some(timeout_d)) => {
+            let tokio_deadline = TokioInstant::from_std(timeout_d);
+            tokio::select! {
+                biased;
+                () = sleep_until(tokio_deadline) => {
+                    if let Err(error) = timeout.expire_if_due(Instant::now()) {
+                        eprintln!("Failed to write run timeout line: {error}");
+                    }
+                    RaceOutcome::TimedOut
+                }
+                maybe = rx.recv() => received(maybe),
+            }
+        }
+        (Some(stall_d), Some(timeout_d)) => {
+            if stall_d <= timeout_d {
+                let tokio_deadline = TokioInstant::from_std(stall_d);
+                tokio::select! {
+                    biased;
+                    () = sleep_until(tokio_deadline) => {
+                        let now = Instant::now();
+                        if let Some(race) = try_poll_after(stall, timeout, now) {
+                            race
+                        } else {
+                            // Race resolved without either firing (e.g. an
+                            // event landed between the timer arm and the
+                            // wakeup). Fall through to a plain recv().
+                            received(rx.recv().await)
+                        }
+                    }
+                    maybe = rx.recv() => received(maybe),
+                }
+            } else {
+                let tokio_deadline = TokioInstant::from_std(timeout_d);
+                tokio::select! {
+                    biased;
+                    () = sleep_until(tokio_deadline) => {
+                        if let Some(race) = try_poll_after(stall, timeout, Instant::now()) {
+                            race
+                        } else {
+                            received(rx.recv().await)
+                        }
+                    }
+                    maybe = rx.recv() => received(maybe),
+                }
+            }
+        }
+    };
+    match outcome {
+        RaceOutcome::EventReceived(event) => NextEvent::Received(event),
+        RaceOutcome::StallWarned => NextEvent::Loop,
+        RaceOutcome::TimedOut => NextEvent::TimedOut,
+    }
 }
 
 /// Per-run tally of turns started and tool calls made by `stream_output`.
@@ -590,7 +790,7 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -600,7 +800,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -612,7 +812,7 @@ mod tests {
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -626,7 +826,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -650,7 +850,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -667,7 +867,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 1, tool_calls: 0 });
     }
@@ -682,7 +882,7 @@ mod tests {
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -697,7 +897,7 @@ mod tests {
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
         let (_code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -755,7 +955,7 @@ mod tests {
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -776,7 +976,7 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None).await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
@@ -798,7 +998,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None).await;
         assert!(sink.windows(3).any(|w| w == b"\xe2\x8f\xba"), "non-quiet must draw the progress line: {sink:?}");
 
         // Quiet: no progress bytes at all.
@@ -806,7 +1006,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None, None).await;
         assert!(sink.is_empty(), "quiet must not write progress bytes: {sink:?}");
     }
 
@@ -836,7 +1036,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None).await;
         sink
     }
 
@@ -919,8 +1119,38 @@ mod tests {
 
         let threshold = Duration::from_millis(50);
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), false, io::sink(), None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), Some(threshold), false, io::sink(), None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    /// The expiry path that TASK-25-18 tests. The channel is held open (the
+    /// sender is kept alive) so `rx.recv()` would otherwise block forever;
+    /// `run_started_at` is set in the past so the run deadline is already due
+    /// on the first iteration. The `biased` `sleep_until` arm fires without
+    /// any real time elapsing, the `RunTimeoutWatch` writes its line, and the
+    /// loop returns the distinct timeout exit code instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn stream_output_expires_with_timeout_exit_code() {
+        // Future date arithmetic: subtract a large-but-representable duration
+        // from the current `Instant` so the deadline has already passed even on
+        // a freshly-initialised runtime. 32-bit platforms support a span of
+        // ~136 years, so any combination of `<limit> + 1s` is well under the
+        // ceiling.
+        let (_keep_tx, rx) = mpsc::channel::<AgentEvent>(1);
+        let limit = Duration::from_secs(30);
+        let started = Instant::now()
+            .checked_sub(limit + Duration::from_secs(1))
+            .expect("`Instant - 31s` must remain representable on the test runtime");
+        let (code, _changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], started, None, false, io::sink(), None, Some(limit)).await;
+        assert_eq!(
+            code,
+            ExitCode::from(crate::run_timeout::TIMEOUT_EXIT_CODE),
+            "loop must exit with the distinct timeout exit code"
+        );
+        assert_ne!(code, ExitCode::FAILURE, "timeout exit code must differ from generic failure");
+        assert_ne!(code, ExitCode::SUCCESS, "timeout exit code must differ from a successful run");
     }
 
     #[test]

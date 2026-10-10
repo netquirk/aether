@@ -17,6 +17,7 @@ pub(crate) mod prompt;
 pub mod provider_connection_args;
 pub(crate) mod provider_stall;
 pub mod resolve;
+pub(crate) mod run_timeout;
 pub(crate) mod run_usage;
 pub mod runtime;
 pub mod sandbox;
