@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
             Ok(LlmResponse::Usage { tokens }) => {
                 eprintln!("\n\n[usage] input={} output={}", tokens.input_tokens, tokens.output_tokens);
             }
-            Ok(LlmResponse::Done { stop_reason }) => {
+            Ok(LlmResponse::Done { stop_reason, .. }) => {
                 eprintln!("[done] stop_reason={stop_reason:?}");
             }
             Ok(_) => {}

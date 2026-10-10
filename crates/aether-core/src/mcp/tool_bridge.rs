@@ -401,7 +401,8 @@ mod tests {
         assert!(result.result.contains("TAIL_SENTINEL"));
         // The elided marker advertises how much of the data was dropped.
         assert!(result.result.contains(" elided "));
-        let saved = std::fs::read_dir(dir.path()).unwrap().find_map(Result::ok).expect("cap wrote the full output to disk");
+        let saved =
+            std::fs::read_dir(dir.path()).unwrap().find_map(Result::ok).expect("cap wrote the full output to disk");
         let on_disk = std::fs::read_to_string(saved.path()).unwrap();
         // The file holds the full YAML-encoded result byte-for-byte.
         assert!(on_disk.contains("TAIL_SENTINEL"));

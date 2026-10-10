@@ -43,6 +43,8 @@ pub enum LlmResponse {
     },
     Done {
         stop_reason: Option<StopReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_request_id: Option<String>,
     },
     Error {
         message: String,
@@ -85,10 +87,18 @@ impl LlmResponse {
     }
 
     pub fn done() -> Self {
-        Self::Done { stop_reason: None }
+        Self::Done { stop_reason: None, provider_request_id: None }
     }
 
     pub fn done_with_stop_reason(stop_reason: StopReason) -> Self {
-        Self::Done { stop_reason: Some(stop_reason) }
+        Self::Done { stop_reason: Some(stop_reason), provider_request_id: None }
+    }
+
+    /// Construct a terminal `Done` event that carries the provider-side request id
+    /// (taken from the response body or from response headers by the parser that
+    /// observed it). When the provider does not return an id, callers should still
+    /// surface `None` — there is no synthetic placeholder.
+    pub fn done_with_request_id(stop_reason: Option<StopReason>, provider_request_id: Option<String>) -> Self {
+        Self::Done { stop_reason, provider_request_id }
     }
 }

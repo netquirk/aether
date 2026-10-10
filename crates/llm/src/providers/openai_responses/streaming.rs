@@ -118,6 +118,8 @@ pub struct ResponsesCompletedEvent {
 #[derive(Debug, Deserialize)]
 pub struct ResponsesCompleted {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub usage: Option<ResponsesUsage>,
     #[serde(default)]
     pub status: Option<Status>,
@@ -151,6 +153,7 @@ where
         let mut last_stop_reason: Option<StopReason> = None;
         let mut started = false;
         let mut terminal = false;
+        let mut provider_request_id: Option<String> = None;
 
         while let Some(result) = stream.next().await {
             let event = match result {
@@ -171,7 +174,7 @@ where
             }
 
             terminal = matches!(event, ResponsesStreamEvent::Completed(_) | ResponsesStreamEvent::Incomplete(_));
-            let responses = process_event(event, &mut tool_collector, &mut last_stop_reason);
+            let responses = process_event(event, &mut tool_collector, &mut last_stop_reason, &mut provider_request_id);
             let event_failed = responses.iter().any(Result::is_err);
             for response in responses {
                 yield response;
@@ -189,7 +192,7 @@ where
         }
 
         if terminal {
-            yield Ok(LlmResponse::Done { stop_reason: last_stop_reason });
+            yield Ok(LlmResponse::Done { stop_reason: last_stop_reason, provider_request_id });
         } else {
             yield Err(ProviderError::stream_interrupted(
                 "Responses stream ended before a terminal response event".to_string(),
@@ -214,6 +217,7 @@ fn process_event(
     event: ResponsesStreamEvent,
     tool_collector: &mut ToolCallCollector<u32>,
     last_stop_reason: &mut Option<StopReason>,
+    provider_request_id: &mut Option<String>,
 ) -> Vec<Result<LlmResponse>> {
     let mut responses = Vec::new();
     let incomplete = matches!(&event, ResponsesStreamEvent::Incomplete(_));
@@ -250,6 +254,12 @@ fn process_event(
             }
         }
         ResponsesStreamEvent::Completed(e) | ResponsesStreamEvent::Incomplete(e) => {
+            if provider_request_id.is_none()
+                && let Some(id) = e.response.id.as_ref()
+                && !id.is_empty()
+            {
+                *provider_request_id = Some(id.clone());
+            }
             if let Some(usage) = e.response.usage {
                 responses.push(Ok(LlmResponse::Usage { tokens: usage.into() }));
             }
@@ -314,7 +324,7 @@ mod tests {
             responses[3],
             LlmResponse::Usage { tokens } if tokens.input_tokens.get() == 10 && tokens.output_tokens.get() == 5
         ));
-        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }));
+        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }));
     }
 
     #[tokio::test]
@@ -476,7 +486,7 @@ mod tests {
     async fn test_incomplete_status_gives_length_stop_reason() {
         let responses = collect_responses(vec![completed(Status::Incomplete, None)]).await;
 
-        assert!(matches!(responses.last().unwrap(), LlmResponse::Done { stop_reason: Some(StopReason::Length) }));
+        assert!(matches!(responses.last().unwrap(), LlmResponse::Done { stop_reason: Some(StopReason::Length), .. }));
     }
 
     #[tokio::test]
@@ -563,7 +573,7 @@ mod tests {
         let usage = fixture_usage(&responses).expect("fixture should report usage");
         assert!(!usage.input_tokens.is_zero(), "input_tokens should be > 0: {usage:?}");
         assert!(!usage.output_tokens.is_zero(), "output_tokens should be > 0: {usage:?}");
-        assert!(matches!(responses.last(), Some(Ok(LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }))));
+        assert!(matches!(responses.last(), Some(Ok(LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }))));
     }
 
     #[tokio::test]
@@ -619,7 +629,8 @@ mod tests {
 
         let mut tool_collector = ToolCallCollector::<u32>::new();
         let mut stop_reason = None;
-        let responses = process_event(event, &mut tool_collector, &mut stop_reason);
+        let mut provider_request_id = None;
+        let responses = process_event(event, &mut tool_collector, &mut stop_reason, &mut provider_request_id);
 
         assert_eq!(responses.len(), 1);
         assert!(
@@ -677,7 +688,9 @@ mod tests {
                 && tokens.output_tokens.get() == 20
                 && tokens.reasoning_tokens.is_some_and(|tokens| tokens.get() == 10)
         ));
-        assert!(matches!(responses.last().unwrap(), LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }));
+        assert!(
+            matches!(responses.last().unwrap(), LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), provider_request_id: Some(id) } if id == "resp_1")
+        );
     }
 
     #[test]
@@ -689,7 +702,8 @@ mod tests {
 
         let mut tool_collector = ToolCallCollector::<u32>::new();
         let mut stop_reason = None;
-        let responses = process_event(event, &mut tool_collector, &mut stop_reason);
+        let mut provider_request_id = None;
+        let responses = process_event(event, &mut tool_collector, &mut stop_reason, &mut provider_request_id);
 
         assert!(responses.is_empty());
     }
@@ -711,7 +725,7 @@ mod tests {
 
     fn completed(status: Status, usage: Option<ResponsesUsage>) -> ResponsesStreamEvent {
         ResponsesStreamEvent::Completed(ResponsesCompletedEvent {
-            response: ResponsesCompleted { usage, status: Some(status) },
+            response: ResponsesCompleted { id: None, usage, status: Some(status) },
         })
     }
 

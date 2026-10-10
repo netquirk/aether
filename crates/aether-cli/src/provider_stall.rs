@@ -141,7 +141,7 @@ mod tests {
     fn llm_chat_ended() -> AgentEvent {
         AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None },
         })
     }
 

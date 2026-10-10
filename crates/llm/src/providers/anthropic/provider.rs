@@ -133,7 +133,7 @@ impl AnthropicProvider {
         &self,
         request: Request,
         headers: header::HeaderMap,
-    ) -> Result<impl futures::Stream<Item = Result<String>>> {
+    ) -> Result<(impl futures::Stream<Item = Result<String>>, Option<String>)> {
         let base_url = self.base_url.as_deref().unwrap_or("https://api.anthropic.com");
         let url = format!("{base_url}/v1/messages");
 
@@ -150,6 +150,9 @@ impl AnthropicProvider {
             return Err(rejected(response, anthropic_code).await.into());
         }
 
+        // Anthropic surfaces the per-request id as the `request-id` response header.
+        let request_id = response.headers().get("request-id").and_then(|value| value.to_str().ok()).map(str::to_string);
+
         let event_stream = response.bytes_stream().eventsource();
         let processed_stream = event_stream.filter_map(|result| {
             std::future::ready(match result {
@@ -161,7 +164,7 @@ impl AnthropicProvider {
             })
         });
 
-        Ok(processed_stream)
+        Ok((processed_stream, request_id))
     }
 }
 
@@ -213,14 +216,14 @@ impl StreamingModelProvider for AnthropicProvider {
             };
 
             let stream = match provider.send_request(request, headers).await {
-                Ok(stream) => stream,
+                Ok((stream, request_id)) => (stream, request_id),
                 Err(e) => {
                     yield Err(e);
                     return;
                 }
             };
 
-            let mut anthropic_stream = Box::pin(process_anthropic_stream(stream));
+            let mut anthropic_stream = Box::pin(process_anthropic_stream(stream.0, stream.1));
             while let Some(result) = anthropic_stream.next().await {
                 yield result;
             }

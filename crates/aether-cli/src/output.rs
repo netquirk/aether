@@ -205,6 +205,13 @@ pub(crate) fn print_message(
     Ok(())
 }
 
+// `format_text` is a per-event switch over the entire `AgentEvent` enum;
+// each branch is a one-line `format!` and merging them into a helper would
+// only shuffle the same lines around, so suppress the line-count lint
+// locally. The TASK-25-421 addition at line ~260 adds one branch (the
+// `Failed { will_retry: true, .. }` arm) and the helper still covers every
+// variant without re-shaping the call sites.
+#[allow(clippy::too_many_lines)]
 fn format_text(message: &AgentEvent, retry_note: Option<&str>) -> Option<String> {
     match message {
         AgentEvent::Message(MessageEvent::Text { chunk, is_complete: true, .. }) => Some(chunk.clone()),
@@ -775,14 +782,14 @@ mod tests {
     fn llm_chat_ended() -> AgentEvent {
         AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: llm::LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None },
         })
     }
 
     fn llm_compaction_ended() -> AgentEvent {
         AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: llm::LlmCallPurpose::Compaction,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None },
         })
     }
 

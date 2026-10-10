@@ -116,7 +116,7 @@ async fn test_parallel_tool_calls() {
     assert_eq!(tool_args, 4, "Should have 4 tool argument chunks");
     assert_eq!(tool_completions, 2, "Should have 2 tool completions");
 
-    assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls) })));
+    assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls), .. })));
 }
 
 #[tokio::test]
@@ -143,4 +143,62 @@ async fn test_tool_call_followed_by_content() {
     assert!(tool_completion_index.is_some());
     assert!(text_index.is_some());
     assert!(tool_completion_index.unwrap() < text_index.unwrap(), "Tool completion should come before text content");
+}
+
+/// TASK-25-421: the OpenAI-compatible parser threads the SSE body's per-chunk
+/// `id` onto the terminal `Done` event so the headless loop can record the
+/// provider-side request id on the run log. The id is taken from the *first*
+/// non-empty chunk; later chunks may repeat the same id and are ignored. A
+/// stream of empty-id chunks leaves `provider_request_id` as `None` so a
+/// missing-id response stays absent in the log (no placeholder).
+#[tokio::test]
+async fn process_completion_stream_threads_provider_request_id_from_chunk_id() {
+    let events = collect_events(vec![
+        chunk_with_id("chatcmpl-abc123", None, Some("hello"), None),
+        chunk_with_id("chatcmpl-abc123", None, Some(" world"), Some(FinishReason::Stop)),
+    ])
+    .await;
+    match events.last() {
+        Some(LlmResponse::Done { provider_request_id, stop_reason, .. }) => {
+            assert_eq!(
+                provider_request_id.as_deref(),
+                Some("chatcmpl-abc123"),
+                "the first non-empty chunk id must be threaded onto Done"
+            );
+            assert_eq!(stop_reason, &Some(StopReason::EndTurn));
+        }
+        other => panic!("expected terminal Done, got {other:?}"),
+    }
+}
+
+/// TASK-25-421 (companion): when every chunk carries an empty `id`, the
+/// parser must leave `provider_request_id` as `None` so a missing-id response
+/// stays absent in the run log — no `Some("")` placeholder, no `Some("none")`.
+#[tokio::test]
+async fn process_completion_stream_leaves_provider_request_id_none_when_chunks_carry_no_id() {
+    let events = collect_events(vec![
+        chunk_with_id("", None, Some("hello"), None),
+        chunk_with_id("", None, Some(" world"), Some(FinishReason::Stop)),
+    ])
+    .await;
+    match events.last() {
+        Some(LlmResponse::Done { provider_request_id, .. }) => {
+            assert!(
+                provider_request_id.is_none(),
+                "empty chunk ids must leave provider_request_id as None (no placeholder); got {provider_request_id:?}"
+            );
+        }
+        other => panic!("expected terminal Done, got {other:?}"),
+    }
+}
+
+fn chunk_with_id(
+    id: &str,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    content: Option<&str>,
+    finish_reason: Option<FinishReason>,
+) -> CreateChatCompletionStreamResponse {
+    let mut c = chunk(tool_calls, content, finish_reason);
+    c.id = id.to_string();
+    c
 }

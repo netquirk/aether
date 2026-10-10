@@ -119,14 +119,7 @@ impl JsonlTranscript {
     /// rotation (matching the `max_bytes = 0` convention used elsewhere).
     pub fn create_with_max_bytes(path: &Path, max_bytes: Option<u64>) -> io::Result<Self> {
         let writer = BufWriter::new(File::create(path)?);
-        Ok(Self {
-            writer,
-            turn: 0,
-            path: path.to_path_buf(),
-            max_bytes,
-            bytes_written: 0,
-            header: None,
-        })
+        Ok(Self { writer, turn: 0, path: path.to_path_buf(), max_bytes, bytes_written: 0, header: None })
     }
 
     /// Write the self-describing header line that will be the first line of
@@ -144,11 +137,7 @@ impl JsonlTranscript {
     /// stored header without rewriting the on-disk copy already flushed to
     /// the live file.
     pub fn write_header(&mut self, aether_version: &str, started_at: &str) -> io::Result<()> {
-        let header = TranscriptHeader {
-            kind: "header",
-            aether_version,
-            started_at,
-        };
+        let header = TranscriptHeader { kind: "header", aether_version, started_at };
         let mut bytes = serde_json::to_vec(&header).map_err(io::Error::other)?;
         bytes.push(b'\n');
         self.writer.write_all(&bytes)?;
@@ -576,9 +565,7 @@ mod tests {
 
         let mut transcript = JsonlTranscript::create(&path).expect("create writer");
         transcript.write_header(env!("CARGO_PKG_VERSION"), started_at).expect("write header");
-        transcript
-            .record(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }))
-            .expect("record writes");
+        transcript.record(&AgentEvent::Turn(TurnEvent::Started { content: vec![] })).expect("record writes");
         transcript.flush().expect("flush");
 
         // Read back: the file must be exactly two non-empty lines (the header
@@ -586,22 +573,15 @@ mod tests {
         // line and that every line is newline-terminated.
         let contents = std::fs::read_to_string(&path).expect("read file");
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "expected two lines (header + turn_started); got {lines:?}"
-        );
-        assert!(
-            contents.ends_with('\n'),
-            "transcript must be newline-terminated to keep one record per line"
-        );
+        assert_eq!(lines.len(), 2, "expected two lines (header + turn_started); got {lines:?}");
+        assert!(contents.ends_with('\n'), "transcript must be newline-terminated to keep one record per line");
 
         // Header line: a JSON object with `type == "header"` and the two
         // self-describing fields populated. The version matches the
         // crate's `CARGO_PKG_VERSION` (same source `version::aether_version`
         // reads from).
-        let header: serde_json::Value =
-            serde_json::from_str(lines[0]).unwrap_or_else(|error| panic!("header line is not JSON: {error}; line={:?}", lines[0]));
+        let header: serde_json::Value = serde_json::from_str(lines[0])
+            .unwrap_or_else(|error| panic!("header line is not JSON: {error}; line={:?}", lines[0]));
         assert!(header.is_object(), "header must be a JSON object: {header:?}");
         assert_eq!(header["type"], "header", "header `type` must be \"header\"; got {header:?}");
         assert_eq!(
@@ -611,10 +591,7 @@ mod tests {
         );
         let started_at_value =
             header["startedAt"].as_str().unwrap_or_else(|| panic!("header missing `startedAt` string: {header:?}"));
-        assert_eq!(
-            started_at_value, started_at,
-            "header must echo the run's wall-clock start time verbatim"
-        );
+        assert_eq!(started_at_value, started_at, "header must echo the run's wall-clock start time verbatim");
         // Confirm the value is itself a valid RFC-3339 timestamp by
         // re-parsing it through a strict RFC-3339 parser. Catches typos like
         // `2026-10-10 08:53:59+00:00` that happen to serialise as JSON
@@ -625,8 +602,8 @@ mod tests {
         // The second line is the recorded `turn_started` event, proving the
         // header precedes the per-event records (not just that the header
         // happens to be on disk).
-        let event: serde_json::Value =
-            serde_json::from_str(lines[1]).unwrap_or_else(|error| panic!("event line is not JSON: {error}; line={:?}", lines[1]));
+        let event: serde_json::Value = serde_json::from_str(lines[1])
+            .unwrap_or_else(|error| panic!("event line is not JSON: {error}; line={:?}", lines[1]));
         assert_eq!(event["turn"], 1, "second line is the first turn's first event");
         assert_eq!(event["type"], "turn_started");
     }
@@ -658,13 +635,9 @@ mod tests {
         assert!(rotated.exists(), "rotation must produce a sibling: {rotated:?}");
         let rotated_contents = std::fs::read_to_string(&rotated).expect("read rotated");
         let rotated_lines: Vec<&str> = rotated_contents.lines().collect();
-        assert_eq!(
-            rotated_lines.len(),
-            2,
-            "rotated sibling holds header + first event; got {rotated_lines:?}"
-        );
-        let rotated_header: serde_json::Value =
-            serde_json::from_str(rotated_lines[0]).unwrap_or_else(|error| panic!("rotated header is not JSON: {error}"));
+        assert_eq!(rotated_lines.len(), 2, "rotated sibling holds header + first event; got {rotated_lines:?}");
+        let rotated_header: serde_json::Value = serde_json::from_str(rotated_lines[0])
+            .unwrap_or_else(|error| panic!("rotated header is not JSON: {error}"));
         assert_eq!(rotated_header["type"], "header");
         assert_eq!(rotated_header["aetherVersion"], env!("CARGO_PKG_VERSION"));
         assert_eq!(rotated_header["startedAt"], started_at);

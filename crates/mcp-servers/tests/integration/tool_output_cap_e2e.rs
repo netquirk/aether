@@ -41,10 +41,7 @@ async fn bash_tool_one_mib_output_gets_capped_and_full_bytes_recoverable() -> Te
     //    terminates cleanly at exactly PAYLOAD_BYTES. Using a non-empty
     //    argument keeps every line non-blank, which is what the bridge's
     //    YAML round-trip filter requires to pick YAML over the JSON fallback.
-    let bash_input = BashInput {
-        command: format!("yes y | head -c {PAYLOAD_BYTES}"),
-        ..Default::default()
-    };
+    let bash_input = BashInput { command: format!("yes y | head -c {PAYLOAD_BYTES}"), ..Default::default() };
     let raw = workspace
         .client
         .call_raw("bash", &bash_input)
@@ -85,12 +82,7 @@ async fn bash_tool_one_mib_output_gets_capped_and_full_bytes_recoverable() -> Te
     // 4. The model-visible result must be at most the cap, must start with
     //    the truncation marker, and must contain the on-disk path so the
     //    model can read the file back.
-    assert!(
-        capped.result.len() <= CAP_BYTES,
-        "capped result {} bytes exceeds cap {}",
-        capped.result.len(),
-        CAP_BYTES,
-    );
+    assert!(capped.result.len() <= CAP_BYTES, "capped result {} bytes exceeds cap {}", capped.result.len(), CAP_BYTES,);
     assert!(
         capped.result.starts_with("[aether: output truncated;"),
         "capped result missing truncation marker: {}",

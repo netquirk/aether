@@ -46,7 +46,7 @@ async fn openai_minimal_ends_with_done() {
     let events = parse_fixture("01_minimal").await;
     let last = events.last().expect("at least one event");
     assert!(
-        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }),
+        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }),
         "last event should be Done(EndTurn), got: {last:?}"
     );
 }

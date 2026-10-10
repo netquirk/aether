@@ -160,7 +160,7 @@ fn turn_entries_name_each_turns_model_from_persisted_events() {
         llm_call_started(LlmCallPurpose::Chat, Some("codex"), Some("gpt-5.5"), "codex"),
         SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None },
         })),
         assistant_text("m1", "first answer"),
         turn_ended(TurnOutcome::Completed),
@@ -169,7 +169,7 @@ fn turn_entries_name_each_turns_model_from_persisted_events() {
         llm_call_started(LlmCallPurpose::Chat, Some("anthropic"), Some("claude-opus-4-6"), "Anthropic"),
         SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None },
         })),
         assistant_text("m2", "second answer"),
         turn_ended(TurnOutcome::Failed { error: "boom".into() }),

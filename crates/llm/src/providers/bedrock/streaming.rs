@@ -42,6 +42,7 @@ enum StreamEvent {
 
 pub fn process_bedrock_stream(
     mut receiver: EventReceiver<ConverseStreamOutput, ConverseStreamOutputError>,
+    provider_request_id: Option<String>,
 ) -> impl Stream<Item = crate::Result<LlmResponse>> + Send {
     async_stream::stream! {
         yield Ok(LlmResponse::Start);
@@ -82,6 +83,7 @@ pub fn process_bedrock_stream(
 
         yield Ok(LlmResponse::Done {
             stop_reason: last_stop_reason,
+            provider_request_id,
         });
     }
 }

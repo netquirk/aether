@@ -217,7 +217,11 @@ async fn completed_llm_calls_capture_finish_reasons() -> Result<(), Box<dyn Erro
     ];
     let mut events = vec![AgentEvent::Turn(TurnEvent::Started { content: vec![] })];
     for (index, (stop_reason, _)) in cases.iter().enumerate() {
-        let outcome = LlmCallOutcome::Completed { stop_reason: Some(stop_reason.clone()), usage: None };
+        let outcome = LlmCallOutcome::Completed {
+            stop_reason: Some(stop_reason.clone()),
+            usage: None,
+            provider_request_id: None,
+        };
         events.extend(chat_call("test", &format!("model-{index}"), outcome));
     }
     events.push(AgentEvent::turn_ended(TurnOutcome::Completed));
@@ -260,7 +264,7 @@ async fn completed_llm_calls_emit_posthog_custom_pricing_and_token_properties() 
         }),
         AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage) },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage), provider_request_id: None },
         }),
         AgentEvent::turn_ended(TurnOutcome::Completed),
     ]);
@@ -288,7 +292,11 @@ async fn completed_llm_calls_capture_token_usage_breakdown() -> Result<(), Box<d
         ..TokenUsage::new(100, 20)
     };
     let mut events = vec![AgentEvent::Turn(TurnEvent::Started { content: vec![] })];
-    events.extend(chat_call("test", "model", LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage) }));
+    events.extend(chat_call(
+        "test",
+        "model",
+        LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage), provider_request_id: None },
+    ));
     events.push(AgentEvent::turn_ended(TurnOutcome::Completed));
 
     let telemetry = otel_test().redacting().observe_trace(&AgentTrace::from_events(events));
@@ -381,7 +389,7 @@ async fn compaction_call_is_tagged_and_parented_to_the_turn() -> Result<(), Box<
 
 #[tokio::test]
 async fn provider_names_map_to_genai_semconv() -> Result<(), Box<dyn Error>> {
-    let completed = || LlmCallOutcome::Completed { stop_reason: None, usage: None };
+    let completed = || LlmCallOutcome::Completed { stop_reason: None, usage: None, provider_request_id: None };
     let mut events = vec![AgentEvent::Turn(TurnEvent::Started { content: vec![] })];
     events.extend(chat_call("gemini", "gemini-2.5-pro", completed()));
     events.extend(chat_call("my-custom-proxy", "custom-model", completed()));

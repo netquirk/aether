@@ -106,6 +106,12 @@ impl Transcript {
         self.header.as_ref()
     }
 
+    // `TranscriptError` aggregates several large variant payloads; the size trips
+    // `clippy::result_large_err` on a recent compiler but the size is
+    // intentional (the error carries the full offending transcript so a
+    // caller can render a useful diagnostic). Suppress locally so the
+    // TASK-25-421 changes do not have to refactor an unrelated type.
+    #[allow(clippy::result_large_err)]
     pub async fn from_stream<T: Stream<Item = AgentRunResult>>(stream: T) -> Result<Self, TranscriptError> {
         let mut transcript = Self::default();
         futures::pin_mut!(stream);
@@ -529,7 +535,7 @@ mod tests {
     fn llm_call_ended(usage: TokenUsage) -> AgentEvent {
         AgentEvent::Turn(TurnEvent::LlmCallEnded {
             purpose: LlmCallPurpose::Chat,
-            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage) },
+            outcome: LlmCallOutcome::Completed { stop_reason: None, usage: Some(usage), provider_request_id: None },
         })
     }
 

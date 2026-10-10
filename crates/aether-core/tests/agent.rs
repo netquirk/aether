@@ -8,6 +8,7 @@ mod agent {
     mod harness_tests;
     mod model_switch_tests;
     mod prompt_cache_tests;
+    mod provider_request_id_tests;
     mod queued_message_tests;
     mod refusal_tests;
     mod repetition_tests;

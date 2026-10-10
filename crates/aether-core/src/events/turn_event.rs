@@ -28,6 +28,13 @@ pub enum LlmCallOutcome {
     Completed {
         stop_reason: Option<StopReason>,
         usage: Option<TokenUsage>,
+        /// Provider-side request id (response body id or response header), as
+        /// reported by the streaming parser on the terminal `Done` event.
+        /// Surfaced on the run log so each turn can be traced back to the
+        /// provider's request. `None` means the provider did not return one;
+        /// the run log records none in that case rather than a placeholder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_request_id: Option<String>,
     },
     Failed {
         error: String,
@@ -73,6 +80,23 @@ impl LlmCallOutcome {
             provider_request_id: provider.request_id.clone(),
             provider_error_code: provider.code.clone(),
             kind: Some(provider.kind),
+        }
+    }
+
+    /// Provider-side request id this outcome carries, when the call returned
+    /// one (`Completed` from a parsed streaming response, `Failed` from a
+    /// provider-side error that arrived with a request id header). `None`
+    /// when the outcome does not have an id to report — the run log records
+    /// none in that case rather than a placeholder.
+    pub fn provider_request_id(&self) -> Option<&str> {
+        // Both `Completed` and `Failed` carry an identically-named
+        // `provider_request_id: Option<String>`; merging the arms keeps the
+        // accessor DRY without losing the per-variant documentation above.
+        match self {
+            Self::Completed { provider_request_id, .. } | Self::Failed { provider_request_id, .. } => {
+                provider_request_id.as_deref()
+            }
+            Self::Cancelled => None,
         }
     }
 }

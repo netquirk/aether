@@ -15,7 +15,7 @@ async fn parse_fixture(scenario: &str) -> Vec<LlmResponse> {
     let bytes = read_fixture("anthropic", scenario);
     let lines = parse_sse_data_lines(&bytes);
     let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-    let mut processed = Box::pin(process_anthropic_stream(stream));
+    let mut processed = Box::pin(process_anthropic_stream(stream, None));
     let mut events = Vec::new();
     while let Some(event) = processed.next().await {
         events.push(event.expect("stream item should not error"));
@@ -35,7 +35,7 @@ async fn anthropic_minimal_ends_with_done() {
     let events = parse_fixture("01_minimal").await;
     let last = events.last().expect("at least one event");
     assert!(
-        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }),
+        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }),
         "last event should be Done(EndTurn), got: {last:?}"
     );
 }
@@ -48,7 +48,7 @@ async fn anthropic_tool_call_emits_tool_request() {
 
     let last = events.last().expect("at least one event");
     assert!(
-        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls) }),
+        matches!(last, LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls), .. }),
         "tool_call fixture should end with Done(ToolCalls), got: {last:?}"
     );
 

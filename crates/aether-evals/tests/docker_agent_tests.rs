@@ -5,6 +5,7 @@ use aether_evals::{
 };
 
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::result_large_err)] // see crates/aether-evals/src/agents/transcript.rs for the rationale.
 enum DockerAgentTestError {
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
@@ -14,6 +15,7 @@ enum DockerAgentTestError {
     Transcript(#[from] TranscriptError),
 }
 
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn docker_agent_direct_agent_event_eval() -> Result<(), DockerAgentTestError> {
     let workspace = Workspace::empty()?;
@@ -33,6 +35,7 @@ async fn docker_agent_direct_agent_event_eval() -> Result<(), DockerAgentTestErr
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn container_exec_shell_returns_non_zero_exit_codes() -> Result<(), DockerAgentTestError> {
     let workspace = Workspace::empty()?;

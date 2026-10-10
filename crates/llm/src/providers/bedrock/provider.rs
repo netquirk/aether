@@ -9,6 +9,7 @@ use aws_config::Region;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Credentials};
 use aws_sdk_bedrockruntime::error::SdkError;
+use aws_sdk_bedrockruntime::operation::RequestId as _;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
@@ -114,7 +115,7 @@ impl BedrockProvider {
     async fn send_converse_stream(
         &self,
         context: &Context,
-    ) -> Result<EventReceiver<ConverseStreamOutput, ConverseStreamOutputError>> {
+    ) -> Result<(EventReceiver<ConverseStreamOutput, ConverseStreamOutputError>, Option<String>)> {
         let cache_point =
             self.model().is_some_and(|m| m.supports_prompt_caching()).then(default_cache_point).transpose()?;
         let (system_blocks, messages) = map_messages(context.messages(), cache_point.as_ref())?;
@@ -159,7 +160,14 @@ impl BedrockProvider {
             LlmError::from(e)
         })?;
 
-        Ok(response.stream)
+        // Bedrock exposes the per-response AWS request id through the
+        // `RequestId` trait accessor. Capture it so the terminal `Done` event
+        // can carry the request id the provider served for this turn. Without
+        // an id on the response the value is `None`; the run log records none
+        // in that case rather than a placeholder.
+        let request_id = response.request_id().map(str::to_string);
+
+        Ok((response.stream, request_id))
     }
 }
 
@@ -194,7 +202,10 @@ impl StreamingModelProvider for BedrockProvider {
         let context = context.clone();
 
         let Some(transport) = self.mantle_transport() else {
-            return stream_from(async move { provider.send_converse_stream(&context).await }, process_bedrock_stream);
+            return stream_from(
+                async move { provider.send_converse_stream(&context).await },
+                |(receiver, request_id)| process_bedrock_stream(receiver, request_id),
+            );
         };
 
         if let Some(arn) = self.inference_profile_arn.as_deref() {

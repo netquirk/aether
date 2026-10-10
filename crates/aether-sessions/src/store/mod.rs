@@ -237,10 +237,7 @@ fn read_session_preview(path: &Path, limits: ScanLimits) -> Result<SessionPrevie
             {
                 truncated = true;
             }
-            SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Call { .. })) => {
-                tool_call_count += 1;
-            }
-            SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Refused { .. })) => {
+            SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Call { .. } | ToolEvent::Refused { .. })) => {
                 tool_call_count += 1;
             }
             _ => {}

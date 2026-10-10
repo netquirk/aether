@@ -98,7 +98,7 @@ impl LlmCallState {
 
     pub(crate) fn finish(mut self, outcome: &LlmCallOutcome) {
         match outcome {
-            LlmCallOutcome::Completed { stop_reason, usage } => {
+            LlmCallOutcome::Completed { stop_reason, usage, .. } => {
                 let finish_reason = stop_reason.as_ref().map(genai_finish_reason);
                 if let Some(output) = output_messages_json(
                     self.output.get(),

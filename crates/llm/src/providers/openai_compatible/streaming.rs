@@ -59,11 +59,20 @@ pub fn process_compatible_stream<E: Into<LlmError> + Send>(
         let mut had_tool_calls = false;
         let mut last_stop_reason: Option<StopReason> = None;
         let mut saw_usage = false;
+        let mut provider_request_id: Option<String> = None;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(mut response) => {
                     chunk_count += 1;
+
+                    // The SSE body carries a per-response `id` (OpenAI, OpenRouter,
+                    // Z.ai, Ollama). Capture it the first time it is non-empty so the
+                    // terminal `Done` event can carry the request id the provider
+                    // served for this turn.
+                    if provider_request_id.is_none() && !response.id.is_empty() {
+                        provider_request_id = Some(response.id);
+                    }
 
                     if let Some(usage) = response.usage {
                         saw_usage = true;
@@ -163,6 +172,7 @@ pub fn process_compatible_stream<E: Into<LlmError> + Send>(
 
         yield Ok(LlmResponse::Done {
             stop_reason: last_stop_reason,
+            provider_request_id,
         });
     }
 }
@@ -240,7 +250,7 @@ mod tests {
 
         assert!(matches!(events[0], LlmResponse::Start));
         assert!(matches!(events[1], LlmResponse::Reasoning { ref chunk } if chunk == "thinking"));
-        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) })));
+        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. })));
     }
 
     #[tokio::test]
@@ -312,7 +322,7 @@ mod tests {
                 .any(|e| matches!(e, LlmResponse::ToolRequestStart { id, name } if id == "call_1" && name == "tool"))
         );
         assert!(events.iter().any(|e| matches!(e, LlmResponse::ToolRequestComplete { tool_call } if tool_call.id == "call_1" && tool_call.arguments == "{}")));
-        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls) })));
+        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls), .. })));
     }
 
     #[tokio::test]
@@ -426,7 +436,7 @@ mod tests {
         let events = run_ok(vec![response]).await;
 
         assert!(matches!(events[0], LlmResponse::Start));
-        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::Length) })));
+        assert!(matches!(events.last(), Some(LlmResponse::Done { stop_reason: Some(StopReason::Length), .. })));
     }
 
     fn chunk(

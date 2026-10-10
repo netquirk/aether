@@ -77,12 +77,12 @@ impl RunUsage {
     /// figure without re-summing. Cache / audio / reasoning dimensions are
     /// not counted: the cap tracks the same input/output pair the existing
     /// `Token usage by model:` block already prints.
+    #[allow(dead_code)] // consumed by a forthcoming `--max-tokens` flag (TASK-25-45); not yet wired in.
     pub(crate) fn total_tokens(&self) -> u64 {
         let mut total: u64 = 0;
         for entry in &self.models {
-            total = total
-                .saturating_add(entry.tokens.input_tokens.get())
-                .saturating_add(entry.tokens.output_tokens.get());
+            total =
+                total.saturating_add(entry.tokens.input_tokens.get()).saturating_add(entry.tokens.output_tokens.get());
         }
         total
     }

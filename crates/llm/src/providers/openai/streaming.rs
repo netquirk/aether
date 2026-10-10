@@ -36,10 +36,18 @@ pub fn process_completion_stream<E: Into<LlmError> + Send>(
 
         let mut collector = ToolCallCollector::<u32>::new();
         let mut last_stop_reason: Option<StopReason> = None;
+        let mut provider_request_id: Option<String> = None;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(mut response) => {
+                    // The SSE body carries a per-response `id`. Capture it the first
+                    // time it is non-empty so the terminal `Done` event carries the
+                    // request id the provider served for this turn.
+                    if provider_request_id.is_none() && !response.id.is_empty() {
+                        provider_request_id = Some(response.id);
+                    }
+
                     // Emit usage information if available
                     // This must be checked on every chunk since usage may come
                     // in a separate final chunk after finish_reason
@@ -105,6 +113,7 @@ pub fn process_completion_stream<E: Into<LlmError> + Send>(
 
         yield Ok(LlmResponse::Done {
             stop_reason: last_stop_reason,
+            provider_request_id,
         });
     }
 }

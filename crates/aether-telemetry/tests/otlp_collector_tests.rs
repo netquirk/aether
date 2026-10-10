@@ -376,6 +376,7 @@ fn events() -> Vec<AgentEvent> {
                     reasoning_tokens: Some(3.into()),
                     ..TokenUsage::new(10, 5)
                 }),
+                provider_request_id: None,
             },
         }),
         AgentEvent::turn_ended(TurnOutcome::Completed),

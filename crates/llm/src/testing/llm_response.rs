@@ -110,7 +110,7 @@ mod tests {
                 LlmResponse::Start,
                 LlmResponse::Text { .. },
                 LlmResponse::Usage { .. },
-                LlmResponse::Done { stop_reason: Some(StopReason::Length) },
+                LlmResponse::Done { stop_reason: Some(StopReason::Length), .. },
             ]
         ));
     }

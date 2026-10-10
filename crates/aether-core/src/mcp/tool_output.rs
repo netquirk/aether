@@ -413,9 +413,11 @@ mod tests {
         let again = cap_tool_output(&cap, &"a".repeat(1_000));
         assert_eq!(first.saved_path, again.saved_path, "same input yields same on-disk path");
         assert_ne!(first.saved_path, second.saved_path);
-        assert!(std::path::Path::new(first.saved_path.as_deref().unwrap().file_name().unwrap())
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("log")));
+        assert!(
+            std::path::Path::new(first.saved_path.as_deref().unwrap().file_name().unwrap())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+        );
     }
 
     #[test]

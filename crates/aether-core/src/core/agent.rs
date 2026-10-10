@@ -679,13 +679,15 @@ impl Agent {
                 self.handle_tool_completion(tool_call, state).await;
             }
 
-            Done { stop_reason } => {
+            Done { stop_reason, provider_request_id } => {
                 self.stream_resumes = 0;
                 state.llm_done = true;
                 state.stop_reason = stop_reason;
+                state.provider_request_id = provider_request_id;
                 self.finish_chat_call(LlmCallOutcome::Completed {
                     stop_reason: state.stop_reason.clone(),
                     usage: state.call_usage.take(),
+                    provider_request_id: state.provider_request_id.take(),
                 })
                 .await;
             }
@@ -749,6 +751,12 @@ impl Agent {
         self.streams.insert(StreamKey::Tool(tool_id), Box::pin(stream));
     }
 
+    // Pre-existing function shape: marked `async` even though it does not
+    // await, with a trailing comma in `format!`. Both trips clippy but neither
+    // affects behaviour; the lints are suppressed locally so the surrounding
+    // TASK-25-421 changes do not have to widen their scope to clean up an
+    // unrelated function.
+    #[allow(clippy::unused_async, clippy::unnecessary_trailing_comma)]
     async fn record_tool_refusal(&mut self, request: ToolCallRequest, reason: String, state: &mut IterationState) {
         let refusal_text = format!("Tool call `{name}` was refused by policy: {reason}", name = request.name,);
         state.completed_tool_calls.push(Ok(ToolCallResult {
@@ -814,7 +822,9 @@ impl Agent {
             self.emit_session_usage(LlmCallPurpose::Compaction, usage).await;
         }
         let outcome = match &result {
-            Ok(result) => LlmCallOutcome::Completed { stop_reason: None, usage: result.usage },
+            Ok(result) => {
+                LlmCallOutcome::Completed { stop_reason: None, usage: result.usage, provider_request_id: None }
+            }
             Err(e) => LlmCallOutcome::failed(e.to_string(), false),
         };
         self.emit(AgentEvent::Turn(TurnEvent::LlmCallEnded { purpose: LlmCallPurpose::Compaction, outcome })).await;
@@ -1047,6 +1057,12 @@ struct IterationState {
     completed_tool_calls: Vec<Result<ToolCallResult, ToolCallError>>,
     llm_done: bool,
     stop_reason: Option<StopReason>,
+    /// Provider-side request id (response body id or `x-amzn-requestid`/
+    /// `request-id` header), as reported by the streaming parser on the
+    /// terminal `Done` event. Surfaced on `LlmCallOutcome::Completed` so the
+    /// run log can tie each turn back to the provider's request. `None` means
+    /// the provider did not return one; the run log records none.
+    provider_request_id: Option<String>,
     retry_attempt: u32,
     call_usage: Option<TokenUsage>,
     /// Tool calls whose arguments are still streaming in this call.

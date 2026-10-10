@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 pub fn process_anthropic_stream<T: Stream<Item = Result<String>> + Send + Sync + Unpin>(
     stream: T,
+    provider_request_id: Option<String>,
 ) -> impl Stream<Item = Result<LlmResponse>> + Send {
     async_stream::stream! {
         yield Ok(LlmResponse::Start);
@@ -57,6 +58,7 @@ pub fn process_anthropic_stream<T: Stream<Item = Result<String>> + Send + Sync +
 
         yield Ok(LlmResponse::Done {
             stop_reason: last_stop_reason,
+            provider_request_id,
         });
     }
 }
@@ -224,7 +226,7 @@ mod tests {
         ];
 
         let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-        let mut response_stream = Box::pin(process_anthropic_stream(stream));
+        let mut response_stream = Box::pin(process_anthropic_stream(stream, None));
 
         let mut responses = Vec::new();
         while let Some(result) = response_stream.next().await {
@@ -238,7 +240,7 @@ mod tests {
             responses[3],
             LlmResponse::Usage { tokens } if tokens.input_tokens.get() == 10 && tokens.output_tokens.get() == 25
         ));
-        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }));
+        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }));
     }
 
     #[tokio::test]
@@ -253,7 +255,7 @@ mod tests {
         ];
 
         let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-        let mut response_stream = Box::pin(process_anthropic_stream(stream));
+        let mut response_stream = Box::pin(process_anthropic_stream(stream, None));
 
         let mut responses = Vec::new();
         while let Some(result) = response_stream.next().await {
@@ -271,7 +273,7 @@ mod tests {
             responses[3],
             LlmResponse::Usage { tokens } if tokens.input_tokens.get() == 10 && tokens.output_tokens.get() == 15
         ));
-        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls) }));
+        assert!(matches!(responses[4], LlmResponse::Done { stop_reason: Some(StopReason::ToolCalls), .. }));
     }
 
     #[tokio::test]
@@ -292,7 +294,7 @@ mod tests {
         ];
 
         let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-        let mut response_stream = Box::pin(process_anthropic_stream(stream));
+        let mut response_stream = Box::pin(process_anthropic_stream(stream, None));
 
         let mut responses = Vec::new();
         while let Some(result) = response_stream.next().await {
@@ -326,7 +328,7 @@ mod tests {
         ];
 
         let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-        let mut response_stream = Box::pin(process_anthropic_stream(stream));
+        let mut response_stream = Box::pin(process_anthropic_stream(stream, None));
 
         let mut responses = Vec::new();
         while let Some(result) = response_stream.next().await {
@@ -341,7 +343,7 @@ mod tests {
             responses[4],
             LlmResponse::Usage { tokens } if tokens.input_tokens.get() == 10 && tokens.output_tokens.get() == 50
         ));
-        assert!(matches!(responses[5], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn) }));
+        assert!(matches!(responses[5], LlmResponse::Done { stop_reason: Some(StopReason::EndTurn), .. }));
     }
 
     #[tokio::test]
@@ -356,7 +358,7 @@ mod tests {
         ];
 
         let stream = tokio_stream::iter(lines.into_iter().map(Ok));
-        let mut response_stream = Box::pin(process_anthropic_stream(stream));
+        let mut response_stream = Box::pin(process_anthropic_stream(stream, None));
 
         let mut responses = Vec::new();
         while let Some(result) = response_stream.next().await {

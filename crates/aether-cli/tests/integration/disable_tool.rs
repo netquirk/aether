@@ -156,10 +156,7 @@ fn disable_tool_repeats_drop_each_named_tool_once() -> TestResult {
     );
 
     let lines: Vec<&str> = stdout.lines().filter(|line| !line.trim().is_empty()).collect();
-    assert!(
-        !lines.contains(&"coding__bash"),
-        "repeatable --disable-tool must drop coding__bash; stdout:\n{stdout}"
-    );
+    assert!(!lines.contains(&"coding__bash"), "repeatable --disable-tool must drop coding__bash; stdout:\n{stdout}");
     assert!(
         !lines.contains(&"coding__read_file"),
         "repeatable --disable-tool must drop coding__read_file; stdout:\n{stdout}"

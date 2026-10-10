@@ -140,11 +140,9 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     let mut transcript = match &config.transcript_jsonl {
         Some(path) => {
             let started_at = chrono::Utc::now().to_rfc3339();
-            let mut writer = JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes)
-                .map_err(CliError::IoError)?;
-            writer
-                .write_header(crate::version::aether_version(), &started_at)
-                .map_err(CliError::IoError)?;
+            let mut writer =
+                JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes).map_err(CliError::IoError)?;
+            writer.write_header(crate::version::aether_version(), &started_at).map_err(CliError::IoError)?;
             Some(writer)
         }
         None => None,
@@ -432,6 +430,21 @@ async fn stream_output<W: io::Write>(
                 stall.observe(msg, now);
             }
             _ => {}
+        }
+
+        // Record the provider-side request id against the turn in the run log
+        // (TASK-25-421). The id is captured by the streaming parser from the
+        // SSE body (`OpenAI`, `OpenRouter`, `Z.ai`, Ollama) or from the
+        // `x-amzn-requestid` / `request-id` response header; the agent copies
+        // it from the terminal `Done` event onto `LlmCallOutcome::Completed`.
+        // A `None` outcome means the provider did not return one, and we
+        // intentionally emit no `provider_request_id` field here rather than
+        // a `none` placeholder so a log-grepping operator can tell apart a
+        // call that carried an id from one that did not.
+        if let AgentEvent::Turn(TurnEvent::LlmCallEnded { purpose, outcome }) = msg
+            && let Some(request_id) = outcome.provider_request_id()
+        {
+            info!(purpose = ?purpose, provider_request_id = %request_id, "llm call ended");
         }
 
         if let Some(meta) = tool_result_meta(msg) {
@@ -770,12 +783,11 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
 fn run_model_identity(model_spec: &str) -> (String, String) {
     let first = model_spec.split(',').next().unwrap_or(model_spec);
     let first = first.trim();
-    match first.parse::<llm::LlmModel>() {
-        Ok(model) => (model.provider().to_string(), model.model_id().into_owned()),
-        Err(_) => {
-            let (provider, model_id) = first.split_once(':').unwrap_or(("", first));
-            (provider.to_string(), model_id.to_string())
-        }
+    if let Ok(model) = first.parse::<llm::LlmModel>() {
+        (model.provider().to_string(), model.model_id().into_owned())
+    } else {
+        let (provider, model_id) = first.split_once(':').unwrap_or(("", first));
+        (provider.to_string(), model_id.to_string())
     }
 }
 
@@ -1668,5 +1680,197 @@ mod tests {
                 usage_ratio: Some(0.5),
             },
         })
+    }
+
+    /// `MakeWriter` impl that hands every line a clone of a shared
+    /// `Arc<Mutex<Vec<u8>>>`. Used by the TASK-25-421 tests to capture what
+    /// `tracing` would have written to whatever `--log-file` (or stderr) the
+    /// headless run is bound to, without standing up an actual file. The
+    /// `Mutex` is held only inside `make_writer`/`write_all` for the duration
+    /// of the per-event write, so the writers do not contend on the test's
+    /// own assertions.
+    #[derive(Clone)]
+    struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl SharedWriter {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn snapshot(&self) -> Vec<u8> {
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+    }
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedWriter {
+        type Writer = SharedWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Drive `agent(provider).spawn()` through one prompt and pipe the
+    /// resulting event stream into [`stream_output`]. Returns the bytes
+    /// captured by `writer` so the test can assert the run-log lines for the
+    /// TASK-25-421 deliverable. `quiet` is forced so the live progress line
+    /// does not pollute the captured bytes (the line is rendered through the
+    /// same `progress_writer` argument, not through `tracing`).
+    ///
+    /// Subscriber isolation between the two TASK-25-421 tests relies on
+    /// `tracing::subscriber::set_default`, which returns a
+    /// [`tracing::dispatcher::DefaultGuard`] scoped to the current thread.
+    /// Holding the guard for the duration of the awaited future — paired with
+    /// `#[tokio::test(flavor = "current_thread")]` so every `tokio::spawn`'d
+    /// task also runs on this thread — ensures every `tracing::info!` the
+    /// agent and the headless loop emit lands on the test's `SharedWriter`.
+    /// The guard is dropped at the end of this function, restoring the prior
+    /// thread-local default; this keeps each test's captured bytes scoped to
+    /// its own buffer and independent of test ordering.
+    ///
+    /// A sentinel `info!("TASK-25-421 probe")` line is emitted at the top of
+    /// the future so both TASK-25-421 tests share a non-empty buffer. Without
+    /// it the negative test (no provider id) would produce an empty buffer —
+    /// `info!` is the level the deliverable uses and the agent's other lines
+    /// at this level only fire on edge cases (auto-continue, turn cap,
+    /// compaction) that the simple fake stream never trips. The probe pins
+    /// subscriber isolation independently of the deliverable's logic.
+    async fn drive_run_and_capture_log(writer: SharedWriter, provider: llm::testing::FakeLlmProvider) -> Vec<u8> {
+        use aether_core::core::RetryConfig;
+        use std::time::Duration;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Use a `tracing` level that lets the `info!` "llm call ended" line
+        // through (the deliverable's record is an `info!` so it is grep-
+        // friendly at the default `--log-level info` callers will use).
+        let filter = tracing_subscriber::filter::EnvFilter::new("info");
+        let layer = tracing_subscriber::fmt::layer().with_writer(writer.clone()).with_ansi(false).with_filter(filter);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // `set_default` is the thread-scoped variant of `with_default`: it
+        // hands back a `DefaultGuard` that unregisters the subscriber on
+        // drop. We hold the guard for the lifetime of the await so every
+        // `tracing::info!` on this thread (including those emitted by
+        // `tokio::spawn`'d tasks on the `current_thread` runtime) routes
+        // through `writer`.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let retry = RetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            resume_partial: false,
+        };
+
+        let (tx, rx, _handle) = aether_core::core::agent(provider).retry(retry).spawn().await.unwrap();
+        tx.send(aether_core::events::Command::text("hello")).await.expect("send prompt");
+        drop(tx);
+
+        // Sentinel `info!` so the buffer always has at least one line. See
+        // the doc comment above for why both TASK-25-421 tests need this.
+        tracing::info!("TASK-25-421 probe");
+
+        let (_code, _changes, _summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &[],
+            Instant::now(),
+            None,
+            // `quiet = true` short-circuits the live progress bytes that
+            // would otherwise bleed into the captured `Vec<u8>`. The
+            // task's deliverable is recorded via `tracing::info!`, not
+            // the progress line, so this keeps the assertions on the
+            // task line alone.
+            true,
+            io::sink(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Snapshot under the guard: `set_default` ensures no other test is
+        // also writing to this `SharedWriter` (each test installs its own
+        // subscriber against its own buffer), so a snapshot now is safe
+        // and contains only the bytes this test produced.
+        writer.snapshot()
+    }
+
+    /// TASK-25-421: a turn whose provider response carries a request id
+    /// surfaces that id on the run log via the `info!("llm call ended")`
+    /// line emitted by `stream_output`. The fake provider yields
+    /// `Done { provider_request_id: Some("req-1") }` on the terminal event;
+    /// the agent copies the id onto `LlmCallOutcome::Completed`; the headless
+    /// loop's log branch reads it back via `provider_request_id()` and
+    /// records it. The captured bytes must contain the expected `provider_request_id=req-1`
+    /// field and the canonical message — that is the operator-facing proof
+    /// that a turn can be traced back to the provider-side request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_logs_provider_request_id_when_response_carries_one() {
+        use llm::testing::FakeLlmProvider;
+        let provider = FakeLlmProvider::from_results(vec![vec![
+            Ok(llm::LlmResponse::Start),
+            Ok(llm::LlmResponse::text("hi")),
+            Ok(llm::LlmResponse::done_with_request_id(Some(llm::StopReason::EndTurn), Some("req-1".to_string()))),
+        ]]);
+        let writer = SharedWriter::new();
+        let log = drive_run_and_capture_log(writer, provider).await;
+        let log = String::from_utf8_lossy(&log);
+        // Defensive non-empty check: if the subscriber isolation regresses and
+        // the buffer ends up empty, the negative assertion below would
+        // trivially pass. Pinning a non-empty buffer here ensures a regression
+        // in the subscriber wiring shows up as a test failure rather than a
+        // silently-vacuous pass.
+        assert!(
+            !log.is_empty(),
+            "the subscriber must have captured at least one line; got an empty buffer (subscriber isolation is broken): {log:?}"
+        );
+        assert!(
+            log.contains("provider_request_id=req-1"),
+            "the run log must surface the provider's request id for the turn; got:\n{log}"
+        );
+        assert!(log.contains("llm call ended"), "the run log carries the canonical message; got:\n{log}");
+    }
+
+    /// Companion of the test above: a provider response that does NOT carry a
+    /// request id must NOT produce a `provider_request_id=...` line at all
+    /// and must NOT produce a `provider_request_id=none`/`Some(None)`
+    /// placeholder. The headless loop only emits the line when `outcome.provider_request_id()`
+    /// returns `Some`; absent means absent, so the run log remains a clean,
+    /// grep-friendly record of the requests that did arrive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_logs_no_provider_request_id_when_response_carries_none() {
+        let provider = llm::testing::FakeLlmProvider::from_results(vec![vec![
+            Ok(llm::LlmResponse::Start),
+            Ok(llm::LlmResponse::text("hi")),
+            Ok(llm::LlmResponse::done()),
+        ]]);
+        let writer = SharedWriter::new();
+        let log = drive_run_and_capture_log(writer, provider).await;
+        let log = String::from_utf8_lossy(&log);
+        // Mirror the positive test's non-empty check: a regression in the
+        // subscriber wiring would leave the buffer empty, making the negative
+        // assertions trivially pass. The positive test's buffer is
+        // non-empty on its own (it contains the "llm call ended" line);
+        // pair the two checks so a regression shows up as a hard failure in
+        // at least one of them.
+        assert!(
+            !log.is_empty(),
+            "the subscriber must have captured at least one line; got an empty buffer (subscriber isolation is broken): {log:?}"
+        );
+        assert!(
+            !log.contains("provider_request_id"),
+            "the run log must NOT carry a provider_request_id field when the response had none (no placeholder); got:\n{log}"
+        );
+        assert!(
+            !log.contains("llm call ended"),
+            "the canonical message is only emitted when the response carries a request id; got:\n{log}"
+        );
     }
 }

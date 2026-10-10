@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("🔧 Tool result: {tool_result}");
                 current_tool_call = None;
             }
-            LlmResponse::Done { stop_reason } => {
+            LlmResponse::Done { stop_reason, .. } => {
                 if let Some(reason) = stop_reason {
                     println!("\n✅ Stream completed ({reason:?})");
                 } else {
