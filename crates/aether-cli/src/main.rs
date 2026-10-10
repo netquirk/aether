@@ -5,6 +5,7 @@ use aether_cli::error::CliError;
 use aether_cli::generate_command::{GenerateArgs, GenerateCommandError, run as run_generate_command};
 use aether_cli::headless::{HeadlessArgs, run_headless};
 use aether_cli::init::{InitError, InitOutcome, InitRequest, next_steps_message, run_init};
+use aether_cli::log_level::LogLevel;
 use aether_cli::mcp_command::{McpArgs, McpCommandError, run as run_mcp_command};
 use aether_cli::settings::SettingsCommand;
 use aether_cli::settings_args::SettingsSourceArgs;
@@ -72,6 +73,16 @@ struct Cli {
     #[arg(long = "list-profiles")]
     list_profiles: bool,
 
+    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`.
+    /// Forwarded to every subcommand that produces tracing output, so the
+    /// flag may be placed before the subcommand (`aether --log-level debug headless …`)
+    /// or after it (`aether headless --log-level debug …`); the first
+    /// placement wins when both are set. Without it, the legacy `--verbose`
+    /// flag (still accepted on the headless subcommand) controls the level,
+    /// defaulting to `warn` when neither is set.
+    #[arg(long = "log-level", value_name = "LEVEL")]
+    log_level: Option<LogLevel>,
+
     #[command(flatten)]
     settings_source: SettingsSourceArgs,
 
@@ -120,21 +131,39 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Copy the top-level flag out before `cli.command` is moved into the
+    // `match` below. The subcommand path (`aether headless --log-level …`) is
+    // the documented placement, but accepting the flag before the subcommand
+    // (`aether --log-level … headless`) keeps it discoverable and matches the
+    // `Clap::Args` derives on the subcommand structs. The merge below only
+    // overwrites when the subcommand did not see a value itself, so the
+    // subcommand-level flag wins when both are set.
+    let top_log_level = cli.log_level;
+
     let result: Result<ExitCode, MainError> = if cli.list_profiles {
         list_profiles(&cli.settings_source).map(|()| ExitCode::SUCCESS)
     } else {
         let rt = Runtime::new().expect("Failed to create tokio runtime");
         match cli.command {
-            Some(Command::Headless(args)) => rt.block_on(run_headless(args)).map_err(Into::into),
+            Some(Command::Headless(mut args)) => {
+                if args.log_level.is_none() {
+                    args.log_level = top_log_level;
+                }
+                rt.block_on(run_headless(args)).map_err(Into::into)
+            }
 
             Some(Command::Generate(args)) => rt.block_on(run_generate_command(args)).map_err(Into::into),
 
-            Some(Command::Acp(args)) => rt
-                .block_on(run_acp(args))
-                .map(|outcome| match outcome {
-                    AcpRunOutcome::CleanDisconnect => ExitCode::SUCCESS,
-                })
-                .map_err(Into::into),
+            Some(Command::Acp(mut args)) => {
+                if args.log_level.is_none() {
+                    args.log_level = top_log_level;
+                }
+                rt.block_on(run_acp(args))
+                    .map(|outcome| match outcome {
+                        AcpRunOutcome::CleanDisconnect => ExitCode::SUCCESS,
+                    })
+                    .map_err(Into::into)
+            }
 
             Some(Command::Server(args)) => {
                 rt.block_on(run_server(args)).map(|()| ExitCode::SUCCESS).map_err(Into::into)
@@ -156,7 +185,7 @@ fn main() -> ExitCode {
 
             Some(Command::Lspd(args)) => aether_lspd::run_lspd(args).map(|()| ExitCode::SUCCESS).map_err(Into::into),
 
-            None => rt.block_on(run_default_command(cli.model)),
+            None => rt.block_on(run_default_command(cli.model, top_log_level)),
         }
     };
 
@@ -185,7 +214,7 @@ async fn run_init_command(request: InitRequest) -> Result<ExitCode, MainError> {
     })
 }
 
-async fn run_default_command(model: Option<String>) -> Result<ExitCode, MainError> {
+async fn run_default_command(model: Option<String>, log_level: Option<LogLevel>) -> Result<ExitCode, MainError> {
     if let Some(model) = model.as_deref() {
         validate_model_override(model)?;
     }
@@ -223,7 +252,7 @@ async fn run_default_command(model: Option<String>) -> Result<ExitCode, MainErro
     }
 
     let settings = load_or_create_settings().with_default_status_line(default_status_line());
-    run_tui(&default_agent_command(model.as_deref()), settings, None)
+    run_tui(&default_agent_command(model.as_deref(), log_level), settings, None)
         .await
         .map(|()| ExitCode::SUCCESS)
         .map_err(Into::into)
@@ -275,12 +304,26 @@ fn format_settings_paths(paths: &[std::path::PathBuf]) -> String {
 /// Without an override, the TUI spawns `aether acp` (which reads the
 /// configured model from settings). With `--model`, the same `aether acp`
 /// command is launched and handed the override via argv so the configured
-/// model is bypassed for this run only.
-fn default_agent_command(model: Option<&str>) -> String {
-    match model {
-        Some(model) => format!("aether acp --model {model}"),
-        None => "aether acp".to_string(),
+/// model is bypassed for this run only. `--log-level` is forwarded the same
+/// way so the spawned child sees the same tracing level the TUI was given.
+fn default_agent_command(model: Option<&str>, log_level: Option<LogLevel>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = model {
+        parts.push(format!("--model {model}"));
     }
+    if let Some(level) = log_level {
+        // `LogLevel`'s clap render yields the lowercase variant names; we
+        // write them out explicitly so a future rename of the enum is caught
+        // by the `default_agent_command_*` unit tests below.
+        let rendered = match level {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+        };
+        parts.push(format!("--log-level {rendered}"));
+    }
+    if parts.is_empty() { "aether acp".to_string() } else { format!("aether acp {}", parts.join(" ")) }
 }
 
 /// Reject any `--model` value that is not parseable as an `LlmModel`.
@@ -302,21 +345,36 @@ mod tests {
 
     #[test]
     fn default_agent_command_without_override_uses_configured_agent() {
-        assert_eq!(default_agent_command(None), "aether acp");
+        assert_eq!(default_agent_command(None, None), "aether acp");
     }
 
     #[test]
     fn default_agent_command_with_override_interpolates_model() {
-        let command = default_agent_command(Some("anthropic:claude-sonnet-4-5"));
+        let command = default_agent_command(Some("anthropic:claude-sonnet-4-5"), None);
         assert_eq!(command, "aether acp --model anthropic:claude-sonnet-4-5");
         assert!(command.contains("anthropic:claude-sonnet-4-5"));
     }
 
     #[test]
     fn model_flag_overrides_the_configured_model() {
-        let command = default_agent_command(Some("zai:glm-5.1"));
+        let command = default_agent_command(Some("zai:glm-5.1"), None);
         assert_eq!(command, "aether acp --model zai:glm-5.1");
         assert!(command.starts_with("aether acp --model zai:glm-5.1"));
+    }
+
+    #[test]
+    fn default_agent_command_forwards_log_level_only() {
+        assert_eq!(default_agent_command(None, Some(LogLevel::Debug)), "aether acp --log-level debug");
+    }
+
+    #[test]
+    fn default_agent_command_forwards_model_and_log_level() {
+        // The two flags travel together when both are set, in the same
+        // --model / --log-level order the function builds them in.
+        assert_eq!(
+            default_agent_command(Some("anthropic:claude-sonnet-4-5"), Some(LogLevel::Error)),
+            "aether acp --model anthropic:claude-sonnet-4-5 --log-level error"
+        );
     }
 
     #[test]

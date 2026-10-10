@@ -13,6 +13,7 @@ pub use protocol::map_mcp_prompt_to_available_command;
 use crate::acp::server::DetachedArgs;
 use crate::acp::state::{AcpState, AcpStateConfig};
 use crate::credentials::oauth_credential_store_from_config;
+use crate::log_level::LogLevel;
 use crate::provider_connection_args::ProviderConnectionArgs;
 use crate::resolve::InitialSessionSelection;
 use crate::settings_args::{ConflictingSettingsSources, SettingsSourceArgs};
@@ -78,6 +79,14 @@ pub struct AcpArgs {
 
     #[command(flatten)]
     pub settings_source: SettingsSourceArgs,
+
+    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`
+    /// (TASK-25-41). When set, replaces the default `warn` filter applied
+    /// to the per-day log file. The flag is also accepted before the
+    /// subcommand (`aether --log-level debug acp …`); the subcommand-level
+    /// flag wins when both are set.
+    #[arg(long = "log-level", value_name = "LEVEL")]
+    pub log_level: Option<LogLevel>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -172,6 +181,7 @@ struct AcpRunConfig {
     trace_context: Option<AgentTraceContext>,
     provider_connections: ProviderConnectionOverrides,
     settings_source: SettingsSourceArgs,
+    log_level: Option<LogLevel>,
 }
 
 impl AcpRunConfig {
@@ -188,6 +198,7 @@ impl AcpRunConfig {
             trace_context: None,
             provider_connections: args.provider_connection.into_overrides(),
             settings_source: args.settings_source,
+            log_level: args.log_level,
         };
         config.validate_reasoning_effort()?;
         Ok(config)
@@ -211,6 +222,9 @@ impl AcpRunConfig {
             trace_context: options.trace_context,
             provider_connections: ProviderConnectionOverrides::new(options.providers.unwrap_or_default()),
             settings_source,
+            // `--options-json` callers have no flag-level override; they
+            // inherit the default `warn` / RUST_LOG filter.
+            log_level: None,
         };
         config.validate_reasoning_effort()?;
         Ok(config)
@@ -226,7 +240,7 @@ impl AcpRunConfig {
 
 fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result<AcpState, AcpRunError> {
     let config = AcpRunConfig::from_args(args)?;
-    setup_logging(&config.log_dir);
+    setup_logging(&config.log_dir, config.log_level);
 
     let initial_selection = if let Some(agent) = config.agent.clone() {
         InitialSessionSelection::agent(agent)
@@ -264,12 +278,18 @@ fn create_acp_state(args: AcpArgs, cwd: &Path, detached: DetachedArgs) -> Result
     }))
 }
 
-fn setup_logging(log_dir: &Path) {
+fn setup_logging(log_dir: &Path, log_level: Option<LogLevel>) {
     create_dir_all(log_dir).ok();
+    // The explicit `--log-level` wins; without it, fall back to the env
+    // filter (so RUST_LOG-based overrides still work) and then to `warn`.
+    let filter = match log_level {
+        Some(level) => EnvFilter::new(level.directive()),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    };
     let _ = tracing_subscriber::fmt()
         .with_writer(daily(log_dir, "aether-acp.log"))
         .with_ansi(false) // No ANSI colors in log files
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(filter)
         .pretty()
         .try_init();
 }

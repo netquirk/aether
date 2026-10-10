@@ -14,6 +14,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::error;
 
 use crate::file_changes::FileChanges;
+use crate::log_level::{LogLevel, resolve as resolve_log_level};
 use crate::run_timeout::{RunTimeoutWatch, TIMEOUT_EXIT_CODE};
 use crate::telemetry::build_telemetry_runtime;
 use crate::transcript::JsonlTranscript;
@@ -32,7 +33,7 @@ use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::{expand_slash_command, parse_slash_command};
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
-    setup_tracing(config.verbose);
+    setup_tracing(resolve_log_level(config.log_level, config.verbose));
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
@@ -594,14 +595,14 @@ pub(crate) fn event_kind(msg: &AgentEvent) -> Option<CliEventKind> {
     }
 }
 
-pub(crate) fn setup_tracing(verbose: bool) {
+pub(crate) fn setup_tracing(level: LogLevel) {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let filter = if verbose { EnvFilter::new("debug,agent=off") } else { EnvFilter::new("warn,agent=off") };
+    let filter = EnvFilter::new(level.directive());
     // Gate the fmt layer's ANSI on the same `NO_COLOR` signal the live
     // progress line honours: a `NO_COLOR=1` run emits log records to stderr
     // in plain text, matching the rest of the colour-free output.

@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::credentials::oauth_credential_store_from_config;
+use crate::log_level::{LogLevel, resolve as resolve_log_level};
 use crate::mcp_config_args::McpConfigArgs;
 use crate::output::OutputFormat;
 use crate::prompt::prompt_or_stdin;
@@ -62,6 +63,11 @@ pub struct RunConfig {
     pub system_prompt: Option<String>,
     pub output: OutputFormat,
     pub verbose: bool,
+    /// Explicit `--log-level` (TASK-25-41). `None` falls back to the
+    /// `--verbose` boolean via [`LogLevel::resolve`] so existing
+    /// `--verbose` callers keep their `debug` level while new runs can pick
+    /// `error`/`warn`/`info`/`debug` directly.
+    pub log_level: Option<LogLevel>,
     /// When true, the headless loop does not write the live per-tool progress
     /// line on stderr. Warnings and errors (including the provider-stall
     /// warning, `eprintln!` failure messages, and `tracing` warnings/errors)
@@ -161,7 +167,7 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // Settings loading can emit `tracing::warn!` for unrecognised keys, so
     // initialise the tracing subscriber before the load (the subscriber is
     // re-installed at the proper verbosity inside `run::run`).
-    run::setup_tracing(args.verbose);
+    run::setup_tracing(resolve_log_level(args.log_level, args.verbose));
     if args.dry_run {
         // Short-circuit before any prompt resolution, session construction,
         // MCP setup, telemetry runtime, or provider call: --dry-run only
@@ -219,9 +225,19 @@ pub struct HeadlessArgs {
     #[arg(long, default_value = "text")]
     pub output: OutputFormat,
 
-    /// Verbose diagnostic logging to stderr.
+    /// Verbose diagnostic logging to stderr. Kept as a back-compat alias for
+    /// `--log-level debug` (TASK-25-41); explicit `--log-level` always wins.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`
+    /// (TASK-25-41). Overrides `--verbose` when both are set; the default
+    /// when neither is set is `warn`, matching the pre-existing
+    /// non-verbose behaviour. The flag is also accepted before the
+    /// subcommand (`aether --log-level debug headless …`); both placements
+    /// resolve to this field.
+    #[arg(long = "log-level", value_name = "LEVEL")]
+    pub log_level: Option<LogLevel>,
 
     /// Suppress the live per-tool progress line on stderr. Warnings and
     /// errors (including the provider-stall warning and `tracing` diagnostics)
@@ -289,6 +305,7 @@ impl RunConfig {
             system_prompt: resolve_system_prompt(args.system_prompt, args.system_prompt_file)?,
             output: args.output,
             verbose: args.verbose,
+            log_level: args.log_level,
             quiet: args.quiet,
             events: args.events,
             oauth_credential_store,
@@ -334,6 +351,10 @@ impl RunConfig {
             system_prompt: resolve_system_prompt(options.system_prompt, options.system_prompt_file)?,
             output: options.output.unwrap_or(OutputFormat::Text),
             verbose: options.verbose.unwrap_or(false),
+            // `--options-json` callers have no flag-level override; they
+            // inherit the `verbose`-derived default (warn / debug) by
+            // leaving this `None` so `LogLevel::resolve` falls back.
+            log_level: None,
             quiet: options.quiet.unwrap_or(false),
             events: options.events.unwrap_or_default(),
             oauth_credential_store,
@@ -611,6 +632,55 @@ mod tests {
         let parsed = QuietHarness::try_parse_from(["aether", "--quiet", "hello"]).unwrap().args;
         assert!(parsed.quiet, "--quiet must set the flag alongside a positional prompt");
         assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn log_level_flag_parses_each_accepted_value() {
+        // The clap-level check: every value listed in the help text must
+        // round-trip to the right `LogLevel` variant so a missing
+        // `ValueEnum` derive or a future rename shows up as a unit-test
+        // failure rather than a runtime surprise. The expected directive
+        // is checked via the same `LogLevel::directive` the run's tracing
+        // setup will use.
+        use clap::Parser as _;
+        let cases = [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+        ];
+        for (raw, expected) in cases {
+            let parsed = QuietHarness::try_parse_from(["aether", "--log-level", raw, "hello"])
+                .unwrap_or_else(|error| panic!("--log-level {raw} must parse: {error}"))
+                .args;
+            assert_eq!(parsed.log_level, Some(expected), "--log-level {raw} round-trip");
+            assert_eq!(parsed.log_level.unwrap().directive(), expected.directive(), "directive must match for {raw}");
+        }
+    }
+
+    #[test]
+    fn log_level_flag_defaults_to_none() {
+        // The absent-flag path stays `None` so `LogLevel::resolve` can fall
+        // back to the `--verbose` boolean (or `warn` when neither is set).
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).unwrap().args;
+        assert!(parsed.log_level.is_none(), "absent --log-level must be None, not a default");
+    }
+
+    #[test]
+    fn log_level_flag_rejects_unknown_values() {
+        // clap surfaces a parse error; the diagnostic must name both the
+        // offending input and the allowed set so a caller typing `--log-level
+        // bogus` learns the legal values.
+        use clap::Parser as _;
+        let error = QuietHarness::try_parse_from(["aether", "--log-level", "bogus", "hello"])
+            .err()
+            .expect("--log-level bogus must be rejected by clap");
+        let rendered = error.to_string();
+        assert!(rendered.contains("bogus"), "diagnostic must name the rejected value: {rendered}");
+        for allowed in ["error", "warn", "info", "debug"] {
+            assert!(rendered.contains(allowed), "diagnostic must list `{allowed}` as an accepted value: {rendered}");
+        }
     }
 
     #[test]
