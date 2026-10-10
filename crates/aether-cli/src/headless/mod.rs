@@ -338,8 +338,10 @@ pub struct HeadlessArgs {
     /// naming the limit, and exits with [`crate::run_timeout::TIMEOUT_EXIT_CODE`]
     /// (`124`). Accepts the same suffixes as `--transcript-max-bytes`-style
     /// durations: `<n>ms`, `<n>s`, `<n>m`, `<n>h`, or a bare number of
-    /// seconds. Zero/empty values are rejected at parse time. Without
-    /// `--timeout` the run shape is preserved (no cap).
+    /// seconds. Values below one second — including zero, empty strings, and
+    /// unknown suffixes — are rejected at parse time with a diagnostic that
+    /// names the `--timeout` flag (TASK-25-168). Without `--timeout` the
+    /// run shape is preserved (no cap).
     #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_timeout)]
     pub timeout: Option<Duration>,
 
@@ -487,38 +489,44 @@ fn resolve_prompt(args: &HeadlessArgs) -> Result<String, CliError> {
 }
 
 /// Parse the `--timeout` value into a [`Duration`]. Accepts `<n>ms`,
-/// `<n>s`, `<n>m`, `<n>h`, and a bare `<n>` (interpreted as seconds). Empty,
-/// zero, negative, non-numeric, and unknown-suffix values are rejected with a
-/// message naming the offending input so `--timeout 0s` / `--timeout abc`
-/// fail at parse time rather than producing a silently-disabled timeout or a
-/// confusingly-hung run.
+/// `<n>s`, `<n>m`, `<n>h`, and a bare `<n>` (interpreted as seconds). The
+/// accepted floor is one second (TASK-25-168): values strictly below one
+/// second — including zero, empty strings, negative, non-numeric, and
+/// unknown-suffix values — are rejected with a message that names the
+/// `--timeout` flag so a `500ms` / `0s` / `abc` arg fails at parse time
+/// rather than producing a silently-disabled timeout or a run that dies
+/// before it has a chance to do any work.
 ///
 /// Avoids depending on `humantime` to keep the workspace's dependency surface
 /// stable for what is conceptually a four-line parser.
 fn parse_timeout(value: &str) -> Result<Duration, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err("timeout must not be empty (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
+        return Err("--timeout must not be empty (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
     }
     let (number, suffix) = match trimmed.find(|c: char| !c.is_ascii_digit()) {
         Some(index) => (&trimmed[..index], &trimmed[index..]),
         None => (trimmed, "s"),
     };
     if number.is_empty() {
-        return Err(format!("timeout '{value}' has no numeric prefix"));
+        return Err(format!("--timeout '{value}' has no numeric prefix"));
     }
-    let magnitude: u64 = number.parse().map_err(|_| format!("timeout '{value}' is not a non-negative integer"))?;
+    let magnitude: u64 = number.parse().map_err(|_| format!("--timeout '{value}' is not a non-negative integer"))?;
     let multiplier: u64 = match suffix {
         "" | "s" | "ms" => 1,
         "m" => 60,
         "h" => 60 * 60,
-        other => return Err(format!("timeout '{value}' uses unknown suffix '{other}' (expected ms, s, m, or h)")),
+        other => return Err(format!("--timeout '{value}' uses unknown suffix '{other}' (expected ms, s, m, or h)")),
     };
     let total_ms = magnitude
         .checked_mul(if suffix == "ms" { 1 } else { multiplier * 1_000 })
-        .ok_or_else(|| format!("timeout '{value}' overflows"))?;
-    if total_ms == 0 {
-        return Err("timeout must be greater than zero (expected <n>, <n>ms, <n>s, <n>m, or <n>h)".to_string());
+        .ok_or_else(|| format!("--timeout '{value}' overflows"))?;
+    // TASK-25-168: reject sub-second values so a run cannot start with a
+    // timeout that fires before the headless loop has a chance to do
+    // anything. `1s` / `1000ms` are the smallest accepted values;
+    // `999ms` / `500ms` / `0ms` / `0s` / `0` all reach this branch.
+    if total_ms < 1_000 {
+        return Err(format!("--timeout must be at least 1s (got '{value}')"));
     }
     Ok(Duration::from_millis(total_ms))
 }
@@ -880,10 +888,13 @@ mod tests {
         // `--timeout 30s` reaches the run; every accepted shape it advertises
         // in the help text must round-trip back to the expected Duration so a
         // typo (e.g. suffix drop) cannot turn a 30-second cap into a 30
-        // microsecond one.
+        // microsecond one. The accepted floor is one second (TASK-25-168),
+        // so every value here is `>= 1s`; sub-second values belong in the
+        // reject test below.
         let cases = [
             ("30s", Duration::from_secs(30)),
-            ("500ms", Duration::from_millis(500)),
+            ("1s", Duration::from_secs(1)),
+            ("1500ms", Duration::from_millis(1_500)),
             ("2m", Duration::from_secs(120)),
             ("1h", Duration::from_secs(3600)),
             ("45", Duration::from_secs(45)),
@@ -897,14 +908,40 @@ mod tests {
 
     #[test]
     fn parse_timeout_rejects_zero_empty_unknown_suffix_and_negative() {
-        // The four shapes the parser explicitly rejects. Zero would otherwise
-        // silently disable the watch (the constructor coerces zero to
-        // disabled); empty / non-numeric / unknown-suffix values must not be
-        // a "successful" parse of an unintended duration.
-        let cases = ["0s", "0", "0m", "0h", "0ms", "", "   ", "abc", "-1s", "30x", "30days"];
+        // The shapes the parser explicitly rejects (TASK-25-168). Zero and
+        // any sub-second value would otherwise silently disable the watch
+        // or fire before the run had any chance to do work; empty,
+        // non-numeric, and unknown-suffix values must not be a "successful"
+        // parse of an unintended duration. Every rejection message is
+        // expected to name the `--timeout` flag so a user sees the flag
+        // name in the diagnostic even when only stderr is captured.
+        let cases = ["0s", "0", "0m", "0h", "0ms", "", "   ", "abc", "-1s", "30x", "30days", "1ms", "500ms", "999ms"];
         for raw in cases {
             let error = parse_timeout(raw).err().unwrap_or_else(|| panic!("{raw:?} must be rejected by parse_timeout"));
             assert!(!error.is_empty(), "{raw:?}: rejection message must not be empty");
+            assert!(error.contains("--timeout"), "rejection for {raw:?} must name the --timeout flag: {error:?}",);
+        }
+    }
+
+    #[test]
+    fn parse_timeout_rejects_sub_second_values_at_one_second_boundary() {
+        // Boundary check (TASK-25-168): values strictly below one second are
+        // rejected, but `1s` and `1000ms` are accepted. A regression that
+        // accepted `999ms` would slip a run that dies immediately past the
+        // parser, and a regression that rejected `1s` would break every
+        // caller asking for the minimum runnable timeout.
+        let rejected = ["0ms", "1ms", "500ms", "999ms", "0s", "0"];
+        for raw in rejected {
+            assert!(
+                parse_timeout(raw).is_err(),
+                "{raw:?} must be rejected: sub-second and zero values are not runnable",
+            );
+        }
+        let accepted = [("1s", Duration::from_secs(1)), ("1000ms", Duration::from_millis(1_000))];
+        for (raw, expected) in accepted {
+            let parsed =
+                parse_timeout(raw).unwrap_or_else(|error| panic!("{raw:?} must parse at the boundary: {error}"));
+            assert_eq!(parsed, expected, "boundary {raw:?} -> {parsed:?} != {expected:?}");
         }
     }
 
@@ -914,17 +951,19 @@ mod tests {
         // `parse_timeout` value parser, and the resulting `HeadlessArgs`
         // carries the expected Duration. This guards against a future change
         // that swaps the parser out or removes the flag; the smaller
-        // `parse_timeout` unit tests above cover the parser alone.
+        // `parse_timeout` unit tests above cover the parser alone. The
+        // second case asserts a millisecond-shaped value above the
+        // one-second floor (TASK-25-168).
         use clap::Parser as _;
         let parsed =
             QuietHarness::try_parse_from(["aether", "--timeout", "30s", "hello"]).expect("--timeout 30s parses").args;
         assert_eq!(parsed.timeout, Some(Duration::from_secs(30)));
         assert_eq!(parsed.prompt, vec!["hello".to_string()]);
 
-        let parsed = QuietHarness::try_parse_from(["aether", "--timeout", "500ms", "hello"])
-            .expect("--timeout 500ms parses")
+        let parsed = QuietHarness::try_parse_from(["aether", "--timeout", "1500ms", "hello"])
+            .expect("--timeout 1500ms parses")
             .args;
-        assert_eq!(parsed.timeout, Some(Duration::from_millis(500)));
+        assert_eq!(parsed.timeout, Some(Duration::from_millis(1_500)));
 
         // Absent flag means no timeout, matching the pre-existing behaviour.
         let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("no --timeout parses").args;
@@ -934,19 +973,45 @@ mod tests {
     #[test]
     fn timeout_flag_rejects_invalid_values_at_parse_time() {
         // clap surfaces `parse_timeout`'s error to the user; assert the
-        // production parser is wired so an `--timeout 0s` / `--timeout abc`
-        // arg fails with a non-empty diagnostic instead of falling through to
-        // a silently-disabled timeout.
+        // production parser is wired so `--timeout <bogus>` fails with a
+        // diagnostic that names the `--timeout` flag instead of falling
+        // through to a silently-disabled timeout or a run that dies
+        // immediately (TASK-25-168).
         use clap::Parser as _;
-        for raw in ["0s", "abc", ""] {
+        for raw in ["0s", "abc", "", "0", "0ms", "1ms", "500ms", "999ms"] {
             let error = QuietHarness::try_parse_from(["aether", "--timeout", raw, "hello"])
                 .err()
                 .unwrap_or_else(|| panic!("--timeout {raw:?} must be rejected by clap"));
             let rendered = error.to_string();
-            assert!(
-                rendered.contains("timeout") || rendered.contains(raw),
-                "diagnostic missing context for {raw:?}: {rendered}"
-            );
+            assert!(rendered.contains("--timeout"), "diagnostic must name the --timeout flag for {raw:?}: {rendered}",);
+        }
+    }
+
+    #[test]
+    fn timeout_flag_rejects_below_one_second_naming_the_flag() {
+        // TASK-25-168: every value strictly below one second must be
+        // rejected at clap parse time, with a diagnostic that names the
+        // `--timeout` flag. This is the test the done-when asks
+        // `cargo test --workspace` to cover: a run that would die
+        // immediately is refused up front instead of starting a doomed run.
+        use clap::Parser as _;
+        let rejected = ["0", "0s", "0ms", "1ms", "500ms", "999ms"];
+        for raw in rejected {
+            let error = QuietHarness::try_parse_from(["aether", "--timeout", raw, "hello"])
+                .err()
+                .unwrap_or_else(|| panic!("--timeout {raw:?} must be rejected: sub-second values are not runnable"));
+            let rendered = error.to_string();
+            assert!(rendered.contains("--timeout"), "diagnostic for {raw:?} must name the --timeout flag: {rendered}",);
+        }
+
+        // The boundary still accepts exactly one second so legitimate
+        // `--timeout 1s` / `--timeout 1000ms` callers keep working.
+        let accepted = [("1s", Duration::from_secs(1)), ("1000ms", Duration::from_millis(1_000))];
+        for (raw, expected) in accepted {
+            let parsed = QuietHarness::try_parse_from(["aether", "--timeout", raw, "hello"])
+                .unwrap_or_else(|error| panic!("--timeout {raw:?} must still parse at the boundary: {error}"))
+                .args;
+            assert_eq!(parsed.timeout, Some(expected), "--timeout {raw:?} boundary value");
         }
     }
 

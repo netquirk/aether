@@ -60,9 +60,10 @@ impl<W: Write> RunTimeoutWatch<W> {
     /// and the headless loop falls back to the plain `recv()` path.
     ///
     /// `limit = Some(zero)` is treated as disabled rather than "expire
-    /// immediately" so `parse_timeout`'s reject of `0s` matches a binary
-    /// build that constructs a `RunConfig` directly without going through
-    /// the parser.
+    /// immediately" so `parse_timeout`'s reject of values below one second
+    /// (TASK-25-168; `0s` is the only zero-shaped input that still reaches
+    /// this branch) matches a binary build that constructs a `RunConfig`
+    /// directly without going through the parser.
     pub(crate) fn new(limit: Option<Duration>, started: Instant, writer: W) -> Self {
         let deadline = limit.filter(|limit| !limit.is_zero()).and_then(|limit| started.checked_add(limit));
         Self { limit: limit.filter(|limit| !limit.is_zero()), deadline, writer, expired: false }
@@ -130,9 +131,10 @@ mod tests {
 
     #[test]
     fn run_timeout_watch_treats_zero_limit_as_disabled() {
-        // `parse_timeout` rejects `0s`, but the constructor still has to behave
-        // when called with `Some(Duration::ZERO)` (e.g. from a test that
-        // builds `RunTimeoutWatch` directly). The watch must treat zero as
+        // `parse_timeout` rejects everything below one second (TASK-25-168),
+        // including `0s`, but the constructor still has to behave when
+        // called with `Some(Duration::ZERO)` (e.g. from a test that builds
+        // `RunTimeoutWatch` directly). The watch must treat zero as
         // disabled rather than firing immediately; otherwise the headless
         // loop would time out any `--timeout 0` arg that slipped past the
         // parser.
