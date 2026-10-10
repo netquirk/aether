@@ -130,9 +130,21 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     // the run before any provider call. A successful open is also the
     // promise the file is on disk; a mid-run write error is reported but
     // does not fail the run.
+    //
+    // The first line written is the self-describing header record (see
+    // [`crate::transcript`]), so a saved transcript names the `aether` build
+    // that produced it and the run's wall-clock start time. The header is
+    // captured immediately before the writer is opened so a slow file open
+    // does not inflate the recorded start time.
     let mut transcript = match &config.transcript_jsonl {
         Some(path) => {
-            Some(JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes).map_err(CliError::IoError)?)
+            let started_at = chrono::Utc::now().to_rfc3339();
+            let mut writer = JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes)
+                .map_err(CliError::IoError)?;
+            writer
+                .write_header(crate::version::aether_version(), &started_at)
+                .map_err(CliError::IoError)?;
+            Some(writer)
         }
         None => None,
     };

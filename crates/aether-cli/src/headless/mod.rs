@@ -100,6 +100,13 @@ pub struct RunConfig {
     /// `type`). The file is truncated on open and independent of `--events`,
     /// so a filtered run still gets a complete transcript. The run's stdout
     /// stays human-readable.
+    ///
+    /// The first line of the file is a self-describing header
+    /// (`{"type":"header","aetherVersion":...,"startedAt":...}`), written
+    /// once at run start so a reader opening the saved file later knows
+    /// which `aether` build produced it and when the run began. Rotated
+    /// files (when `transcript_max_bytes` triggers a rotation) also start
+    /// with that header. Every subsequent line is a per-event record.
     pub transcript_jsonl: Option<PathBuf>,
     /// When set together with `transcript_jsonl`, the transcript is rotated
     /// to `<stem>.1` once a complete line would push the file at or past

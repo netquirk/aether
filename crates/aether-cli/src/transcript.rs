@@ -16,6 +16,17 @@
 //! file at the path. The run's stdout is unchanged and stays human-readable
 //! by default; this writer is purely additive.
 //!
+//! ## Header line
+//!
+//! The first line of a saved transcript is a self-describing header, written
+//! once at run start via [`JsonlTranscript::write_header`]: an object shaped
+//! `{"type":"header","aetherVersion":<version>,"startedAt":<rfc3339 utc>}`
+//! that names which `aether` build produced the file and when the run
+//! started. Rotated files are also self-describing: the header is re-emitted
+//! at the top of every freshly-opened file (see [`Self::rotate`]). Tests and
+//! downstream readers must skip line 0 (or otherwise tolerate a non-event
+//! record) to reach the per-event lines that follow.
+//!
 //! ## Rotation
 //!
 //! When the writer is opened with [`JsonlTranscript::create_with_max_bytes`]
@@ -48,11 +59,27 @@ struct TranscriptRecord<'a> {
     event: &'a AgentEvent,
 }
 
+/// The self-describing header written as the first line of a saved
+/// transcript. Lifted into its own struct so the on-the-wire layout
+/// (`{"type":"header","aetherVersion":<…>,"startedAt":<…>}`) is one
+/// `Serialize` impl rather than a hand-formatted string, keeping the JSON
+/// encoding identical to the per-event records.
+#[derive(Debug, Serialize)]
+struct TranscriptHeader<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(rename = "aetherVersion")]
+    aether_version: &'a str,
+    #[serde(rename = "startedAt")]
+    started_at: &'a str,
+}
+
 /// Streaming writer for the `--transcript-jsonl` transcript file.
 ///
 /// Holds a `BufWriter<File>`, the current 1-based turn number, the bytes
 /// written since the last rotation, the configured rotation threshold (if
-/// any), and the file path needed to rename it on rotation. Turn numbering
+/// any), the file path needed to rename it on rotation, and the
+/// self-describing header line re-emitted on every rotation. Turn numbering
 /// increments on every `TurnEvent::Started`; events seen before the first
 /// `Started` are written with `turn: 0`.
 pub struct JsonlTranscript {
@@ -61,6 +88,13 @@ pub struct JsonlTranscript {
     path: PathBuf,
     max_bytes: Option<u64>,
     bytes_written: u64,
+    /// Serialised header line for the current run, written once via
+    /// [`Self::write_header`] at run start and re-written into every freshly
+    /// rotated file so each one is self-describing on its own. `None` until
+    /// [`Self::write_header`] is called; `rotate()` (and any code path that
+    /// truncates the live file) is a no-op for the header before the first
+    /// write.
+    header: Option<Vec<u8>>,
 }
 
 impl JsonlTranscript {
@@ -85,7 +119,42 @@ impl JsonlTranscript {
     /// rotation (matching the `max_bytes = 0` convention used elsewhere).
     pub fn create_with_max_bytes(path: &Path, max_bytes: Option<u64>) -> io::Result<Self> {
         let writer = BufWriter::new(File::create(path)?);
-        Ok(Self { writer, turn: 0, path: path.to_path_buf(), max_bytes, bytes_written: 0 })
+        Ok(Self {
+            writer,
+            turn: 0,
+            path: path.to_path_buf(),
+            max_bytes,
+            bytes_written: 0,
+            header: None,
+        })
+    }
+
+    /// Write the self-describing header line that will be the first line of
+    /// the transcript. The header names the `aether` build and the run's
+    /// start time so a reader opening the saved file later knows which
+    /// version produced it and when the run began. The same line is
+    /// re-emitted into every freshly-rotated file (see [`Self::rotate`]),
+    /// keeping each produced transcript self-describing on its own.
+    ///
+    /// Writes the line + `\n`, adds its length to `bytes_written` so rotation
+    /// accounting treats the header as part of the file, stores the
+    /// serialised line in `self.header` for re-use on rotation, and never
+    /// triggers rotation itself (the header is small and goes in first).
+    /// Calling this method twice is harmless: the second call replaces the
+    /// stored header without rewriting the on-disk copy already flushed to
+    /// the live file.
+    pub fn write_header(&mut self, aether_version: &str, started_at: &str) -> io::Result<()> {
+        let header = TranscriptHeader {
+            kind: "header",
+            aether_version,
+            started_at,
+        };
+        let mut bytes = serde_json::to_vec(&header).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes)?;
+        self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+        self.header = Some(bytes);
+        Ok(())
     }
 
     /// Write one transcript line for `event`. Events without a CLI event
@@ -137,6 +206,12 @@ impl JsonlTranscript {
     /// is deleted first so the rename never collides (Windows-friendly).
     /// The byte counter and turn counter are reset only for the byte count;
     /// turns persist across rotation.
+    ///
+    /// When a header line was written via [`Self::write_header`] before
+    /// rotation, the same header is re-emitted into the freshly-opened file
+    /// so every produced transcript is self-describing on its own. The
+    /// header's bytes are added to `bytes_written` so the rotation
+    /// accounting still treats the file as "just opened".
     fn rotate(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         let rotated = self.rotated_path();
@@ -146,6 +221,10 @@ impl JsonlTranscript {
         std::fs::rename(&self.path, &rotated)?;
         self.writer = BufWriter::new(File::create(&self.path)?);
         self.bytes_written = 0;
+        if let Some(header) = self.header.as_ref() {
+            self.writer.write_all(header)?;
+            self.bytes_written = self.bytes_written.saturating_add(header.len() as u64);
+        }
         Ok(())
     }
 }
@@ -480,5 +559,120 @@ mod tests {
             serde_json::from_str(rotated_contents.lines().next().expect("rotated has one line"))
                 .unwrap_or_else(|error| panic!("rotated line is not JSON: {error}"));
         assert_eq!(rotated_value["type"], "turn_started");
+    }
+
+    #[test]
+    fn header_is_the_first_record_and_names_version_and_start_time() {
+        // The done-when for TASK-25-487: the first record of a saved
+        // transcript is the header and it carries the aether version plus
+        // the run's start time. The run-side test
+        // `stream_output_writes_self_describing_header_before_first_event`
+        // covers the wiring through `run_agent`; this test exercises the
+        // writer itself so the contract on the public API is locked down
+        // independently of how `run_agent` calls it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+        let started_at = "2026-10-10T08:53:59+00:00";
+
+        let mut transcript = JsonlTranscript::create(&path).expect("create writer");
+        transcript.write_header(env!("CARGO_PKG_VERSION"), started_at).expect("write header");
+        transcript
+            .record(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }))
+            .expect("record writes");
+        transcript.flush().expect("flush");
+
+        // Read back: the file must be exactly two non-empty lines (the header
+        // and the recorded `turn_started`), proving the header is the *first*
+        // line and that every line is newline-terminated.
+        let contents = std::fs::read_to_string(&path).expect("read file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected two lines (header + turn_started); got {lines:?}"
+        );
+        assert!(
+            contents.ends_with('\n'),
+            "transcript must be newline-terminated to keep one record per line"
+        );
+
+        // Header line: a JSON object with `type == "header"` and the two
+        // self-describing fields populated. The version matches the
+        // crate's `CARGO_PKG_VERSION` (same source `version::aether_version`
+        // reads from).
+        let header: serde_json::Value =
+            serde_json::from_str(lines[0]).unwrap_or_else(|error| panic!("header line is not JSON: {error}; line={:?}", lines[0]));
+        assert!(header.is_object(), "header must be a JSON object: {header:?}");
+        assert_eq!(header["type"], "header", "header `type` must be \"header\"; got {header:?}");
+        assert_eq!(
+            header["aetherVersion"],
+            env!("CARGO_PKG_VERSION"),
+            "header must name the aether build that produced the transcript"
+        );
+        let started_at_value =
+            header["startedAt"].as_str().unwrap_or_else(|| panic!("header missing `startedAt` string: {header:?}"));
+        assert_eq!(
+            started_at_value, started_at,
+            "header must echo the run's wall-clock start time verbatim"
+        );
+        // Confirm the value is itself a valid RFC-3339 timestamp by
+        // re-parsing it through a strict RFC-3339 parser. Catches typos like
+        // `2026-10-10 08:53:59+00:00` that happen to serialise as JSON
+        // strings but are not RFC-3339.
+        chrono::DateTime::parse_from_rfc3339(started_at_value)
+            .unwrap_or_else(|error| panic!("startedAt must be RFC-3339: {error}; value={started_at_value:?}"));
+
+        // The second line is the recorded `turn_started` event, proving the
+        // header precedes the per-event records (not just that the header
+        // happens to be on disk).
+        let event: serde_json::Value =
+            serde_json::from_str(lines[1]).unwrap_or_else(|error| panic!("event line is not JSON: {error}; line={:?}", lines[1]));
+        assert_eq!(event["turn"], 1, "second line is the first turn's first event");
+        assert_eq!(event["type"], "turn_started");
+    }
+
+    #[test]
+    fn rotate_re_emits_header_into_fresh_file() {
+        // The header written before the first rotation must appear at the
+        // top of the newly-opened file too, so a reader of any produced
+        // transcript (live or rotated sibling) gets the same self-describing
+        // first line. The acceptance criterion is the *header is the first
+        // line of every transcript*, not just the first file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+        let rotated = path.with_extension("1");
+        let started_at = "2026-10-10T08:54:00+00:00";
+
+        // Open with a tiny threshold so the first record triggers rotation.
+        // Two records: the header line, then a kinded event that crosses
+        // the byte threshold and forces rotation.
+        let mut transcript = JsonlTranscript::create_with_max_bytes(&path, Some(1)).expect("create writer");
+        transcript.write_header(env!("CARGO_PKG_VERSION"), started_at).expect("write header");
+        transcript
+            .record(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }))
+            .expect("first record triggers rotation");
+        transcript.flush().expect("flush");
+
+        // The rotated sibling must start with the header line as line 0; the
+        // recorded event follows.
+        assert!(rotated.exists(), "rotation must produce a sibling: {rotated:?}");
+        let rotated_contents = std::fs::read_to_string(&rotated).expect("read rotated");
+        let rotated_lines: Vec<&str> = rotated_contents.lines().collect();
+        assert_eq!(
+            rotated_lines.len(),
+            2,
+            "rotated sibling holds header + first event; got {rotated_lines:?}"
+        );
+        let rotated_header: serde_json::Value =
+            serde_json::from_str(rotated_lines[0]).unwrap_or_else(|error| panic!("rotated header is not JSON: {error}"));
+        assert_eq!(rotated_header["type"], "header");
+        assert_eq!(rotated_header["aetherVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(rotated_header["startedAt"], started_at);
+        // The event line on the rotated sibling is the trigger event, with
+        // the turn numbering carried across rotation (turn 1).
+        let rotated_event: serde_json::Value =
+            serde_json::from_str(rotated_lines[1]).unwrap_or_else(|error| panic!("rotated event is not JSON: {error}"));
+        assert_eq!(rotated_event["turn"], 1);
+        assert_eq!(rotated_event["type"], "turn_started");
     }
 }
