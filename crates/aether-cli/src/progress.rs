@@ -60,14 +60,24 @@ pub(crate) fn tool_progress_update(event: &AgentEvent) -> Option<ToolProgressUpd
 /// tracks whether a line is currently visible so clearing an idle state
 /// writes nothing to the sink. Generic over `Write` so tests can use a
 /// `Vec<u8>` to assert byte-for-byte output.
+///
+/// When `color` is `false` (e.g. the [`NO_COLOR`] environment variable is
+/// set) the reporter writes a newline-terminated plain-text line on each
+/// `Show` and writes nothing on `clear`, so the CLI emits no ANSI or
+/// cursor-control escape sequences. This produces a different but
+/// still-readable live progress indicator than the colourful form
+/// (one line per tool start, no in-place replacement) — see module docs.
+///
+/// [`NO_COLOR`]: https://no-color.org/
 pub(crate) struct ToolProgressReporter<W: Write> {
     sink: W,
     active: bool,
+    color: bool,
 }
 
 impl<W: Write> ToolProgressReporter<W> {
-    pub(crate) fn new(sink: W) -> Self {
-        Self { sink, active: false }
+    pub(crate) fn new(sink: W, color: bool) -> Self {
+        Self { sink, active: false, color }
     }
 
     /// Apply a derived update: show the named tool or clear the line. Errors
@@ -76,10 +86,19 @@ impl<W: Write> ToolProgressReporter<W> {
     pub(crate) fn apply(&mut self, update: ToolProgressUpdate) -> io::Result<()> {
         match update {
             ToolProgressUpdate::Show(name) => {
-                // `\r` returns to column 0 so the new name overwrites the
-                // previous one in place; `\x1b[K` erases to end of line so a
-                // shorter name cannot leave a tail of the previous text.
-                write!(self.sink, "\r{}\x1b[K", tool_progress_line(&name))?;
+                if self.color {
+                    // `\r` returns to column 0 so the new name overwrites the
+                    // previous one in place; `\x1b[K` erases to end of line so
+                    // a shorter name cannot leave a tail of the previous
+                    // text.
+                    write!(self.sink, "\r{}\x1b[K", tool_progress_line(&name))?;
+                } else {
+                    // Plain-text fallback for `NO_COLOR=1`: one newline-
+                    // terminated line per tool start, no escape sequences.
+                    // Each tool starts on a new line; a subsequent `Show`
+                    // simply appends another line rather than overwriting.
+                    writeln!(self.sink, "{}", tool_progress_line(&name))?;
+                }
                 self.sink.flush()?;
                 self.active = true;
                 Ok(())
@@ -94,9 +113,15 @@ impl<W: Write> ToolProgressReporter<W> {
         if !self.active {
             return Ok(());
         }
-        // `\r` returns to column 0 and `\x1b[2K` erases the whole line.
-        write!(self.sink, "\r\x1b[2K")?;
-        self.sink.flush()?;
+        if self.color {
+            // `\r` returns to column 0 and `\x1b[2K` erases the whole line.
+            write!(self.sink, "\r\x1b[2K")?;
+            self.sink.flush()?;
+        }
+        // Without colour there is no in-place line to erase; each `Show`
+        // already terminated its own line, so the next `Show` simply writes
+        // a fresh line. Either way the active flag is cleared so subsequent
+        // idle `clear` calls stay no-ops.
         self.active = false;
         Ok(())
     }
@@ -161,7 +186,7 @@ mod tests {
 
     #[test]
     fn tool_progress_reporter_replaces_and_clears() {
-        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new());
+        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new(), true);
         reporter.apply(ToolProgressUpdate::Show("bash".to_string())).unwrap();
         reporter.apply(ToolProgressUpdate::Show("edit_file".to_string())).unwrap();
         reporter.apply(ToolProgressUpdate::Clear).unwrap();
@@ -191,9 +216,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_progress_reporter_no_color_writes_plain_lines() {
+        // With colour off the reporter must emit only plain text: no `\r`,
+        // no `0x1b`, one newline-terminated line per `Show`, and a silent
+        // `clear`. This is the byte-level proof for the `NO_COLOR=1` path
+        // the headless integration test below drives end-to-end.
+        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new(), false);
+        reporter.apply(ToolProgressUpdate::Show("bash".to_string())).unwrap();
+        reporter.apply(ToolProgressUpdate::Show("edit_file".to_string())).unwrap();
+        reporter.apply(ToolProgressUpdate::Clear).unwrap();
+
+        let bytes = reporter.sink.clone();
+        assert!(!bytes.contains(&0x1b), "colour off must not emit any 0x1b byte: {bytes:?}");
+        assert!(!bytes.contains(&b'\r'), "colour off must not emit carriage returns: {bytes:?}");
+        // Two `Show`s plus the newline terminator on each: the second name
+        // must come after the first in source order, separated by a newline.
+        let first = "⏺ bash\n".as_bytes().to_vec();
+        let second = "⏺ edit_file\n".as_bytes().to_vec();
+        let first_offset = bytes.windows(first.len()).position(|w| w == first.as_slice());
+        let second_offset = bytes.windows(second.len()).position(|w| w == second.as_slice());
+        assert!(
+            first_offset.is_some() && second_offset.is_some(),
+            "both tool names should be present on their own lines: {bytes:?}"
+        );
+        let first_offset = first_offset.unwrap();
+        let second_offset = second_offset.unwrap();
+        assert!(second_offset > first_offset, "second tool name must follow the first: {bytes:?}");
+        assert!(bytes.ends_with(b"\n"), "clear in colour-off mode still leaves the last newline terminated: {bytes:?}");
+        // Second clear after the line is gone is a no-op, so bytes do not
+        // change (and still contain no escape characters).
+        let before = reporter.sink.clone();
+        reporter.clear().unwrap();
+        assert_eq!(reporter.sink, before, "second clear must not write extra bytes");
+        assert!(!reporter.sink.contains(&0x1b));
+    }
+
+    #[test]
     fn tool_progress_reporter_clear_is_noop_when_idle() {
-        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new());
+        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new(), true);
         // Never called `apply`, so nothing is active; clear must not write anything.
+        reporter.clear().unwrap();
+        assert!(reporter.sink.is_empty(), "idle clear should not emit bytes: {:?}", reporter.sink);
+    }
+
+    #[test]
+    fn tool_progress_reporter_clear_is_noop_when_idle_no_color() {
+        // Same guarantee for the colour-off branch: an idle `clear` stays a
+        // silent no-op so a quiet, NO_COLOR run leaves no stray bytes on
+        // stderr.
+        let mut reporter = ToolProgressReporter::new(Vec::<u8>::new(), false);
         reporter.clear().unwrap();
         assert!(reporter.sink.is_empty(), "idle clear should not emit bytes: {:?}", reporter.sink);
     }

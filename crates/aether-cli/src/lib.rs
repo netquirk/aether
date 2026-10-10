@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod client;
+pub(crate) mod color;
 pub mod credentials;
 pub mod error;
 pub(crate) mod file_changes;

@@ -167,7 +167,12 @@ async fn stream_output<W: io::Write>(
     // still updates the status line. When `--quiet` is set the reporter is
     // still constructed (so the post-loop `clear()` calls stay safe) but
     // `apply()` is skipped below, so no progress bytes reach `progress_writer`.
-    let mut progress = ToolProgressReporter::new(progress_writer);
+    // Resolved once per run from the `NO_COLOR` environment variable via
+    // [`crate::color::color_enabled`]: when colour is off the reporter writes
+    // plain newline-terminated lines and never emits ANSI / cursor-control
+    // sequences, regardless of `--quiet`.
+    let color = crate::color::color_enabled();
+    let mut progress = ToolProgressReporter::new(progress_writer, color);
     // Live one-line stall warning for provider calls that exceed
     // `provider_stall_warn`. Fed the same events as `provider_wait`. The
     // select loop below races `rx.recv()` against the watch's deadline so a
@@ -398,7 +403,10 @@ pub(crate) fn setup_tracing(verbose: bool) {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = if verbose { EnvFilter::new("debug,agent=off") } else { EnvFilter::new("warn,agent=off") };
-    let layer = fmt::layer().with_writer(io::stderr).with_filter(filter);
+    // Gate the fmt layer's ANSI on the same `NO_COLOR` signal the live
+    // progress line honours: a `NO_COLOR=1` run emits log records to stderr
+    // in plain text, matching the rest of the colour-free output.
+    let layer = fmt::layer().with_writer(io::stderr).with_ansi(crate::color::color_enabled()).with_filter(filter);
 
     let _ = tracing_subscriber::registry().with(layer).try_init();
 }
@@ -409,6 +417,13 @@ mod tests {
 
     use super::*;
     use llm::ContextUsage;
+
+    /// Process-global lock borrowed from [`crate::color::tests::ENV_LOCK`]:
+    /// every test in the crate that mutates `NO_COLOR` shares it so no two
+    /// run in parallel. Declared `&'static Mutex<()>` so it's a single
+    /// crate-wide instance the static reference borrows.
+    use crate::color::tests::ENV_LOCK as NO_COLOR_LOCK;
+    static ENV_LOCK: &std::sync::Mutex<()> = &NO_COLOR_LOCK;
 
     #[test]
     fn event_kind_none_for_non_output_fragments() {
@@ -750,6 +765,97 @@ mod tests {
         let mut sink = Vec::new();
         stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None).await;
         assert!(sink.is_empty(), "quiet must not write progress bytes: {sink:?}");
+    }
+
+    /// RAII guard that captures the pre-test value of `NO_COLOR` and restores
+    /// it on drop. The `Drop` impl calls `unsafe` `env::{set_var, remove_var}`
+    /// because edition 2024 marks those `unsafe` (process-global mutation).
+    struct EnvGuard(std::option::Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("NO_COLOR", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("NO_COLOR");
+                },
+            }
+        }
+    }
+
+    /// Drive `stream_output` with one synthetic `ExecutionStarted`+`turn_ended`
+    /// sequence, returning every byte the progress writer received. Used by
+    /// [`stream_output_no_color_emits_plain_progress_line`] to assert
+    /// byte-level guarantees from both colour states.
+    async fn drain_progress_sink() -> Vec<u8> {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(execution_started("bash")).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+        let mut sink = Vec::new();
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None).await;
+        sink
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_no_color_emits_plain_progress_line() {
+        // The lock below is a process-global; we hold it across the
+        // `stream_output` future because the colour decision reads
+        // `NO_COLOR` once at run start, and another test could mutate the
+        // environment between the env write and the future's read on a
+        // multi-threaded runtime. With `current_thread` the only awaits are
+        // on the same task as the holder, so no other task can race for the
+        // mutex; the allow documents that the test is intentionally
+        // single-threaded rather than relying on the runtime default.
+        #[allow(clippy::await_holding_lock)]
+        async fn body() {
+            // The colour-state decision is read once at the top of
+            // `stream_output`, so every nested test below restores `NO_COLOR`
+            // to its prior value on the way out (even on panic) before the
+            // next test runs. Same convention as `with_env` in
+            // `crates/aether-core/tests/mcp/config_parser_tests.rs`.
+            let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = std::env::var_os("NO_COLOR");
+
+            // With `NO_COLOR=1` the progress line must still appear (so a
+            // watcher on stderr can see tool names) but only as plain text:
+            // no `0x1b`, no `\r`, the tool name on a single terminated line.
+            unsafe {
+                std::env::set_var("NO_COLOR", "1");
+            }
+            let restore = EnvGuard(prior.clone());
+            let sink = drain_progress_sink().await;
+            assert!(!sink.contains(&0x1b), "NO_COLOR=1 run must not contain any 0x1b escape byte: {sink:?}");
+            assert!(!sink.contains(&b'\r'), "NO_COLOR=1 run must not contain carriage returns: {sink:?}");
+            assert!(
+                sink.windows(b"\xe2\x8f\xba".len()).any(|w| w == b"\xe2\x8f\xba"),
+                "tool name should still be on the plain-text line: {sink:?}"
+            );
+            drop(restore);
+
+            // With `NO_COLOR` absent the in-place colourful form returns.
+            unsafe {
+                std::env::remove_var("NO_COLOR");
+            }
+            let restore = EnvGuard(prior.clone());
+            let sink = drain_progress_sink().await;
+            assert!(sink.contains(&0x1b), "colour run must contain at least one 0x1b escape byte: {sink:?}");
+            assert!(
+                sink.windows(b"\x1b[K".len()).any(|w| w == b"\x1b[K"),
+                "colour run must use the in-place replacement form (`\\x1b[K` to erase to EOL): {sink:?}"
+            );
+            assert!(
+                sink.windows(b"\r\x1b[2K".len()).any(|w| w == b"\r\x1b[2K"),
+                "colour run must end with the full-line clear escape: {sink:?}"
+            );
+            assert!(
+                sink.starts_with(b"\r"),
+                "colour run should start with the carriage-return that overwrites the previous tool: {sink:?}"
+            );
+            drop(restore);
+        }
+
+        body().await;
     }
 
     #[tokio::test]
