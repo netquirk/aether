@@ -73,6 +73,17 @@ struct Cli {
     #[arg(long = "list-profiles")]
     list_profiles: bool,
 
+    /// Validate the loaded config and exit without starting a run.
+    ///
+    /// Reads the same settings the subcommands do (defaults, or the file
+    /// named by `--config`/`--settings-file`/the inline `--settings-json`)
+    /// and exercises the same JSON / schema validation the run path sees.
+    /// Exits 0 when the config loads, and prints the error and exits
+    /// non-zero when it does not. Does not build a session, runtime, or
+    /// provider client.
+    #[arg(long = "check-config")]
+    check_config: bool,
+
     /// How much the run logs: one of `error`, `warn`, `info`, or `debug`.
     /// Forwarded to every subcommand that produces tracing output, so the
     /// flag may be placed before the subcommand (`aether --log-level debug headless …`)
@@ -140,7 +151,9 @@ fn main() -> ExitCode {
     // subcommand-level flag wins when both are set.
     let top_log_level = cli.log_level;
 
-    let result: Result<ExitCode, MainError> = if cli.list_profiles {
+    let result: Result<ExitCode, MainError> = if cli.check_config {
+        check_config(&cli.settings_source).map(|()| ExitCode::SUCCESS)
+    } else if cli.list_profiles {
         list_profiles(&cli.settings_source).map(|()| ExitCode::SUCCESS)
     } else {
         let rt = Runtime::new().expect("Failed to create tokio runtime");
@@ -270,6 +283,18 @@ fn default_status_line() -> StatusLineSettings {
             StatusLineSegmentConfig::ServerHealth,
         ]),
     }
+}
+
+/// Load the config and report whether it is valid. The load performs the
+/// same JSON / schema validation the run path sees; on failure `main`
+/// prints the error to stderr and returns `ExitCode::FAILURE` via the
+/// `MainError::Settings` variant. Does not start a run, build a tokio
+/// runtime, or contact any provider.
+fn check_config(source: &SettingsSourceArgs) -> Result<(), MainError> {
+    let cwd = current_dir()?;
+    source.load_settings(&cwd).map_err(|e| MainError::Settings(e.to_string()))?;
+    println!("Configuration is valid");
+    Ok(())
 }
 
 /// Print every profile (agent) name from the loaded config, one per line, and
