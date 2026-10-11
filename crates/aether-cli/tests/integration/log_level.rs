@@ -51,7 +51,7 @@ fn accepts_each_log_level_before_the_subcommand() -> TestResult {
     let dir = tempfile::tempdir()?;
     let config_path = write_settings_with_unknown_key(dir.path())?;
 
-    for level in ["error", "warn", "info", "debug"] {
+    for level in ["error", "warn", "info", "debug", "trace"] {
         let output = Command::new(env!("CARGO_BIN_EXE_aether"))
             .arg("--log-level")
             .arg(level)
@@ -86,7 +86,7 @@ fn accepts_each_log_level_after_the_subcommand() -> TestResult {
     let dir = tempfile::tempdir()?;
     let config_path = write_settings_with_unknown_key(dir.path())?;
 
-    for level in ["error", "warn", "info", "debug"] {
+    for level in ["error", "warn", "info", "debug", "trace"] {
         let output = Command::new(env!("CARGO_BIN_EXE_aether"))
             .arg("headless")
             .arg("--dry-run")
@@ -203,7 +203,7 @@ fn rejects_unknown_log_level_value() -> TestResult {
         output.status.code(),
     );
     assert!(stderr.contains("bogus"), "stderr must name the rejected value `bogus`; got:\n{stderr}");
-    for allowed in ["error", "warn", "info", "debug"] {
+    for allowed in ["error", "warn", "info", "debug", "trace"] {
         assert!(stderr.contains(allowed), "stderr must list `{allowed}` as an accepted value; got:\n{stderr}");
     }
 

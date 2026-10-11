@@ -68,7 +68,7 @@ pub struct RunConfig {
     /// Explicit `--log-level` (TASK-25-41). `None` falls back to the
     /// `--verbose` boolean via [`LogLevel::resolve`] so existing
     /// `--verbose` callers keep their `debug` level while new runs can pick
-    /// `error`/`warn`/`info`/`debug` directly.
+    /// `error`/`warn`/`info`/`debug`/`trace` directly.
     pub log_level: Option<LogLevel>,
     /// File the run's tracing log is redirected to (TASK-25-48). When
     /// `Some`, `setup_tracing` opens the path in append mode (creating it
@@ -280,9 +280,9 @@ pub struct HeadlessArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`
-    /// (TASK-25-41). Overrides `--verbose` when both are set; the default
-    /// when neither is set is `warn`, matching the pre-existing
+    /// How much the run logs: one of `error`, `warn`, `info`, `debug`, or
+    /// `trace` (TASK-25-41). Overrides `--verbose` when both are set; the
+    /// default when neither is set is `warn`, matching the pre-existing
     /// non-verbose behaviour. The flag is also accepted before the
     /// subcommand (`aether --log-level debug headless …`); both placements
     /// resolve to this field.
@@ -787,6 +787,7 @@ mod tests {
             ("warn", LogLevel::Warn),
             ("info", LogLevel::Info),
             ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
         ];
         for (raw, expected) in cases {
             let parsed = QuietHarness::try_parse_from(["aether", "--log-level", raw, "hello"])
@@ -817,7 +818,7 @@ mod tests {
             .expect("--log-level bogus must be rejected by clap");
         let rendered = error.to_string();
         assert!(rendered.contains("bogus"), "diagnostic must name the rejected value: {rendered}");
-        for allowed in ["error", "warn", "info", "debug"] {
+        for allowed in ["error", "warn", "info", "debug", "trace"] {
             assert!(rendered.contains(allowed), "diagnostic must list `{allowed}` as an accepted value: {rendered}");
         }
     }

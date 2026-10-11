@@ -1,6 +1,7 @@
 pub(crate) mod agent;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod fake_prompt_mcp;
+pub(crate) mod message_log;
 pub(crate) mod protocol;
 pub mod server;
 pub(crate) mod session;
@@ -10,6 +11,7 @@ pub mod testing;
 
 pub use protocol::map_mcp_prompt_to_available_command;
 
+use crate::acp::message_log::log_acp_message;
 use crate::acp::server::DetachedArgs;
 use crate::acp::state::{AcpState, AcpStateConfig};
 use crate::credentials::oauth_credential_store_from_config;
@@ -23,7 +25,7 @@ use aether_project::AetherSettings;
 use aether_sessions::SessionStore;
 use aether_telemetry::{AgentTraceContext, TelemetryInitError};
 use agent_client_protocol as acp;
-use agent_client_protocol::Stdio;
+use agent_client_protocol::{LineDirection, Stdio};
 use llm::catalog::{ReasoningEffortError, validate_reasoning_effort};
 use llm::{ProviderConnectionOverride, ProviderConnectionOverrides, ReasoningEffort};
 use std::collections::BTreeMap;
@@ -85,11 +87,14 @@ pub struct AcpArgs {
     #[arg(short = 'C', long = "cwd", value_name = "DIR", default_value = ".")]
     pub cwd: PathBuf,
 
-    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`
-    /// (TASK-25-41). When set, replaces the default `warn` filter applied
-    /// to the per-day log file. The flag is also accepted before the
-    /// subcommand (`aether --log-level debug acp …`); the subcommand-level
-    /// flag wins when both are set.
+    /// How much the run logs: one of `error`, `warn`, `info`, `debug`, or
+    /// `trace` (TASK-25-41). When set, replaces the default `warn` filter
+    /// applied to the per-day log file. `trace` additionally installs a
+    /// debug callback on the stdio ACP transport so every message the
+    /// server sends and receives is recorded in the log file as a single
+    /// line naming its direction and method (TASK-25-467). The flag is also
+    /// accepted before the subcommand (`aether --log-level debug acp …`);
+    /// the subcommand-level flag wins when both are set.
     #[arg(long = "log-level", value_name = "LEVEL")]
     pub log_level: Option<LogLevel>,
 }
@@ -172,8 +177,15 @@ pub async fn run_acp(args: AcpArgs) -> Result<AcpRunOutcome, AcpRunError> {
 
     let cwd = resolve_session_root(&args)?;
     warn_if_not_a_repository(&cwd);
+    // `--log-level trace` (TASK-25-467) attaches a one-line debug callback
+    // to the stdio ACP transport so every JSON-RPC message is logged. We
+    // compute the gate here — before `args` is moved into
+    // `create_acp_state` — and reuse it below to pick the right transport.
+    let trace_messages = args.log_level == Some(LogLevel::Trace);
     let state = Arc::new(create_acp_state(args, &cwd, DetachedArgs::default())?);
-    let connect_result = state.serve(Stdio::new(), state.stop_token()).await;
+    let transport =
+        if trace_messages { Stdio::new().with_debug(log_acp_message as fn(&str, LineDirection)) } else { Stdio::new() };
+    let connect_result = state.serve(transport, state.stop_token()).await;
     state.shutdown_all().await;
 
     match connect_result {

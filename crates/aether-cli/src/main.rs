@@ -84,13 +84,15 @@ struct Cli {
     #[arg(long = "check-config")]
     check_config: bool,
 
-    /// How much the run logs: one of `error`, `warn`, `info`, or `debug`.
-    /// Forwarded to every subcommand that produces tracing output, so the
-    /// flag may be placed before the subcommand (`aether --log-level debug headless …`)
-    /// or after it (`aether headless --log-level debug …`); the first
-    /// placement wins when both are set. Without it, the legacy `--verbose`
-    /// flag (still accepted on the headless subcommand) controls the level,
-    /// defaulting to `warn` when neither is set.
+    /// How much the run logs: one of `error`, `warn`, `info`, `debug`, or
+    /// `trace`. Forwarded to every subcommand that produces tracing output,
+    /// so the flag may be placed before the subcommand (`aether --log-level
+    /// debug headless …`) or after it (`aether headless --log-level debug
+    /// …`); the first placement wins when both are set. Without it, the
+    /// legacy `--verbose` flag (still accepted on the headless subcommand)
+    /// controls the level, defaulting to `warn` when neither is set.
+    /// `trace` additionally logs every ACP message the `acp` subcommand
+    /// sends and receives (TASK-25-467).
     #[arg(long = "log-level", value_name = "LEVEL")]
     log_level: Option<LogLevel>,
 
@@ -359,6 +361,7 @@ fn default_agent_command(model: Option<&str>, log_level: Option<LogLevel>) -> St
             LogLevel::Warn => "warn",
             LogLevel::Info => "info",
             LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
         };
         parts.push(format!("--log-level {rendered}"));
     }

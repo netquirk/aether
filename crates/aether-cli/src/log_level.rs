@@ -1,15 +1,16 @@
 //! Shared `--log-level` enum for the `aether` CLI.
 //!
-//! Four named verbosity values (`error`, `warn`, `info`, `debug`) that map
-//! to `tracing_subscriber` `EnvFilter` directives. The `agent=off` suffix
-//! silences the `agent` crate so its loud model-internal events do not drown
-//! out our own logs, matching the behaviour the previous
+//! Five named verbosity values (`error`, `warn`, `info`, `debug`, `trace`)
+//! that map to `tracing_subscriber` `EnvFilter` directives. The `agent=off`
+//! suffix silences the `agent` crate so its loud model-internal events do
+//! not drown out our own logs, matching the behaviour the previous
 //! `--verbose`/`setup_tracing` path established.
 
 /// Verbosity for the run's tracing output.
 ///
 /// The `clap` derive renders the variants in their default `lower` form
-/// (`error`, `warn`, `info`, `debug`) so no `rename_all` attribute is needed.
+/// (`error`, `warn`, `info`, `debug`, `trace`) so no `rename_all` attribute
+/// is needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum LogLevel {
     /// `error` and above
@@ -20,6 +21,9 @@ pub enum LogLevel {
     Info,
     /// `debug` and above
     Debug,
+    /// `trace` and above. The full ACP message stream is logged through this
+    /// level (see `crates/aether-cli/src/acp/message_log.rs`).
+    Trace,
 }
 
 impl LogLevel {
@@ -32,6 +36,7 @@ impl LogLevel {
             LogLevel::Warn => "warn,agent=off",
             LogLevel::Info => "info,agent=off",
             LogLevel::Debug => "debug,agent=off",
+            LogLevel::Trace => "trace,agent=off",
         }
     }
 }
@@ -54,6 +59,7 @@ mod tests {
         assert_eq!(LogLevel::Warn.directive(), "warn,agent=off");
         assert_eq!(LogLevel::Info.directive(), "info,agent=off");
         assert_eq!(LogLevel::Debug.directive(), "debug,agent=off");
+        assert_eq!(LogLevel::Trace.directive(), "trace,agent=off");
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod acp_prompt_search;
 mod acp_remote;
 mod acp_session_lifecycle;
 mod acp_stdio;
+mod acp_trace;
 mod acp_workspace_move;
 mod check_config;
 mod config_flag;
