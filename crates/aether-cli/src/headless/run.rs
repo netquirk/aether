@@ -172,6 +172,14 @@ async fn run_agent(
         .mcp_sources(config.mcp_config_sources)
         .settings_tool_output(config.settings_tool_output.clone())
         .shell_environment(config.shell_environment.clone())
+        // Per-command shell timeout (TASK-26-470): forwarded into the MCP
+        // builder via `RuntimeBuilder::shell_command_timeout` so a tool-spawned
+        // shell command that outruns the configured limit is killed and the
+        // transcript record for that tool call names it. `None` keeps the
+        // pre-existing no-cap behaviour, matching every pre-existing caller
+        // (and the `0`/absent-settings path `RunSettings::shell_command_timeout`
+        // resolves to).
+        .shell_command_timeout(config.shell_command_timeout)
         .disable_tools(config.disable_tools.clone())
         .agent_deps(deps)
         .build_ready(resume_messages)

@@ -17,6 +17,7 @@ use mcp_utils::client::{
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::debug;
 
@@ -35,6 +36,13 @@ pub struct RuntimeBuilder {
     /// which merges them with the internal gateway socket inside
     /// [`spawn_mcp`].
     shell_environment: BTreeMap<String, String>,
+    /// Per-command wall-clock ceiling applied to every shell command a run
+    /// starts (the `bash` tool of the built-in `coding` MCP server). Sourced
+    /// from the top-level `run.shellCommandTimeoutSeconds` block of the loaded
+    /// settings and resolved via [`RunSettings::shell_command_timeout`] so the
+    /// `None`/zero disabled path is preserved. Threaded into
+    /// [`McpBuilder::with_shell_command_timeout`] inside [`spawn_mcp`].
+    shell_command_timeout: Option<Duration>,
     mcp_config_sources: Vec<McpConfigSource>,
     extra_mcp_servers: Vec<McpServer>,
     oauth_applicator: Option<Box<dyn FnOnce(McpBuilder) -> McpBuilder + Send>>,
@@ -67,6 +75,7 @@ impl RuntimeBuilder {
             spec,
             settings_tool_output: None,
             shell_environment: BTreeMap::new(),
+            shell_command_timeout: None,
             mcp_config_sources: Vec::new(),
             extra_mcp_servers: Vec::new(),
             oauth_applicator: None,
@@ -92,6 +101,20 @@ impl RuntimeBuilder {
     /// merged over its process environment.
     pub fn shell_environment(mut self, vars: BTreeMap<String, String>) -> Self {
         self.shell_environment = vars;
+        self
+    }
+
+    /// Set the top-level `run.shellCommandTimeoutSeconds` block from the
+    /// loaded settings. The CLI threads it into
+    /// [`McpBuilder::with_shell_command_timeout`] inside [`spawn_mcp`] so the
+    /// built-in `coding` MCP server's `bash` tool kills any command that
+    /// outruns the configured limit and marks the result with a `killed:
+    /// true` plus a "timed out after …" marker in its structured output.
+    /// `None` preserves the pre-existing no-cap behaviour, matching the
+    /// `0`/absent-settings path [`RunSettings::shell_command_timeout`]
+    /// resolves to.
+    pub fn shell_command_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.shell_command_timeout = timeout;
         self
     }
 
@@ -215,6 +238,18 @@ impl RuntimeBuilder {
         }
 
         builder = builder.with_agent_deps(deps).with_shell_environment(self.shell_environment).with_builtin_servers();
+
+        // Per-command shell timeout (TASK-26-470). Forward the resolved
+        // `run.shellCommandTimeoutSeconds` to the MCP builder so the built-in
+        // `coding` server's `bash` tool kills any command that outruns it.
+        // Guarded by `if let Some(...)` because
+        // [`McpBuilder::with_shell_command_timeout`] takes a non-optional
+        // `Duration` (the MCP API's disabled state is the absent call); the
+        // resolved `None` keeps the pre-existing no-cap behaviour so every
+        // pre-existing caller is unchanged.
+        if let Some(timeout) = self.shell_command_timeout {
+            builder = builder.with_shell_command_timeout(timeout);
+        }
 
         if !self.extra_mcp_servers.is_empty() {
             builder = builder.with_servers(self.extra_mcp_servers);

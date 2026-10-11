@@ -80,3 +80,4 @@ aether-agent-cli = { path = ".", features = ["testing"] }
 aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.8.4", features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 acp_utils = { package = "aether-acp-utils", path = "../acp-utils", features = ["testing"], version = "0.5.4" }
+serde_yml = { workspace = true }

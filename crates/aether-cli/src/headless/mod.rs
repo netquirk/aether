@@ -136,6 +136,19 @@ pub struct RunConfig {
     /// built-in `coding` MCP server's `bash` tool sees them merged over the
     /// process environment.
     pub shell_environment: BTreeMap<String, String>,
+    /// Per-command wall-clock ceiling applied to every shell command a run
+    /// starts (TASK-26-470). When set, the built-in `coding` MCP server's
+    /// `bash` tool kills any command that outruns the limit and marks the
+    /// result with a `killed: true` plus a "timed out after …" marker in its
+    /// structured output. Resolved from the top-level
+    /// `run.shellCommandTimeoutSeconds` block via
+    /// [`RunSettings::shell_command_timeout`] so the `None`/zero disabled
+    /// path returns `None` here. Threaded into the runtime via
+    /// [`crate::runtime::RuntimeBuilder::shell_command_timeout`], which
+    /// forwards it to
+    /// [`aether_core::mcp::McpBuilder::with_shell_command_timeout`] inside
+    /// the CLI's MCP setup.
+    pub shell_command_timeout: Option<Duration>,
     /// Threshold after which the headless CLI prints a one-line warning
     /// naming the elapsed wait when a provider call is still in flight
     /// (TASK-24-378). `None` disables the warning so the existing run shape
@@ -474,6 +487,7 @@ impl RunConfig {
         let settings_tool_output = settings.tool_output.clone();
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
+        let shell_command_timeout = settings.run.as_ref().and_then(RunSettings::shell_command_timeout);
         let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
         // Heartbeat default lives on `RunSettings::default_heartbeat_interval`
         // so a wholly-absent `run` block still emits a heartbeat (TASK-26-111);
@@ -511,6 +525,7 @@ impl RunConfig {
             trace_context: None,
             settings_tool_output,
             shell_environment,
+            shell_command_timeout,
             provider_stall_warn,
             heartbeat_interval,
             transcript_jsonl: args.transcript_jsonl,
@@ -534,6 +549,7 @@ impl RunConfig {
         let settings_tool_output = settings.tool_output.clone();
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
+        let shell_command_timeout = settings.run.as_ref().and_then(RunSettings::shell_command_timeout);
         let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
         // Heartbeat default lives on `RunSettings::default_heartbeat_interval`
         // so a wholly-absent `run` block still emits a heartbeat (TASK-26-111);
@@ -586,6 +602,7 @@ impl RunConfig {
             trace_context: options.trace_context,
             settings_tool_output,
             shell_environment,
+            shell_command_timeout,
             provider_stall_warn,
             heartbeat_interval,
             transcript_jsonl: options.transcript_jsonl,
