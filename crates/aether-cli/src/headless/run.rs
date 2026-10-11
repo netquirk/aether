@@ -66,8 +66,13 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     // runs do not acquire the lock and can coexist with an active run.
     let _run_lock = crate::run_lock::RunLock::acquire(&config.cwd)?;
     let log_file = config.log_file.clone();
-    setup_tracing(resolve_log_level(config.log_level, config.verbose), config.log_file.as_deref(), config.log_format)
-        .map_err(|source| match log_file {
+    setup_tracing(
+        resolve_log_level(config.log_level, config.verbose),
+        config.log_file.as_deref(),
+        config.log_format,
+        config.log_max_bytes,
+    )
+    .map_err(|source| match log_file {
         Some(path) => CliError::LogFileOpen { path, source },
         None => CliError::IoError(source),
     })?;
@@ -818,6 +823,7 @@ pub(crate) fn setup_tracing(
     level: LogLevel,
     log_file: Option<&Path>,
     format: crate::log_format::LogFormat,
+    max_bytes: Option<u64>,
 ) -> std::io::Result<()> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
@@ -833,9 +839,21 @@ pub(crate) fn setup_tracing(
     // missing parent directories still fail the run; the file is opened
     // in append mode (TASK-25-48) so an operator's existing log is
     // preserved across runs.
-    let writer = match log_file {
-        None => BoxMakeWriter::new(io::stderr),
-        Some(path) => {
+    //
+    // Size-based rotation (TASK-26-92) lives behind `--log-max-bytes`. The
+    // `Some(n) if n > 0` branch swaps the bare `File` writer for a
+    // `RotatingFileAppender` that renames the live file to `<stem>.1` and
+    // reopens a fresh empty file at the original path once a write crosses
+    // the threshold. `None` and `Some(0)` keep the pre-existing
+    // single-file behaviour byte-for-byte so a run with no `--log-max-bytes`
+    // flag is unchanged.
+    let writer = match (log_file, max_bytes) {
+        (None, _) => BoxMakeWriter::new(io::stderr),
+        (Some(path), Some(max)) if max > 0 => {
+            let appender = crate::rotating_log::RotatingFileAppender::new(path, max)?;
+            BoxMakeWriter::new(appender)
+        }
+        (Some(path), _) => {
             let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
             BoxMakeWriter::new(file)
         }

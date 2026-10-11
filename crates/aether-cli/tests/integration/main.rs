@@ -20,6 +20,7 @@ mod list_tools;
 mod log_file;
 mod log_format;
 mod log_level;
+mod log_rotation;
 mod mcp_command;
 mod resume;
 mod retry_reporting;

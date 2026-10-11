@@ -78,6 +78,15 @@ pub struct RunConfig {
     /// existing log is preserved across runs; the task only requires
     /// creating PATH if missing, not replacing it.
     pub log_file: Option<std::path::PathBuf>,
+    /// Maximum size of `--log-file` before a rotation fires (TASK-26-92).
+    /// When `Some(N)` and `N > 0`, the writer renames the live log to
+    /// `<stem>.1` (overwriting any previous rotated sibling) and opens a
+    /// fresh empty file at the original `--log-file` path once a write
+    /// crosses the threshold; a line naming the newly-opened file is
+    /// printed to stderr. `None` and `Some(0)` both disable rotation so the
+    /// pre-existing single-file behaviour is preserved byte-for-byte. No
+    /// effect when `log_file` is `None` (the run logs to stderr as before).
+    pub log_max_bytes: Option<u64>,
     /// Output format for the run's tracing log (TASK-25-99). `Text`
     /// (the default) preserves the pre-existing `fmt` layer; `Json`
     /// switches to the structured `tracing-subscriber` JSON formatter
@@ -229,11 +238,16 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // `--dry-run` short-circuit still writes the log to the file, and any
     // IO error opening the path fails the run before the agent starts.
     let log_file = args.log_file.clone();
-    run::setup_tracing(resolve_log_level(args.log_level, args.verbose), args.log_file.as_deref(), args.log_format)
-        .map_err(|source| match log_file {
-            Some(path) => CliError::LogFileOpen { path, source },
-            None => CliError::IoError(source),
-        })?;
+    run::setup_tracing(
+        resolve_log_level(args.log_level, args.verbose),
+        args.log_file.as_deref(),
+        args.log_format,
+        args.log_max_bytes,
+    )
+    .map_err(|source| match log_file {
+        Some(path) => CliError::LogFileOpen { path, source },
+        None => CliError::IoError(source),
+    })?;
     if args.dry_run {
         // Short-circuit before any prompt resolution, session construction,
         // MCP setup, telemetry runtime, or provider call: --dry-run only
@@ -314,6 +328,15 @@ pub struct HeadlessArgs {
     /// viewer.
     #[arg(long = "log-file", value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Rotate `--log-file` to `<stem>.1` when it reaches this many bytes;
+    /// the previous sibling is overwritten on each rotation and a fresh
+    /// empty file is opened at the original path (TASK-26-92). One line
+    /// naming the new file is printed to stderr. `0` or omitted disables
+    /// rotation so the run shape is preserved (no cap, single file). Only
+    /// meaningful together with `--log-file`.
+    #[arg(long = "log-max-bytes", value_name = "BYTES")]
+    pub log_max_bytes: Option<u64>,
 
     /// Format of the run's tracing log: `text` (default, unchanged) or
     /// `json` (TASK-25-99). With `json`, each log line is a single JSON
@@ -427,6 +450,7 @@ impl RunConfig {
             verbose: args.verbose,
             log_level: args.log_level,
             log_file: args.log_file,
+            log_max_bytes: args.log_max_bytes,
             // `--log-format json` is opted into via the flag; absent means
             // `text` (the pre-existing `setup_tracing` output). The default
             // is preserved on the `LogFormat` enum so this matches the
@@ -487,6 +511,13 @@ impl RunConfig {
             // `--options-json` callers (TASK-25-48) do not expose
             // `--log-file` either; the run logs to stderr as before.
             log_file: None,
+            // `--options-json` callers (TASK-26-92) do not expose
+            // `--log-max-bytes` either; a max there would be inert because
+            // `log_file` is forced to `None` above (the run logs to
+            // stderr). Hard-coding `None` keeps the rotation path
+            // unreachable from `--options-json`, so the run shape is
+            // preserved.
+            log_max_bytes: None,
             // `--options-json` callers do not expose `--log-format` either
             // (TASK-25-99); the run logs in the pre-existing text format
             // regardless of what the harness's other flags set.
