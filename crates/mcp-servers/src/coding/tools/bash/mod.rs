@@ -41,6 +41,10 @@ pub struct BashOutput {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BashEnvironment {
     vars: BTreeMap<String, String>,
+    /// Upper bound on a single command's wall time, applied in addition to
+    /// whatever deadline the caller passes per call. Set by
+    /// [`with_command_timeout`](Self::with_command_timeout).
+    command_timeout: Option<Duration>,
 }
 
 impl BashEnvironment {
@@ -51,6 +55,20 @@ impl BashEnvironment {
     pub fn with_var(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.vars.insert(name.into(), value.into());
         self
+    }
+
+    /// Set an environment-level ceiling on a single command's wall time. A
+    /// call that supplies its own deadline is bounded by the smaller of the
+    /// two; a call that does not is bounded by this one alone.
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout);
+        self
+    }
+
+    /// Read the environment-level ceiling set via
+    /// [`with_command_timeout`](Self::with_command_timeout).
+    pub fn command_timeout(&self) -> Option<Duration> {
+        self.command_timeout
     }
 
     pub fn with_path_prepend(self, directory: impl AsRef<Path>) -> Self {
@@ -85,7 +103,10 @@ pub fn validate_args(args: &BashInput) -> Result<(), BashError> {
     Ok(())
 }
 
-/// Runs `args.command` to completion; `args.timeout: None` means no timeout.
+/// Runs `args.command` to completion. The effective deadline is the smaller
+/// of `args.timeout` (caller-supplied, in milliseconds) and the environment's
+/// [`BashEnvironment::command_timeout`]; either being `None` falls back to
+/// the one that is set, and both `None` means no timeout.
 pub async fn execute_command(
     args: BashInput,
     cwd: Option<&Path>,
@@ -93,7 +114,11 @@ pub async fn execute_command(
 ) -> Result<BashOutput, BashError> {
     validate_args(&args)?;
 
-    let timeout = args.timeout.map(Duration::from_millis);
+    let call_timeout = args.timeout.map(Duration::from_millis);
+    let timeout = match (call_timeout, environment.command_timeout()) {
+        (Some(call), Some(env)) => Some(call.min(env)),
+        (call, env) => call.or(env),
+    };
 
     let mut command = Command::new("bash");
     command.arg("-c").arg(&args.command);
@@ -186,6 +211,7 @@ impl Drop for ProcessGroupGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[tokio::test]
     async fn environment_overrides_are_passed_to_bash() {
@@ -198,5 +224,95 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output.output, "present");
+    }
+
+    #[tokio::test]
+    async fn command_timeout_kills_a_long_running_command() {
+        let environment = BashEnvironment::new().with_command_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let output = execute_command(
+            BashInput { command: "sleep 5".into(), ..Default::default() },
+            None,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(output.killed, "long-running command should be marked killed");
+        assert_eq!(output.exit_code, -1);
+        assert!(
+            output.output.contains("timed out"),
+            "timed-out marker should appear in output, got {:?}",
+            output.output
+        );
+        assert!(
+            output.meta.as_ref().map(|meta| format!("{meta:?}").contains("timed out")).unwrap_or(false),
+            "display meta should mention the timed-out status"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "command should die well under 5s, elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_is_not_marked_killed() {
+        let environment = BashEnvironment::new().with_command_timeout(Duration::from_millis(200));
+        let output = execute_command(
+            BashInput { command: "exit 3".into(), ..Default::default() },
+            None,
+            &environment,
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.killed, "a non-zero exit must not be flagged as killed");
+        assert_eq!(output.exit_code, 3);
+        assert!(!output.output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn environment_timeout_caps_a_longer_call_timeout() {
+        let environment = BashEnvironment::new().with_command_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let output = execute_command(
+            BashInput { command: "sleep 5".into(), timeout: Some(30_000), ..Default::default() },
+            None,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(output.killed, "environment timeout must override a longer call timeout");
+        assert_eq!(output.exit_code, -1);
+        assert!(output.output.contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "command should die near the 200ms environment timeout, elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_timeout_caps_a_longer_environment_timeout() {
+        let environment = BashEnvironment::new().with_command_timeout(Duration::from_secs(10));
+        let started = Instant::now();
+        let output = execute_command(
+            BashInput { command: "sleep 5".into(), timeout: Some(150), ..Default::default() },
+            None,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(output.killed, "a shorter call timeout must still bound the command");
+        assert_eq!(output.exit_code, -1);
+        assert!(output.output.contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "command should die near the 150ms call timeout, elapsed = {elapsed:?}"
+        );
     }
 }

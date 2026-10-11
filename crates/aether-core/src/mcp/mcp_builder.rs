@@ -21,6 +21,7 @@ use rmcp::{RoleServer, service::DynService};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     sync::{
         mpsc::{self, Receiver},
@@ -39,6 +40,11 @@ pub struct RuntimeServices {
     pub root_dir: PathBuf,
     pub agent_deps: AgentDeps,
     pub shell_environment: BTreeMap<String, String>,
+    /// Optional ceiling on a single shell command's wall time, applied to the
+    /// built-in coding MCP server's `bash` tool. When set, an explicit
+    /// per-call deadline is capped by this value; when `None`, only the
+    /// per-call deadline (if any) bounds the command.
+    pub shell_command_timeout: Option<Duration>,
 }
 
 pub type ServerFactory = Box<
@@ -195,6 +201,10 @@ pub struct McpBuilder {
     /// [`spawn`](Self::spawn) so config-supplied values can never spoof the
     /// real socket.
     shell_environment: BTreeMap<String, String>,
+    /// Optional ceiling on a single shell command's wall time (the `bash`
+    /// tool of the built-in `coding` MCP server). Applied alongside any
+    /// per-call deadline; the smaller of the two wins.
+    shell_command_timeout: Option<Duration>,
 }
 
 impl McpBuilder {
@@ -218,6 +228,7 @@ impl McpBuilder {
             progressive_discovery_instructions: None,
             tool_output_cap: Arc::new(ToolOutputCap::new(0, root_dir.as_ref().join(".prairie/out"))),
             shell_environment: BTreeMap::new(),
+            shell_command_timeout: None,
         }
     }
 
@@ -269,6 +280,15 @@ impl McpBuilder {
     /// variable is written after this map and always wins.
     pub fn with_shell_environment(mut self, vars: BTreeMap<String, String>) -> Self {
         self.shell_environment = vars;
+        self
+    }
+
+    /// Set the per-command deadline applied to every shell command a run
+    /// starts through the built-in `coding` MCP server's `bash` tool. A
+    /// per-call deadline that exceeds this value is capped by it; a per-call
+    /// deadline shorter than this value still wins.
+    pub fn with_shell_command_timeout(mut self, timeout: Duration) -> Self {
+        self.shell_command_timeout = Some(timeout);
         self
     }
 
@@ -332,6 +352,7 @@ impl McpBuilder {
             progressive_discovery_instructions,
             tool_output_cap,
             shell_environment,
+            shell_command_timeout,
         } = self;
         if servers.iter().any(|server| server.tool_exposure.has_deferred_tools())
             && servers.iter().any(|server| server.name == PROGRESSIVE_DISCOVERY_INSTRUCTION_NAME)
@@ -355,7 +376,13 @@ impl McpBuilder {
             shell_environment
                 .insert(AETHER_MCP_IPC_SOCKET.to_string(), transport.path().to_string_lossy().into_owned());
         }
-        let services = RuntimeServices { mcp: mcp.clone(), root_dir: root_dir.clone(), agent_deps, shell_environment };
+        let services = RuntimeServices {
+            mcp: mcp.clone(),
+            root_dir: root_dir.clone(),
+            agent_deps,
+            shell_environment,
+            shell_command_timeout,
+        };
         let servers = resolve_servers(servers, &factories, &services).await?;
 
         let mut mcp_manager = McpManager::new(event_tx, oauth_handler_factory)
@@ -466,6 +493,37 @@ mod tests {
             &oauth_store,
         ));
         assert!(services.shell_environment.is_empty());
+        assert!(
+            services.shell_command_timeout.is_none(),
+            "shell_command_timeout should default to None when not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_command_timeout_is_passed_through_to_in_memory_factories() {
+        let received = Arc::new(Mutex::new(None::<RuntimeServices>));
+        let factory_received = Arc::clone(&received);
+        let factory: ServerFactory = Box::new(move |_, services| {
+            *factory_received.lock().unwrap() = Some(services);
+            async move { FakeMcpServer::new().into_dyn() }.boxed()
+        });
+        let configured = Duration::from_millis(200);
+
+        let _spawn = McpBuilder::new("/workspace")
+            .with_shell_command_timeout(configured)
+            .register_in_memory_server("test", factory)
+            .from_mcp_config_sources(&[json_source(r#"{"servers":{"test":{"type":"in-memory"}}}"#)])
+            .unwrap()
+            .spawn()
+            .await
+            .unwrap();
+
+        let services = received.lock().unwrap().clone().expect("factory received runtime services");
+        assert_eq!(
+            services.shell_command_timeout,
+            Some(configured),
+            "configured shell command timeout must reach RuntimeServices"
+        );
     }
 
     #[tokio::test]

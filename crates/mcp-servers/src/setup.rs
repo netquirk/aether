@@ -118,10 +118,14 @@ impl McpBuilderExt for McpBuilder {
 }
 
 fn coding_bash_environment(services: &RuntimeServices) -> BashEnvironment {
-    services
+    let environment = services
         .shell_environment
         .iter()
         .fold(BashEnvironment::new().with_current_exe_dir_on_path(), |environment, (name, value)| {
             environment.with_var(name, value)
-        })
+        });
+    match services.shell_command_timeout {
+        Some(timeout) => environment.with_command_timeout(timeout),
+        None => environment,
+    }
 }
