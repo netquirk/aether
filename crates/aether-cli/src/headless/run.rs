@@ -74,6 +74,19 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     // short-circuits in `run_headless` before this function is called, so dry
     // runs do not acquire the lock and can coexist with an active run.
     let _run_lock = crate::run_lock::RunLock::acquire(&config.cwd)?;
+    // Per-session-id run lock (TASK-26-163). Guards the same session a run
+    // in a different working directory could clobber — the cwd lock above
+    // cannot see that case. Holds a `SessionLock` value bound to a named
+    // local so its `Drop` releases the lock on every return path, matching
+    // the cwd lock's release contract. The guard is `None` when no
+    // `--session-id` was provided (the run takes no session lock, matching
+    // the pre-existing single-run behaviour), or when `aether_home()` is
+    // unavailable (warn-and-proceed so headless on a home-less host keeps
+    // working). `--dry-run` short-circuits above before reaching this line.
+    let _session_lock = match config.session_id.as_deref() {
+        Some(session_id) => crate::session_lock::SessionLock::acquire(session_id)?,
+        None => None,
+    };
     let log_file = config.log_file.clone();
     setup_tracing(
         resolve_log_level(config.log_level, config.verbose),

@@ -28,6 +28,7 @@ pub(crate) mod run_timeout;
 pub(crate) mod run_usage;
 pub mod runtime;
 pub mod sandbox;
+pub(crate) mod session_lock;
 pub mod settings;
 pub mod settings_args;
 pub mod show_prompt;

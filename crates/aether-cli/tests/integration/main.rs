@@ -28,6 +28,7 @@ mod retry_reporting;
 mod run_init;
 mod run_log_elapsed;
 mod run_model_log;
+mod session_lock;
 mod shell_environment;
 mod slash_commands;
 mod startup_version;

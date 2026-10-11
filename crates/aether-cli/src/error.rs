@@ -46,6 +46,17 @@ pub enum CliError {
 Its lock file is {path}; delete it if no run is active."
     )]
     RunLocked { path: PathBuf },
+    /// A second run tried to use a session id another run already holds
+    /// (TASK-26-163). Mirrors [`CliError::RunLocked`] but keys on the session
+    /// id rather than the working directory, so two `aether` runs in
+    /// different directories cannot clobber the same session transcript. The
+    /// message names the held session id and the lock file so an operator
+    /// who suspects the lock is stale knows exactly which session to release.
+    #[error(
+        "cannot start run: another aether run is already using session id {session_id}. \
+Its lock file is {path}; delete it if no run is active."
+    )]
+    SessionLocked { session_id: String, path: PathBuf },
     #[error("failed to resume from transcript {path}: {source}")]
     Resume {
         path: PathBuf,

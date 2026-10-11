@@ -188,6 +188,15 @@ pub struct RunConfig {
     /// any provider call (via `CliError::Resume`), so a bad transcript
     /// cannot produce a misleading resumed context.
     pub resume: Option<PathBuf>,
+    /// Explicit session id for this run (TASK-26-163). When set, the run
+    /// acquires a per-session id lock under
+    /// `$AETHER_HOME/sessions/<id>.lock` so two runs in different
+    /// working directories cannot clobber the same session transcript.
+    /// Mirrors the per-cwd `RunLock` but on a different axis (session id,
+    /// not cwd) and stored centrally under the aether home. `None`
+    /// preserves the pre-existing single-run behaviour: the run takes no
+    /// session-id lock.
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -236,6 +245,12 @@ pub struct HeadlessOptions {
     /// `None` (the default) preserves the pre-existing single-shot behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<PathBuf>,
+    /// Mirror of the `--session-id` flag for `--options-json` callers
+    /// (TASK-26-163). When set, the run acquires a per-session lock so a
+    /// second run holding the same id cannot start until this run ends.
+    /// `None` (the default) preserves the pre-existing single-run behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
@@ -424,6 +439,15 @@ pub struct HeadlessArgs {
     /// pre-existing single-shot behaviour.
     #[arg(long = "resume", value_name = "PATH")]
     pub resume: Option<PathBuf>,
+
+    /// Tag this run with a session id (TASK-26-163) so two runs holding the
+    /// same id cannot both clobber the same session transcript. The id is
+    /// used as the lock key under `$AETHER_HOME/sessions/<id>.lock`; an id
+    /// that contains a path separator, is empty, or is `.` / `..` is
+    /// rejected at parse time. Without `--session-id` the run takes no
+    /// session lock, matching the pre-existing single-run behaviour.
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: Option<String>,
 }
 
 impl RunConfig {
@@ -486,6 +510,7 @@ impl RunConfig {
             max_tool_calls: args.max_tool_calls,
             disable_tools: args.disable_tools,
             resume: args.resume,
+            session_id: args.session_id,
         })
     }
 
@@ -571,6 +596,11 @@ impl RunConfig {
             // is wired here so `--options-json` mirrors the CLI flag,
             // mirroring how `transcript_jsonl` is plumbed on the same struct.
             resume: options.resume,
+            // `--options-json` callers reach the session-id lock through the
+            // `session_id` field on the options struct (TASK-26-163); the
+            // flag-level `--session-id` is mirrored here for parity with
+            // `transcript_jsonl` / `resume`.
+            session_id: options.session_id,
         })
     }
 }
