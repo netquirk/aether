@@ -56,6 +56,14 @@ pub(crate) fn authentication_failure_line() -> String {
 }
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
+    // Working-directory writability guard (TASK-26-110). Runs before the run
+    // lock and every on-disk artefact, so a read-only cwd is refused with a
+    // message naming the path instead of failing mid-turn. Probing
+    // `.aether/` (the same directory the run lock and the transcript writer
+    // touch) means a project whose root is read-only but whose `.aether/`
+    // is writable keeps running — the refusal targets the directory the run
+    // actually needs.
+    crate::working_directory::ensure_writable(&config.cwd)?;
     // Per-working-directory run lock (TASK-26-21). Acquired before tracing,
     // before any agent build, and before any file write so two `aether`
     // runs in the same working directory cannot race on the artefacts they

@@ -52,4 +52,17 @@ Its lock file is {path}; delete it if no run is active."
         #[source]
         source: crate::transcript::TranscriptError,
     },
+    /// The run's working directory cannot be written (TASK-26-110). Refused
+    /// before the run lock, the agent build, and any provider call so a run
+    /// that would die on its first write mid-turn is refused up front with
+    /// the path. Probes inside the `.aether/` directory the run actually
+    /// writes so a project whose root is read-only but whose `.aether/` is
+    /// writable keeps running — over-refusing would break projects that
+    /// store their data next to the lockable workspace.
+    #[error("cannot start run: the working directory {path} is not writable ({source})")]
+    WorkingDirectoryNotWritable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }

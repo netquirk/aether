@@ -34,6 +34,7 @@ pub(crate) mod slash_commands;
 pub(crate) mod telemetry;
 pub mod transcript;
 pub mod version;
+pub(crate) mod working_directory;
 pub mod workspace;
 
 pub use acp::map_mcp_prompt_to_available_command;

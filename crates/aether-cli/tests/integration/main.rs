@@ -12,6 +12,7 @@ mod acp_trace;
 mod acp_workspace_move;
 mod check_config;
 mod config_flag;
+mod cwd_not_writable;
 mod disable_tool;
 mod dry_run;
 mod headless_system_prompt;
