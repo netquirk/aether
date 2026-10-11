@@ -56,6 +56,15 @@ pub(crate) fn authentication_failure_line() -> String {
 }
 
 pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
+    // Per-working-directory run lock (TASK-26-21). Acquired before tracing,
+    // before any agent build, and before any file write so two `aether`
+    // runs in the same working directory cannot race on the artefacts they
+    // produce (transcript, file changes, session index, `.aether/`). Bound
+    // to a named local so its `Drop` runs on every return path: success,
+    // `?`-propagated `CliError`, panic, and process exit. `--dry-run`
+    // short-circuits in `run_headless` before this function is called, so dry
+    // runs do not acquire the lock and can coexist with an active run.
+    let _run_lock = crate::run_lock::RunLock::acquire(&config.cwd)?;
     let log_file = config.log_file.clone();
     setup_tracing(resolve_log_level(config.log_level, config.verbose), config.log_file.as_deref(), config.log_format)
         .map_err(|source| match log_file {
