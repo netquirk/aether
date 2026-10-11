@@ -88,11 +88,23 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
         None => None,
     };
     let log_file = config.log_file.clone();
+    // TASK-26-22: build a redactor seeded with every credential the run is
+    // about to use (provider catalog env vars that are set, inline
+    // `provider_connections.api_key` overrides, and any header values whose
+    // name follows the Anthropic `should_redact_header` convention). The
+    // same redactor is handed to `setup_tracing` (which wraps the run-log
+    // writer with `RedactingMakeWriter`) and to `run_agent` (which seeds
+    // `JsonlTranscript`'s redaction so the saved transcript uses the same
+    // rule). Building it once and sharing the clone keeps the run log and
+    // the transcript scrubbing identically so a debug bundle does not
+    // leak the same value across two sinks.
+    let redactor = crate::redact::SecretRedactor::from_env_and_spec(&config.spec);
     setup_tracing(
         resolve_log_level(config.log_level, config.verbose),
         config.log_file.as_deref(),
         config.log_format,
         config.log_max_bytes,
+        redactor.clone(),
     )
     .map_err(|source| match log_file {
         Some(path) => CliError::LogFileOpen { path, source },
@@ -114,7 +126,7 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;
-    let result = run_agent(config, telemetry.clone()).await;
+    let result = run_agent(config, telemetry.clone(), redactor).await;
     // Whole-run wall-clock duration the log carries (TASK-25-148). Emitted
     // unconditionally — `result` is bound rather than `?`-propagated — so a
     // failed run (refused provider call, MCP failure, build error) still
@@ -129,7 +141,11 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     result
 }
 
-async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) -> Result<ExitCode, CliError> {
+async fn run_agent(
+    config: RunConfig,
+    telemetry: Option<Arc<TelemetryRuntime>>,
+    redactor: crate::redact::SecretRedactor,
+) -> Result<ExitCode, CliError> {
     let mut spec = config.spec;
     if let Some(system_prompt) = config.system_prompt {
         spec.prompts.push(Prompt::text(&system_prompt));
@@ -189,8 +205,13 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     let mut transcript = match &config.transcript_jsonl {
         Some(path) => {
             let started_at = chrono::Utc::now().to_rfc3339();
-            let mut writer =
-                JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes).map_err(CliError::IoError)?;
+            // TASK-26-22: install the redactor the same way `setup_tracing`
+            // does so the saved transcript scrubs the same secrets as the
+            // run log. `create_with_max_bytes` first so existing callers
+            // that never configure a redactor keep working unchanged.
+            let mut writer = JsonlTranscript::create_with_max_bytes(path, config.transcript_max_bytes)
+                .map_err(CliError::IoError)?
+                .with_redactor(redactor);
             writer.write_header(crate::version::aether_version(), &started_at).map_err(CliError::IoError)?;
             Some(writer)
         }
@@ -889,6 +910,7 @@ pub(crate) fn setup_tracing(
     log_file: Option<&Path>,
     format: crate::log_format::LogFormat,
     max_bytes: Option<u64>,
+    redactor: crate::redact::SecretRedactor,
 ) -> std::io::Result<()> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::EnvFilter;
@@ -898,12 +920,11 @@ pub(crate) fn setup_tracing(
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = EnvFilter::new(level.directive());
-    // Converge the two writers onto a single `BoxMakeWriter` so the
-    // `format` match below can use a single concrete writer type. The
-    // writer's behaviour matches the pre-existing `setup_tracing` exactly:
-    // missing parent directories still fail the run; the file is opened
-    // in append mode (TASK-25-48) so an operator's existing log is
-    // preserved across runs.
+    // Converge the three writers onto a single concrete writer type so the
+    // `format` match below can use a single arm. The writer's behaviour
+    // matches the pre-existing `setup_tracing` exactly: missing parent
+    // directories still fail the run; the file is opened in append mode
+    // (TASK-25-48) so an operator's existing log is preserved across runs.
     //
     // Size-based rotation (TASK-26-92) lives behind `--log-max-bytes`. The
     // `Some(n) if n > 0` branch swaps the bare `File` writer for a
@@ -912,7 +933,16 @@ pub(crate) fn setup_tracing(
     // the threshold. `None` and `Some(0)` keep the pre-existing
     // single-file behaviour byte-for-byte so a run with no `--log-max-bytes`
     // flag is unchanged.
-    let writer = match (log_file, max_bytes) {
+    //
+    // TASK-26-22 wraps every base writer in `RedactingMakeWriter` so any
+    // `tracing` event that lands in the run log has its secret-looking
+    // values (provider API keys seeded from env / inline overrides, and
+    // any `bearer <token>` substring) replaced with the `[REDACTED]`
+    // marker before the bytes are flushed. The wrapper buffers until `\n`
+    // so the inner writer never sees a half-redacted line, and forwards
+    // a trailing partial line on `flush` / `drop` so an event written
+    // without a final newline does not get lost.
+    let base = match (log_file, max_bytes) {
         (None, _) => BoxMakeWriter::new(io::stderr),
         (Some(path), Some(max)) if max > 0 => {
             let appender = crate::rotating_log::RotatingFileAppender::new(path, max)?;
@@ -923,6 +953,7 @@ pub(crate) fn setup_tracing(
             BoxMakeWriter::new(file)
         }
     };
+    let writer = crate::redact::RedactingMakeWriter::new(base, redactor);
     // Gate the `Text` layer's ANSI on the same `NO_COLOR` signal the live
     // progress line honours: a `NO_COLOR=1` run emits log records to
     // stderr in plain text, matching the rest of the colour-free output.

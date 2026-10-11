@@ -50,6 +50,7 @@ use thiserror::Error;
 
 use crate::headless::CliEventKind;
 use crate::headless::run::event_kind;
+use crate::redact::SecretRedactor;
 
 /// One JSON object per line in the transcript file. The `type` field carries
 /// the CLI's event kind (using `snake_case`); the `event` field is the full
@@ -85,6 +86,13 @@ struct TranscriptHeader<'a> {
 /// self-describing header line re-emitted on every rotation. Turn numbering
 /// increments on every `TurnEvent::Started`; events seen before the first
 /// `Started` are written with `turn: 0`.
+///
+/// The [`SecretRedactor`] is applied (TASK-26-22) to every serialised line
+/// before it reaches the file so an API key or `bearer <token>` that lands
+/// in the run's event stream does not leak into the saved transcript. The
+/// default value is [`SecretRedactor::new`] so existing callers (and most
+/// existing tests) automatically pick up bearer-pattern redaction with no
+/// further wiring.
 pub struct JsonlTranscript {
     writer: BufWriter<File>,
     turn: u32,
@@ -98,6 +106,12 @@ pub struct JsonlTranscript {
     /// truncates the live file) is a no-op for the header before the first
     /// write.
     header: Option<Vec<u8>>,
+    /// Redactor applied to every serialised line (header and per-event
+    /// records). The default is an empty redactor seeded only with the
+    /// bearer pattern; callers that need more coverage use
+    /// [`Self::with_redactor`] to install one seeded with the configured
+    /// provider API keys and inline credentials.
+    redactor: SecretRedactor,
 }
 
 impl JsonlTranscript {
@@ -122,7 +136,30 @@ impl JsonlTranscript {
     /// rotation (matching the `max_bytes = 0` convention used elsewhere).
     pub fn create_with_max_bytes(path: &Path, max_bytes: Option<u64>) -> io::Result<Self> {
         let writer = BufWriter::new(File::create(path)?);
-        Ok(Self { writer, turn: 0, path: path.to_path_buf(), max_bytes, bytes_written: 0, header: None })
+        Ok(Self {
+            writer,
+            turn: 0,
+            path: path.to_path_buf(),
+            max_bytes,
+            bytes_written: 0,
+            header: None,
+            redactor: SecretRedactor::new(),
+        })
+    }
+
+    /// Replace the redactor used to scrub secret-looking values from every
+    /// serialised line before it reaches disk. The default (installed by
+    /// [`Self::create_with_max_bytes`]) is an empty [`SecretRedactor`] that
+    /// only runs the bearer-pattern pass; this builder lets a caller seed
+    /// the configured provider API keys and inline credentials so the same
+    /// redaction rule applies to the transcript that [`crate::redact`]
+    /// applies to the run log.
+    ///
+    /// Returns `self` for chaining so the typical pattern is:
+    /// `JsonlTranscript::create_with_max_bytes(path, max).with_redactor(redactor)`.
+    pub fn with_redactor(mut self, redactor: SecretRedactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Write the self-describing header line that will be the first line of
@@ -143,6 +180,11 @@ impl JsonlTranscript {
         let header = TranscriptHeader { kind: "header", aether_version, started_at };
         let mut bytes = serde_json::to_vec(&header).map_err(io::Error::other)?;
         bytes.push(b'\n');
+        // Redact before writing so the on-disk header (and the cached copy
+        // we re-emit on rotation) holds the scrubbed form. The byte-length
+        // accounting uses the post-redaction length so rotation math does
+        // not get distorted by the change in size.
+        let bytes = self.redactor.redact_bytes(&bytes);
         self.writer.write_all(&bytes)?;
         self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
         self.header = Some(bytes);
@@ -168,6 +210,12 @@ impl JsonlTranscript {
         let record = TranscriptRecord { turn: self.turn, event_type, event };
         let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
         bytes.push(b'\n');
+        // Redact before writing so secret-looking values that landed in the
+        // event stream (an `x-api-key: ...` header echo, a `bearer <token>`
+        // request header, etc.) are scrubbed from the saved line. The
+        // byte-length accounting uses the post-redaction length so
+        // rotation math stays correct under either redaction rule.
+        let bytes = self.redactor.redact_bytes(&bytes);
         self.writer.write_all(&bytes)?;
         self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
         if let Some(max) = self.max_bytes
@@ -568,6 +616,84 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(lines[1]).expect("second line is JSON");
         assert_eq!(second["type"], "turn_ended");
         assert_eq!(second["turn"], 1);
+    }
+
+    /// TASK-26-22: a `JsonlTranscript` opened with a redactor must scrub
+    /// secret-looking values from the saved transcript. The redactor is
+    /// seeded with a known secret and the event text contains both that
+    /// exact value AND a `bearer <token>` substring; neither may survive
+    /// in the file. Reading the file back and asserting against the raw
+    /// bytes (not against re-deserialised JSON) proves the bytes the
+    /// operator shares for debugging do not contain the secret.
+    #[test]
+    fn record_redacts_credential_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+
+        let redactor =
+            SecretRedactor::new().with_secret("sk-known-secret-123").with_secret("Bearer shared-token-abcdef");
+        let mut transcript = JsonlTranscript::create(&path).expect("create writer").with_redactor(redactor);
+        transcript.write_header(env!("CARGO_PKG_VERSION"), "2026-10-11T08:53:59+00:00").expect("write header");
+        // The event payload exercises both redactor passes: an inline known
+        // secret and a `bearer` token in the same payload.
+        let event = AgentEvent::text(
+            "m1",
+            "preamble sk-known-secret-123 and Bearer shared-token-abcdef suffix",
+            StreamState::Complete,
+        );
+        transcript.record(&event).expect("record event");
+        transcript.flush().expect("flush");
+
+        let raw = std::fs::read_to_string(&path).expect("read file");
+        assert!(
+            !raw.contains("sk-known-secret-123"),
+            "the seeded secret must be scrubbed from the transcript; got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("shared-token-abcdef"),
+            "the bearer token's payload must be scrubbed from the transcript; got:\n{raw}"
+        );
+        assert!(raw.contains("[REDACTED]"), "the marker must appear in the transcript; got:\n{raw}");
+        // The unmangled preamble and suffix confirm the byte boundary is
+        // right; the secret-shaped substring was the only thing replaced.
+        assert!(raw.contains("preamble"));
+        assert!(raw.contains("suffix"));
+
+        // Every line is still a parseable JSON object, so the saved file
+        // remains usable for downstream tooling.
+        for (index, line) in raw.lines().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("line {index} is not JSON after redaction: {error}; line={line:?}"));
+            assert!(value.is_object(), "line {index} must be a JSON object: {value:?}");
+        }
+    }
+
+    /// Companion to `record_redacts_credential_values`: the same redactor
+    /// must also scrub the saved header. The header normally carries only
+    /// the aether version and the start time, but a future change that
+    /// embeds an operator-supplied string in the header would otherwise
+    /// leak. This test confirms the redaction pipe applies to the header
+    /// path, not just `record`.
+    #[test]
+    fn write_header_redacts_credential_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+
+        // Seed a redactor and embed the marker into `started_at` so the
+        // header byte stream actually contains a known secret. (In a real
+        // run the header only carries a timestamp; this artificially
+        // exercises the redaction path.)
+        let redactor = SecretRedactor::new().with_secret("sk-known-secret-123");
+        let mut transcript = JsonlTranscript::create(&path).expect("create writer").with_redactor(redactor);
+        transcript.write_header(env!("CARGO_PKG_VERSION"), "sk-known-secret-123").expect("write header");
+        transcript.flush().expect("flush");
+
+        let raw = std::fs::read_to_string(&path).expect("read file");
+        assert!(
+            !raw.contains("sk-known-secret-123"),
+            "the seeded secret must be scrubbed from the header; got:\n{raw}"
+        );
+        assert!(raw.contains("[REDACTED]"), "the marker must appear in the header; got:\n{raw}");
     }
 
     #[test]

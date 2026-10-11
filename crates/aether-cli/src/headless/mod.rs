@@ -260,12 +260,21 @@ pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
     // `--log-file` is set (TASK-25-48) the redirection happens here so a
     // `--dry-run` short-circuit still writes the log to the file, and any
     // IO error opening the path fails the run before the agent starts.
+    //
+    // TASK-26-22: the early `setup_tracing` install happens before any
+    // resolved `AgentSpec` exists, so the dry-run path's log file is
+    // redacted using the env-var-only seed (an inline `api_key` cannot
+    // arrive through CLI args alone). `run::run` re-installs the
+    // subscriber with a redactor that is also seeded from the resolved
+    // `AgentSpec` (and shares that redactor with the transcript), so the
+    // full redaction rule applies once spec resolution has happened.
     let log_file = args.log_file.clone();
     run::setup_tracing(
         resolve_log_level(args.log_level, args.verbose),
         args.log_file.as_deref(),
         args.log_format,
         args.log_max_bytes,
+        crate::redact::SecretRedactor::from_env(),
     )
     .map_err(|source| match log_file {
         Some(path) => CliError::LogFileOpen { path, source },
