@@ -5,7 +5,7 @@
 //! CLI, so the CLI can tally those diffs here and print a one-line summary
 //! at the end of the transcript.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mcp_utils::display_meta::ToolResultMeta;
 
@@ -21,6 +21,7 @@ pub(crate) enum ChangeKind {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct FileChanges {
     files: BTreeMap<String, ChangeKind>,
+    reads: BTreeSet<String>,
 }
 
 impl FileChanges {
@@ -80,6 +81,27 @@ impl FileChanges {
             self.modified(),
             self.deleted(),
         )
+    }
+
+    /// Record a path the run inspected, even when no diff was attached.
+    pub(crate) fn record_read(&mut self, path: &str) {
+        self.reads.insert(path.to_string());
+    }
+
+    /// Paths the run read but never recorded a [`ChangeKind`] for, in
+    /// lexicographic order.
+    pub(crate) fn read_not_changed(&self) -> Vec<&str> {
+        self.reads.iter().filter(|path| !self.files.contains_key(*path)).map(String::as_str).collect()
+    }
+
+    /// One-line summary of read paths that did not produce a diff, for the
+    /// transcript.
+    pub(crate) fn read_summary(&self) -> Option<String> {
+        let paths = self.read_not_changed();
+        if paths.is_empty() {
+            return None;
+        }
+        Some(format!("Files read but not changed: {} ({})", paths.len(), paths.join(", "),))
     }
 }
 
@@ -179,5 +201,24 @@ mod tests {
         assert_ne!(ChangeKind::Created, ChangeKind::Modified);
         assert_ne!(ChangeKind::Modified, ChangeKind::Deleted);
         assert_ne!(ChangeKind::Created, ChangeKind::Deleted);
+    }
+
+    #[test]
+    fn read_is_reported_until_the_file_is_changed() {
+        let mut changes = FileChanges::default();
+        changes.record_read("src/lib.rs");
+        assert_eq!(changes.read_not_changed(), vec!["src/lib.rs"]);
+        assert_eq!(changes.read_summary(), Some("Files read but not changed: 1 (src/lib.rs)".to_string()));
+
+        changes.record(&meta(diff("src/lib.rs", Some("old"), Some("new"))));
+        assert!(changes.read_not_changed().is_empty());
+        assert_eq!(changes.read_summary(), None);
+    }
+
+    #[test]
+    fn read_summary_is_none_without_reads() {
+        let changes = FileChanges::default();
+        assert!(changes.read_not_changed().is_empty());
+        assert_eq!(changes.read_summary(), None);
     }
 }
