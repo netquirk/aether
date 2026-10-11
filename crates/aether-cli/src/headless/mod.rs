@@ -691,7 +691,12 @@ fn resolve_system_prompt(text: Option<String>, file: Option<PathBuf>) -> Result<
         }
         (Some(text), None) => Ok(Some(text)),
         (None, Some(path)) => {
-            std::fs::read_to_string(&path).map(Some).map_err(|source| CliError::SystemPromptFile { path, source })
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|source| CliError::SystemPromptFile { path: path.clone(), source })?;
+            if contents.trim().is_empty() {
+                return Err(CliError::EmptySystemPromptFile { path });
+            }
+            Ok(Some(contents))
         }
         (None, None) => Ok(None),
     }
@@ -798,6 +803,46 @@ mod tests {
 
         let resolved = resolve_system_prompt(None, Some(path.clone())).expect("file resolves");
         assert_eq!(resolved.as_deref(), Some("you are a helpful agent\n"));
+    }
+
+    #[test]
+    fn empty_system_prompt_file_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").expect("write file");
+        let path_for_assert = path.clone();
+
+        let error = resolve_system_prompt(None, Some(path)).expect_err("empty file must fail");
+
+        match error {
+            CliError::EmptySystemPromptFile { path } => assert_eq!(path, path_for_assert),
+            other => panic!("expected EmptySystemPromptFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_system_prompt_file_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blank.txt");
+        std::fs::write(&path, "  \n\t\n").expect("write file");
+        let path_for_assert = path.clone();
+
+        let error = resolve_system_prompt(None, Some(path)).expect_err("whitespace-only file must fail");
+
+        match error {
+            CliError::EmptySystemPromptFile { path } => assert_eq!(path, path_for_assert),
+            other => panic!("expected EmptySystemPromptFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn padded_non_empty_system_prompt_file_is_kept_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("padded.txt");
+        std::fs::write(&path, "  keep me  \n").expect("write file");
+
+        let resolved = resolve_system_prompt(None, Some(path)).expect("padded file resolves");
+        assert_eq!(resolved.as_deref(), Some("  keep me  \n"));
     }
 
     #[test]
