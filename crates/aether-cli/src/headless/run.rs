@@ -265,6 +265,9 @@ async fn run_agent(
 
     if config.output == OutputFormat::Text {
         println!("{}", changes.summary());
+        if let Some(line) = changes.read_summary() {
+            println!("{line}");
+        }
     }
 
     Ok(exit_code)
@@ -565,6 +568,9 @@ async fn stream_output<W: io::Write>(
         if let Some(meta) = tool_result_meta(msg) {
             changes.record(meta);
         }
+        if let Some(path) = tool_read_path(msg) {
+            changes.record_read(&path);
+        }
 
         // Write the transcript line before we print: a bad disk shows up
         // here, not as a corrupt half-line on stdout. The writer ignores
@@ -836,6 +842,42 @@ fn tool_result_meta(msg: &AgentEvent) -> Option<&mcp_utils::display_meta::ToolRe
         ) => Some(meta),
         _ => None,
     }
+}
+
+/// Extract the path a tool result read, when the result is a file read.
+///
+/// A result counts as a read when its display title is `Read file` or its
+/// tool name humanizes to `Read file`. The path is taken from the call
+/// arguments when present, otherwise from the leading segment of the
+/// display value (the value is formatted `"<path>, <n> lines"`).
+fn tool_read_path(msg: &AgentEvent) -> Option<String> {
+    let AgentEvent::Tool(ToolEvent::Result { result, result_meta }) = msg else {
+        return None;
+    };
+    let is_read = result_meta.as_ref().is_some_and(|m| m.display.title == "Read file")
+        || aether_core::events::humanize_tool_name(&result.name) == "Read file";
+    if !is_read {
+        return None;
+    }
+    read_path_from_arguments(&result.arguments).or_else(|| {
+        result_meta
+            .as_ref()
+            .and_then(|m| m.display.value.split(',').next())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Pull the file path out of a tool call's JSON arguments, if present.
+///
+/// Coding MCP tools name the parameter `filePath`; some call sites use
+/// `file_path`. Mirrors the argument parsing in
+/// `crate::acp::protocol::events`. Returns `None` for non-JSON arguments or
+/// a missing / non-string field.
+fn read_path_from_arguments(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    value.get("filePath").or_else(|| value.get("file_path")).and_then(serde_json::Value::as_str).map(str::to_string)
 }
 
 fn should_emit(msg: &AgentEvent, include: &[CliEventKind]) -> bool {
@@ -1458,6 +1500,50 @@ mod tests {
             },
             result_meta: Some(meta),
         })
+    }
+
+    fn read_result(path: &str, arguments: &str) -> AgentEvent {
+        let basename = Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or(path);
+        let meta = mcp_utils::display_meta::ToolDisplayMeta::new("Read file", format!("{basename}, 10 lines"));
+        AgentEvent::Tool(ToolEvent::Result {
+            result: llm::ToolCallResult {
+                id: "tc1".to_string(),
+                name: "read_file".to_string(),
+                arguments: arguments.to_string(),
+                result: "ok".to_string(),
+            },
+            result_meta: Some(meta.into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn stream_output_reports_file_read_but_not_changed() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(read_result("src/lib.rs", r#"{"filePath":"src/lib.rs"}"#)).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+
+        let (code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(changes.summary().contains("Files changed: 0"));
+        assert!(changes.read_not_changed().contains(&"src/lib.rs"));
+        assert!(changes.read_summary().unwrap().contains("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn stream_output_does_not_report_a_read_that_was_changed() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(read_result("src/lib.rs", r#"{"filePath":"src/lib.rs"}"#)).await.unwrap();
+        tx.send(tool_result_with_file_diff("src/lib.rs", Some("old"), Some("new"))).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+
+        let (_code, changes, _summary) =
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
+
+        assert!(changes.read_summary().is_none());
     }
 
     fn task_completed_with_file_diff(path: &str, old: Option<&str>, new: Option<&str>) -> AgentEvent {
