@@ -16,8 +16,11 @@ use mcp_utils::client::{
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::debug;
+
+use crate::workspace_boundary::WorkspaceBoundaryPolicy;
 
 pub struct RuntimeBuilder {
     cwd: PathBuf,
@@ -139,10 +142,12 @@ impl RuntimeBuilder {
     ) -> Result<Runtime, CliError> {
         let deps = self.agent_deps.clone();
         let usage_seed = self.usage_seed.clone();
+        let cwd = self.cwd.clone();
         let (spec, session) = self.spawn_mcp().await?;
         let mcp = session.handle().clone();
 
         let (agent_tx, agent_rx, agent_handle) = spawn_agent(&spec, &deps, mcp, Vec::new(), |mut agent_builder| {
+            agent_builder = agent_builder.tool_policy(Arc::new(WorkspaceBoundaryPolicy::new(cwd.clone())));
             if let Some(last) = &usage_seed {
                 agent_builder = agent_builder.resume_usage(last);
             }
@@ -168,6 +173,7 @@ impl RuntimeBuilder {
     pub async fn build_ready(self, messages: Vec<ChatMessage>) -> Result<(Runtime, McpConnectionDetails), CliError> {
         let deps = self.agent_deps.clone();
         let usage_seed = self.usage_seed.clone();
+        let cwd = self.cwd.clone();
         let (spec, mut session) = self.spawn_mcp().await?;
         let snapshot = session
             .block_until_ready()
@@ -176,6 +182,7 @@ impl RuntimeBuilder {
         let mcp = session.handle().clone();
 
         let (agent_tx, agent_rx, agent_handle) = spawn_agent(&spec, &deps, mcp, Vec::new(), |mut agent_builder| {
+            agent_builder = agent_builder.tool_policy(Arc::new(WorkspaceBoundaryPolicy::new(cwd.clone())));
             if let Some(last) = &usage_seed {
                 agent_builder = agent_builder.resume_usage(last);
             }
@@ -267,11 +274,143 @@ async fn spawn_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm::testing::llm_response;
     use llm::ToolDefinition;
+    use mcp_utils::testing::{FakeMcpServer, FakeTool, FakeToolResponse};
     use serde_json::json;
+    use std::error::Error;
 
     fn tool(name: &str) -> ToolDefinition {
         ToolDefinition::new(name, "test tool", json!({"type": "object"}))
+    }
+
+    /// Drives a fake MCP and the [`WorkspaceBoundaryPolicy`] the runtime wires in
+    /// (TASK-26-615). An LLM-scripted `coding__read_file` call whose argument
+    /// `../secret` escapes the canonical root must surface as a
+    /// [`ToolEvent::Refused`](aether_core::events::ToolEvent::Refused) whose
+    /// `reason` names the offending path; a sibling in-root call must dispatch
+    /// and produce a result event. The test exercises the same
+    /// `AgentBuilder::tool_policy(...)` consult point (`agent.rs:767`) the
+    /// runtime populates, so it pins the wiring without reaching for a real
+    /// provider-driven `RuntimeBuilder::build` (which has no fake-provider seam).
+    #[tokio::test]
+    async fn workspace_boundary_refuses_dotdot_escape_and_lets_in_root_through() -> Result<(), Box<dyn Error>> {
+        use aether_core::events::{AgentEvent, ToolEvent};
+
+        // Build the canonical root exactly as the production policy will: a
+        // freshly canonicalized tempdir so the `/tmp` <-> `/private/tmp`
+        // symlink dance on macOS lines up the same way the runtime sees it.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        std::fs::write(root.join("notes.txt"), "hello")?;
+
+        // Fake `coding` MCP server: the only tool exposed is `read_file`,
+        // and it returns a fixed body whose contents are unique enough that
+        // a leaking call would be unmistakable in the trace. The fake
+        // server records every call, so we can assert the escaping call
+        // never reached it.
+        let server = FakeMcpServer::new()
+            .with_tool(FakeTool::new("read_file").responds(FakeToolResponse::text("FILE CONTENTS")));
+        let server_state = server.state();
+
+        let escape_args = json!({ "filePath": "../secret" }).to_string();
+        let in_root_args = json!({ "filePath": "notes.txt" }).to_string();
+
+        let llm_responses = [
+            llm_response()
+                .tool_call("escape", "coding__read_file", &[&escape_args])
+                .build(),
+            llm_response()
+                .tool_call("in-root", "coding__read_file", &[&in_root_args])
+                .build(),
+            llm_response().text(&["done"]).build(),
+        ];
+
+        let observer = aether_core::testing::FakeAgentObserver::new();
+        let events = observer.events();
+        let messages = aether_core::testing::test_agent()
+            .fake_mcp_server("coding", server)
+            .llm_responses(&llm_responses)
+            .user_text("read")
+            .tool_policy(std::sync::Arc::new(WorkspaceBoundaryPolicy::new(&root)))
+            .observer(Box::new(observer))
+            .run()
+            .await?;
+
+        assert_eq!(
+            messages.len(),
+            events.lock().unwrap().len(),
+            "observer must see every event the agent emits"
+        );
+
+        let observer_events = events.lock().unwrap();
+
+        // The ../secret call must surface as a refusal that names the
+        // offending path and the canonical root; the simulated server must
+        // not have been hit, so nothing outside the root is read.
+        let escape_refused = observer_events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Tool(ToolEvent::Refused { request, reason })
+                    if request.name == "coding__read_file" && request.id == "escape" =>
+                {
+                    Some((request.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .expect("the ../secret call must be refused as ToolEvent::Refused");
+        let (_request, escape_reason) = escape_refused;
+        assert!(
+            escape_reason.contains("../secret"),
+            "refusal reason must name the offending path `../secret`; got: {escape_reason}",
+        );
+        assert!(
+            escape_reason.contains(&*root.to_string_lossy()),
+            "refusal reason must name the canonical root `{}`; got: {escape_reason}",
+            root.display(),
+        );
+        assert_eq!(
+            server_state.calls_for("read_file").len(),
+            1,
+            "only the in-root call may have reached the server; got {} call(s)",
+            server_state.calls_for("read_file").len(),
+        );
+        assert!(
+            !observer_events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Tool(ToolEvent::ExecutionStarted { tool_id, .. }) if tool_id == "escape"
+            )),
+            "the escaped call must never be marked as executing",
+        );
+        assert!(
+            !observer_events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Tool(ToolEvent::Result { result, .. }) if result.id == "escape"
+            )),
+            "the escaped call must never produce a result event",
+        );
+
+        // The sibling in-root `notes.txt` call must dispatch and yield a
+        // result event for its `in-root` call id, with the canned body the
+        // fake server returned. This guards against an over-broad policy
+        // that would refuse legitimate in-root calls along with the escape.
+        assert!(
+            observer_events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Tool(ToolEvent::ExecutionStarted { tool_id, .. }) if tool_id == "in-root"
+            )),
+            "the in-root call must have started executing",
+        );
+        assert!(
+            observer_events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Tool(ToolEvent::Result { result, .. })
+                    if result.id == "in-root" && result.result.contains("FILE CONTENTS")
+            )),
+            "the in-root call must have produced a result event with the canned file body",
+        );
+
+        Ok(())
     }
 
     #[test]
