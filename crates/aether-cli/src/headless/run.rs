@@ -25,6 +25,7 @@ use llm::ProviderErrorKind;
 
 use super::error::CliError;
 use super::{CliEventKind, RunConfig};
+use crate::heartbeat::HeartbeatWatch;
 use crate::output::{
     OutputFormat, ProviderWaitTracker, RetryTracker, TurnTimings, print_message, print_provider_wait, print_run_usage,
     print_turn_summary,
@@ -189,6 +190,13 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
         &config.events,
         run_started_at,
         config.provider_stall_warn,
+        // Per-turn heartbeat interval (TASK-26-111). `None` disables the
+        // watch (the `run.heartbeatSeconds = 0` opt-out path); `Some`
+        // arms `HeartbeatWatch` in `stream_output` and races its
+        // deadline alongside the existing provider-stall and run-timeout
+        // deadlines so a long turn logs a one-line heartbeat at the
+        // configured cadence.
+        config.heartbeat_interval,
         config.quiet,
         io::stderr(),
         transcript.as_mut(),
@@ -250,8 +258,8 @@ async fn expand_prompt(mcp: &McpHandle, prompt: String) -> String {
     }
 }
 
-// `stream_output` takes 9 positional parameters: the addition of the
-// caller-capped tool-call cap (TASK-25-260) brought it from 8 to 9.
+// `stream_output` takes 10 positional parameters: the addition of the
+// per-turn heartbeat interval (TASK-26-111) brought it from 9 to 10.
 // Bundling them into a config struct would obscure the call sites without
 // reducing total surface area, so silence the threshold-crossing lint.
 // The function is also intentionally long: it owns the whole event loop
@@ -265,6 +273,12 @@ async fn stream_output<W: io::Write>(
     events: &[CliEventKind],
     run_started_at: Instant,
     provider_stall_warn: Option<Duration>,
+    // Per-turn heartbeat interval (TASK-26-111). `None` disables the
+    // watch; `Some(interval)` arms [`HeartbeatWatch`] with the cadence
+    // that produces one `info!("heartbeat: ...")` line per interval while
+    // a turn is in flight. Defaulted to 30 s in `RunConfig` so a wholly-
+    // absent `run` block still emits heartbeats out of the box.
+    heartbeat_interval: Option<Duration>,
     quiet: bool,
     progress_writer: W,
     mut transcript: Option<&mut JsonlTranscript>,
@@ -335,15 +349,30 @@ async fn stream_output<W: io::Write>(
     // capped" from "the run timed out" (`TIMEOUT_EXIT_CODE`, 124) and
     // from a normal completion (`SUCCESS`, 0).
     let mut tool_cap = MaxToolCallsWatch::new(max_tool_calls, io::stderr());
+    // Per-turn heartbeat log line (TASK-26-111). Fed the same turn
+    // events as `timings` (and the matching per-turn bookkeeping) so the
+    // watch only arms while a turn is in flight; the headless select
+    // loop races `beat.next_deadline()` alongside the provider-stall and
+    // run-timeout deadlines, and the earliest of the three wakes the
+    // loop. When the heartbeat deadline is the earliest, `beat_if_due`
+    // emits one `tracing::info!` line and advances `next_deadline` to
+    // `now + interval` so the cadence is "one beat per interval" rather
+    // than "every poll past the deadline". The watch's writer is
+    // `tracing` rather than a `Write` sink because the heartbeat is a
+    // log record (it lands in `--log-file` / stderr via the run's
+    // subscriber), not a live progress line.
+    let mut beat = HeartbeatWatch::new(heartbeat_interval);
 
     loop {
-        // Race the next event against the stall deadline and the caller-capped
-        // run deadline. The earliest of the three wakes the loop; when none of
-        // them is due (no in-flight call, no timeout set, or the timeout has
-        // already fired) the loop falls back to the plain `rx.recv()` path
-        // with no timer overhead. Extracted to keep `stream_output` under the
-        // `clippy::too_many_lines` pedantic threshold.
-        let next = await_with_deadlines(&mut rx, &mut stall, &mut timeout).await;
+        // Race the next event against the stall deadline, the heartbeat
+        // deadline (TASK-26-111), and the caller-capped run deadline. The
+        // earliest of the four wakes the loop; when none of them is due
+        // (no in-flight call, no heartbeat armed, no timeout set, or the
+        // timeout has already fired) the loop falls back to the plain
+        // `rx.recv()` path with no timer overhead. Extracted to keep
+        // `stream_output` under the `clippy::too_many_lines` pedantic
+        // threshold.
+        let next = await_with_deadlines(&mut rx, &mut stall, &mut beat, &mut timeout).await;
         let maybe_event = match next {
             NextEvent::Received(event) => event,
             NextEvent::TimedOut => {
@@ -455,8 +484,25 @@ async fn stream_output<W: io::Write>(
         }
 
         match msg {
-            AgentEvent::Turn(TurnEvent::Started { .. }) => timings.begin(Instant::now()),
-            AgentEvent::Turn(TurnEvent::Ended { .. }) => timings.end(Instant::now()),
+            AgentEvent::Turn(TurnEvent::Started { .. }) => {
+                // Sample `now` once so the per-turn timings, the
+                // provider-wait tracker, the stall watch, and the
+                // heartbeat (TASK-26-111) all agree on the turn's start
+                // instant; the heartbeat in particular uses it to anchor
+                // the next deadline at `started + interval`.
+                let now = Instant::now();
+                timings.begin(now);
+                beat.observe(msg, now);
+            }
+            AgentEvent::Turn(TurnEvent::Ended { .. }) => {
+                // Same `now` sample so the per-turn timings close and the
+                // heartbeat disarms from a consistent instant; a mismatch
+                // here would leave the heartbeat armed past the turn's
+                // terminal event and log a spurious line.
+                let now = Instant::now();
+                timings.end(now);
+                beat.observe(msg, now);
+            }
             AgentEvent::Turn(TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. }) => {
                 // Sample `now` once so the live stall warning and the per-call
                 // wait tracker agree on the elapsed time.
@@ -574,10 +620,12 @@ fn finish_run<W: io::Write>(
 /// Outcome of one iteration of `stream_output`'s timer race.
 ///
 /// The headless event loop arms a stall deadline (when a provider call is
-/// in flight and not yet warned about) and a run deadline (when `--timeout`
-/// is set); both can be unset, in which case the loop falls back to a plain
-/// `recv()`. Extracted into an enum so the helper that owns the timer race
-/// can talk to the loop without an `Option`/`Result` dance.
+/// in flight and not yet warned about), a heartbeat deadline (when a turn
+/// is in flight and the interval has passed; TASK-26-111), and a run
+/// deadline (when `--timeout` is set); each can be unset, in which case
+/// the loop falls back to a plain `recv()`. Extracted into an enum so the
+/// helper that owns the timer race can talk to the loop without an
+/// `Option`/`Result` dance.
 enum NextEvent {
     /// `rx.recv()` produced an event (or `None` if the channel closed). The
     /// payload is boxed so the bare variants (`TimedOut` / `Loop`) do not
@@ -586,26 +634,33 @@ enum NextEvent {
     /// The caller-capped run deadline fired; the loop must exit with the
     /// distinct timeout exit code.
     TimedOut,
-    /// A watch latched (the stall warning fired) without reaching the run
-    /// deadline; the loop should re-arm the timers and `continue`.
+    /// A watch latched (the stall warning fired, or the heartbeat beat)
+    /// without reaching the run deadline; the loop should re-arm the
+    /// timers and `continue`. Both watches reuse the same `Loop` variant
+    /// because neither one ends the run.
     Loop,
 }
 
-/// Wait for the next agent event while racing both watches' deadlines.
+/// Wait for the next agent event while racing the three watches' deadlines.
 ///
-/// Falls back to `rx.recv().await` when neither deadline is set. When the
-/// earliest deadline is the stall one, `warn_if_stalled` latches the watch
-/// and the helper returns [`NextEvent::Loop`] so the caller can `continue`
-/// without re-reading. When the earliest deadline is the run timeout,
-/// `expire_if_due` writes the timeout line and the helper returns
-/// [`NextEvent::TimedOut`]; the caller exits the loop with
-/// [`crate::run_timeout::TIMEOUT_EXIT_CODE`].
+/// Falls back to `rx.recv().await` when no deadline is set. When the
+/// earliest deadline is the stall one, `warn_if_stalled` latches the
+/// watch and the helper returns [`NextEvent::Loop`] so the caller can
+/// `continue` without re-reading. When the earliest deadline is the
+/// heartbeat (TASK-26-111), `beat_if_due` emits one `tracing::info!` line
+/// and advances the deadline to `now + interval`, then returns
+/// [`NextEvent::Loop`] so the loop re-arms. When the earliest deadline is
+/// the run timeout, `expire_if_due` writes the timeout line and the helper
+/// returns [`NextEvent::TimedOut`]; the caller exits the loop with
+/// [`crate::run_timeout::TIMEOUT_EXIT_CODE`]. Priority ties resolve to the
+/// run-timeout path first, then the stall warning, then the heartbeat,
+/// matching the order the existing two-watch helper polled them in.
 #[allow(clippy::too_many_arguments)]
 /// Either a channel event (or `None` if the channel closed) or one of the
-/// two deadlines woke the loop. Used to keep the `tokio::select!` arms in
-/// `await_with_deadlines` structurally homogeneous; without it the
-/// "deadline fired" arms need a sentinel payload to satisfy the macro's
-/// type constraint.
+/// three deadlines woke the loop. Used to keep the `tokio::select!`
+/// arms in `await_with_deadlines` structurally homogeneous; without it
+/// the "deadline fired" arms need a sentinel payload to satisfy the
+/// macro's type constraint.
 enum RaceOutcome {
     /// `rx.recv()` produced an event (or `None` if the channel closed).
     EventReceived(Option<Box<AgentEvent>>),
@@ -615,19 +670,32 @@ enum RaceOutcome {
     /// The provider-stall deadline fired; the loop should re-arm the
     /// timers and `continue`.
     StallWarned,
+    /// The heartbeat deadline fired (TASK-26-111); the loop should
+    /// re-arm the timers and `continue`. Shares the [`NextEvent::Loop`]
+    /// continuation with `StallWarned` because neither ends the run.
+    Heartbeat,
 }
 
 async fn await_with_deadlines<W: io::Write, T: io::Write>(
     rx: &mut mpsc::Receiver<AgentEvent>,
     stall: &mut ProviderStallWatch<W>,
+    beat: &mut HeartbeatWatch,
     timeout: &mut RunTimeoutWatch<T>,
 ) -> NextEvent {
     fn received(opt: Option<AgentEvent>) -> RaceOutcome {
         RaceOutcome::EventReceived(opt.map(Box::new))
     }
 
+    /// Poll order on a tie or simultaneous deadline: the run timeout wins
+    /// first (the run is capped), then the stall warning (a stuck call is
+    /// a real problem), then the heartbeat (informational). The order
+    /// matches the existing two-watch poll: timeout before stall. Adding
+    /// the heartbeat at the end keeps the precedence rules that already
+    /// pass the existing tests intact while letting the heartbeat win
+    /// only when neither of the other two is due.
     fn try_poll_after<W: io::Write, T: io::Write>(
         stall: &mut ProviderStallWatch<W>,
+        beat: &mut HeartbeatWatch,
         timeout: &mut RunTimeoutWatch<T>,
         now: Instant,
     ) -> Option<RaceOutcome> {
@@ -637,78 +705,54 @@ async fn await_with_deadlines<W: io::Write, T: io::Write>(
         if stall.warn_if_stalled(now).unwrap_or(false) {
             return Some(RaceOutcome::StallWarned);
         }
+        if beat.beat_if_due(now) {
+            return Some(RaceOutcome::Heartbeat);
+        }
         None
     }
 
     let stall_d = stall.next_deadline();
+    let beat_d = beat.next_deadline();
     let timeout_d = timeout.deadline();
-    let outcome = match (stall_d, timeout_d) {
-        (None, None) => received(rx.recv().await),
-        (Some(stall_d), None) => {
-            let tokio_deadline = TokioInstant::from_std(stall_d);
-            tokio::select! {
-                biased;
-                () = sleep_until(tokio_deadline) => {
-                    if let Err(error) = stall.warn_if_stalled(Instant::now()) {
-                        eprintln!("Failed to write provider stall warning: {error}");
-                    }
-                    RaceOutcome::StallWarned
-                }
-                maybe = rx.recv() => received(maybe),
-            }
-        }
-        (None, Some(timeout_d)) => {
-            let tokio_deadline = TokioInstant::from_std(timeout_d);
-            tokio::select! {
-                biased;
-                () = sleep_until(tokio_deadline) => {
-                    if let Err(error) = timeout.expire_if_due(Instant::now()) {
-                        eprintln!("Failed to write run timeout line: {error}");
-                    }
-                    RaceOutcome::TimedOut
-                }
-                maybe = rx.recv() => received(maybe),
-            }
-        }
-        (Some(stall_d), Some(timeout_d)) => {
-            if stall_d <= timeout_d {
-                let tokio_deadline = TokioInstant::from_std(stall_d);
-                tokio::select! {
-                    biased;
-                    () = sleep_until(tokio_deadline) => {
-                        let now = Instant::now();
-                        if let Some(race) = try_poll_after(stall, timeout, now) {
-                            race
-                        } else {
-                            // Race resolved without either firing (e.g. an
-                            // event landed between the timer arm and the
-                            // wakeup). Fall through to a plain recv().
-                            received(rx.recv().await)
-                        }
-                    }
-                    maybe = rx.recv() => received(maybe),
-                }
+    // Reduce the three deadlines to a single `tokio::select!` arm by picking
+    // the earliest. Ties resolve via `try_poll_after` (timeout > stall >
+    // heartbeat), so the helper re-polls in priority order on the wake.
+    let earliest = pick_earliest(stall_d, beat_d, timeout_d);
+    let Some(earliest_d) = earliest else {
+        // No watch armed: straight to the channel receive.
+        return NextEvent::Received(rx.recv().await.map(Box::new));
+    };
+    let tokio_deadline = TokioInstant::from_std(earliest_d);
+    let outcome = tokio::select! {
+        biased;
+        () = sleep_until(tokio_deadline) => {
+            let now = Instant::now();
+            // The selected deadline may no longer be the only one due:
+            // re-poll all three in priority order so the run-timeout
+            // still wins ties (and the heartbeat still fires last).
+            if let Some(race) = try_poll_after(stall, beat, timeout, now) {
+                race
             } else {
-                let tokio_deadline = TokioInstant::from_std(timeout_d);
-                tokio::select! {
-                    biased;
-                    () = sleep_until(tokio_deadline) => {
-                        if let Some(race) = try_poll_after(stall, timeout, Instant::now()) {
-                            race
-                        } else {
-                            received(rx.recv().await)
-                        }
-                    }
-                    maybe = rx.recv() => received(maybe),
-                }
+                // Race resolved without any deadline firing (e.g. an
+                // event landed between the timer arm and the wakeup).
+                // Fall through to a plain recv().
+                received(rx.recv().await)
             }
         }
+        maybe = rx.recv() => received(maybe),
     };
     match outcome {
         RaceOutcome::EventReceived(event) => NextEvent::Received(event),
-        RaceOutcome::StallWarned => NextEvent::Loop,
+        RaceOutcome::StallWarned | RaceOutcome::Heartbeat => NextEvent::Loop,
         RaceOutcome::TimedOut => NextEvent::TimedOut,
     }
+}
+
+/// Pick the earliest of the three watches' deadlines, ignoring `None`
+/// (the watch is not armed). Returns `None` only when every deadline is
+/// unset, which the caller turns into a plain `recv().await`.
+fn pick_earliest(stall: Option<Instant>, beat: Option<Instant>, timeout: Option<Instant>) -> Option<Instant> {
+    [stall, beat, timeout].into_iter().flatten().min()
 }
 
 /// Per-run tally of turns started and tool calls made by `stream_output`.
@@ -1126,9 +1170,20 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let filter = vec![CliEventKind::ToolCall];
-        let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None, None)
-                .await;
+        let (code, changes, _summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &filter,
+            Instant::now(),
+            None,
+            None,
+            false,
+            io::sink(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
     }
@@ -1138,7 +1193,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "boom".to_string() })).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(changes.total(), 0);
     }
@@ -1170,7 +1226,8 @@ mod tests {
             .unwrap();
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
 
         assert_eq!(code, ExitCode::from(AUTH_EXIT_CODE), "auth failure must surface the distinct exit code");
         assert_ne!(code, ExitCode::FAILURE, "auth exit code must differ from a generic task failure");
@@ -1204,7 +1261,8 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Failed { error: "API error: bad request".into() })).await.unwrap();
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
 
         assert_eq!(code, ExitCode::FAILURE, "non-auth failure must keep the generic FAILURE code");
         assert_ne!(code, ExitCode::from(AUTH_EXIT_CODE), "non-auth failure must not be promoted to auth");
@@ -1231,7 +1289,8 @@ mod tests {
         tx.send(tool_result_with_file_diff("edited.rs", Some("old"), Some("new"))).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 2);
         assert_eq!(changes.created(), 1);
@@ -1245,7 +1304,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 0);
         assert!(changes.summary().contains("Files changed: 0"));
@@ -1269,7 +1329,8 @@ mod tests {
         drop(tx);
 
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -1286,7 +1347,8 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 1, tool_calls: 0 });
     }
@@ -1301,7 +1363,8 @@ mod tests {
         tx.send(task_completed_with_file_diff("removed.rs", Some("old"), None)).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(changes.total(), 1);
         assert_eq!(changes.deleted(), 1);
@@ -1315,9 +1378,20 @@ mod tests {
         // Restrict to a different event kind so the ToolResult is not printed,
         // but file changes are still tallied.
         let filter = vec![CliEventKind::TurnEnded];
-        let (_code, changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &filter, Instant::now(), None, false, io::sink(), None, None, None)
-                .await;
+        let (_code, changes, _summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &filter,
+            Instant::now(),
+            None,
+            None,
+            false,
+            io::sink(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(changes.total(), 1);
     }
 
@@ -1375,7 +1449,8 @@ mod tests {
         tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -1396,7 +1471,8 @@ mod tests {
         drop(tx);
 
         let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, None).await;
+            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, io::sink(), None, None, None)
+                .await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(summary, RunSummary { turns: 2, tool_calls: 2 });
@@ -1418,7 +1494,8 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, &mut sink, None, None, None)
+            .await;
         assert!(sink.windows(3).any(|w| w == b"\xe2\x8f\xba"), "non-quiet must draw the progress line: {sink:?}");
 
         // Quiet: no progress bytes at all.
@@ -1426,7 +1503,7 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, true, &mut sink, None, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, true, &mut sink, None, None, None).await;
         assert!(sink.is_empty(), "quiet must not write progress bytes: {sink:?}");
     }
 
@@ -1456,7 +1533,8 @@ mod tests {
         tx.send(execution_started("bash")).await.unwrap();
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         let mut sink = Vec::new();
-        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, &mut sink, None, None, None).await;
+        stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, None, false, &mut sink, None, None, None)
+            .await;
         sink
     }
 
@@ -1544,6 +1622,7 @@ mod tests {
             &[],
             Instant::now(),
             Some(threshold),
+            None,
             false,
             io::sink(),
             None,
@@ -1573,7 +1652,8 @@ mod tests {
             .checked_sub(limit + Duration::from_secs(1))
             .expect("`Instant - 31s` must remain representable on the test runtime");
         let (code, _changes, _summary) =
-            stream_output(rx, OutputFormat::Text, &[], started, None, false, io::sink(), None, Some(limit), None).await;
+            stream_output(rx, OutputFormat::Text, &[], started, None, None, false, io::sink(), None, Some(limit), None)
+                .await;
         assert_eq!(
             code,
             ExitCode::from(crate::run_timeout::TIMEOUT_EXIT_CODE),
@@ -1599,9 +1679,20 @@ mod tests {
         tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
         drop(tx);
 
-        let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, Some(3))
-                .await;
+        let (code, _changes, summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &[],
+            Instant::now(),
+            None,
+            None,
+            false,
+            io::sink(),
+            None,
+            None,
+            Some(3),
+        )
+        .await;
 
         assert_eq!(code, ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE), "loop must exit with the distinct cap exit code");
         assert_ne!(code, ExitCode::FAILURE, "cap exit code must differ from generic failure");
@@ -1627,9 +1718,20 @@ mod tests {
         }
         drop(tx);
 
-        let (code, _changes, summary) =
-            stream_output(rx, OutputFormat::Text, &[], Instant::now(), None, false, io::sink(), None, None, Some(2))
-                .await;
+        let (code, _changes, summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &[],
+            Instant::now(),
+            None,
+            None,
+            false,
+            io::sink(),
+            None,
+            None,
+            Some(2),
+        )
+        .await;
 
         assert_eq!(code, ExitCode::from(MAX_TOOL_CALLS_EXIT_CODE));
         assert_eq!(summary.tool_calls, 2);
@@ -1839,6 +1941,10 @@ mod tests {
             &[],
             Instant::now(),
             None,
+            // `heartbeat_interval = None` (TASK-26-111): the run's heartbeat
+            // is opt-out for these TASK-25-421 tests so the captured log
+            // only carries the provider-request-id line under test.
+            None,
             // `quiet = true` short-circuits the live progress bytes that
             // would otherwise bleed into the captured `Vec<u8>`. The
             // task's deliverable is recorded via `tracing::info!`, not
@@ -1929,5 +2035,263 @@ mod tests {
             !log.contains("llm call ended"),
             "the canonical message is only emitted when the response carries a request id; got:\n{log}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-26-111: the headless CLI emits a one-line `info!("heartbeat: ...")`
+    // record at the configured interval while an agent turn is in flight.
+    //
+    // The integration tests below drive `stream_output` directly with a
+    // synthetic event stream so the deadline race, the per-event bookkeeping,
+    // and the `tracing` subscriber all converge in one test. A
+    // `SharedWriter`-backed subscriber is installed via `set_default` so
+    // every `info!` the loop emits lands on the test's `Vec<u8>`; a sentinel
+    // `info!` pins the non-empty buffer requirement (the deliverable fires
+    // conditionally on `now >= next_beat`, so a regression that leaves the
+    // watch unarmed would otherwise produce an empty buffer that the
+    // negative assertions would trivially pass). Paired positive/negative
+    // cases prove the line is only emitted (i) at the configured cadence
+    // while a turn is in flight, and (ii) is absent when the watch is
+    // disabled (`None` / zero) or when the turn ends before the first
+    // interval.
+    // -----------------------------------------------------------------------
+
+    /// Drive `stream_output` against a synthetic event stream while the
+    /// headless loop's `tracing::info!` records land on the test's
+    /// `SharedWriter`. Used by the TASK-26-111 tests below; the
+    /// `intermediate` future is `join!`-ed alongside the loop so the test
+    /// can either send more events after some sleep (to keep the turn in
+    /// flight long enough to fire a heartbeat) or finish the turn
+    /// immediately (the negative path).
+    ///
+    /// Both the loop and the driver run on real wall-clock `tokio::time`
+    /// primitives rather than under `start_paused = true`: the loop's
+    /// `await_with_deadlines` race drives the heartbeat watcher forward by
+    /// actually waiting for the timer's `Instant`, and a paused runtime
+    /// would never advance past a `tokio::time::sleep` whose only waiter
+    /// is the test body itself. The intervals are small (a few tens of
+    /// milliseconds) so the suite stays fast.
+    async fn capture_heartbeat_log<F, Fut>(heartbeat_interval: Option<Duration>, intermediate: F) -> String
+    where
+        F: FnOnce(mpsc::Sender<AgentEvent>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let writer = SharedWriter::new();
+        // `info` is the level the deliverable uses (the heartbeat is a
+        // log record, not a warning) and matches the default
+        // `--log-level info` callers will run with. Lower-bound filter so
+        // a regression that accidentally emits at `warn`/`error` is still
+        // captured.
+        let filter = tracing_subscriber::filter::EnvFilter::new("info");
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .with_filter(filter);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = mpsc::channel(8);
+        // Sentinel so the buffer is non-vacuously non-empty: every test
+        // asserts the absence or presence of a specific line, and a buffer
+        // the subscriber failed to populate would let both kinds of
+        // assertion pass. The probe line itself is grep-friendly enough
+        // that it never shadows the deliverable's `heartbeat:` prefix.
+        tracing::info!("TASK-26-111 probe");
+
+        // Start a turn immediately so the heartbeat is armed.
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        // Hand the only remaining sender to the driver, then drop our copy
+        // so the channel actually closes when the driver completes —
+        // otherwise `stream_output` blocks on `rx.recv()` forever once the
+        // events are drained, and the join never resolves.
+        let driver_tx = tx.clone();
+        drop(tx);
+        let driver = intermediate(driver_tx);
+
+        // Run the loop and the driver concurrently. Awaiting
+        // `stream_output` on its own would never schedule the driver
+        // future, so the loop would block forever on a channel that
+        // nothing ever closes — exactly the failure mode the heartbeat
+        // tests guard against.
+        let (stream_result, _driver_done) = tokio::join!(
+            stream_output(
+                rx,
+                OutputFormat::Text,
+                // Filter out everything so the only line emitted under the
+                // filter is the heartbeat. The deliverable must still
+                // land even with the filter set (it is `tracing::info!`,
+                // not a CLI event), so a regression that funnels the
+                // heartbeat through `print_message` would show up as an
+                // empty `heartbeat:` match.
+                &[],
+                Instant::now(),
+                None,
+                heartbeat_interval,
+                // `quiet = true` keeps the live progress bytes off the
+                // captured `Vec<u8>` so the assertions only see the
+                // `tracing::info!` records.
+                true,
+                io::sink(),
+                None,
+                None,
+                None,
+            ),
+            driver,
+        );
+        let (_code, _changes, _summary) = stream_result;
+
+        String::from_utf8_lossy(&writer.snapshot()).into_owned()
+    }
+
+    /// TASK-26-111: with a configured interval and a turn that is still in
+    /// flight long enough to cross the deadline, `stream_output` emits
+    /// one `info!("heartbeat: agent turn still in flight")` line per
+    /// interval. The driver future sleeps `5 * interval` and then sends
+    /// `TurnEvent::Ended` so the run completes after several beats have
+    /// fired. The captured log must contain at least one heartbeat line;
+    /// the lower bound (a `contains` check, not a count) lets the test
+    /// run without coupling to the exact number of beats the loop
+    /// manages to fire, while still pinning the headline guarantee.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_emits_heartbeat_while_turn_in_flight() {
+        let interval = Duration::from_millis(40);
+        let log = capture_heartbeat_log(Some(interval), |tx| async move {
+            // Five intervals: the loop should have plenty of beats to
+            // log at this point. Real wall-clock sleep so the loop's
+            // tokio time advances and the heartbeat tick fires; total
+            // wait is ~200ms.
+            tokio::time::sleep(interval * 5).await;
+            tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // Non-empty guard: a regression in the subscriber wiring would
+        // produce an empty buffer and trivially pass the negative
+        // assertion below.
+        assert!(
+            !log.is_empty(),
+            "the subscriber must have captured at least one line; got an empty buffer (subscriber isolation is broken): {log:?}"
+        );
+        // Pin the deliverable: the canonical `heartbeat:` prefix the
+        // TASK-26-111 spec calls out, named exactly so a regression in
+        // the message body shows up as a literal failure rather than a
+        // silently-passing assertion.
+        assert!(
+            log.contains(crate::heartbeat::HEARTBEAT_MESSAGE),
+            "the run log must contain at least one `heartbeat: agent turn still in flight` line while the turn is in flight; got:\n{log}"
+        );
+        // The sentinel must still be in the log, so the deliverable is
+        // genuinely captured (and not just trivially equal to the
+        // sentinel).
+        assert!(log.contains("TASK-26-111 probe"), "the sentinel probe line must remain in the log; got:\n{log}");
+    }
+
+    /// Negative path (TASK-26-111): when the heartbeat interval is `None`
+    /// (the `run.heartbeatSeconds = 0` opt-out), the watch is disabled and
+    /// no heartbeat line is emitted even if a turn is in flight long
+    /// enough to cross many intervals. The sentinel still lands so the
+    /// buffer is non-vacuously non-empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_does_not_emit_heartbeat_when_interval_is_none() {
+        let log = capture_heartbeat_log(None, |tx| async move {
+            // Well past any sane interval; with `None` the watch is
+            // disabled regardless of duration, but the loop must still
+            // see this sleep to keep the test from finishing
+            // instantaneously.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(!log.is_empty(), "the subscriber must have captured at least one line; got an empty buffer: {log:?}");
+        assert!(
+            !log.contains(crate::heartbeat::HEARTBEAT_MESSAGE),
+            "no heartbeat line must be emitted when `heartbeat_interval = None`; got:\n{log}"
+        );
+    }
+
+    /// Negative path (TASK-26-111): when the turn ends before the first
+    /// interval passes, the heartbeat is never armed past its first
+    /// tick and no line is emitted. The watch's `Ended` arm clears
+    /// `next_beat` so the `await_with_deadlines` race falls back to a
+    /// plain `recv()` for the rest of the run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_does_not_emit_heartbeat_when_turn_ends_before_first_interval() {
+        let interval = Duration::from_millis(40);
+        let log = capture_heartbeat_log(Some(interval), |tx| async move {
+            // Well below the first tick so the watch never gets a
+            // chance to fire.
+            tokio::time::sleep(interval / 4).await;
+            tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(!log.is_empty(), "the subscriber must have captured at least one line; got an empty buffer: {log:?}");
+        assert!(
+            !log.contains(crate::heartbeat::HEARTBEAT_MESSAGE),
+            "no heartbeat line must be emitted when the turn ends before the first interval; got:\n{log}"
+        );
+    }
+
+    /// Negative path (TASK-26-111): when no turn is ever started (the
+    /// run delivers nothing the watch cares about), the heartbeat is
+    /// never armed and no line is emitted regardless of how long the
+    /// loop sleeps. Pairs with the "turn ends before first interval"
+    /// negative above so a regression that arms the watch on the wrong
+    /// event surfaces as a hard failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_output_does_not_emit_heartbeat_when_no_turn_starts() {
+        let log = capture_heartbeat_log(Some(Duration::from_millis(40)), |_tx| async move {
+            // Multiple intervals' worth of wall-clock; no `Started`
+            // ever arrives, so the watch never arms.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        })
+        .await;
+
+        assert!(!log.is_empty(), "the subscriber must have captured at least one line; got an empty buffer: {log:?}");
+        assert!(
+            !log.contains(crate::heartbeat::HEARTBEAT_MESSAGE),
+            "no heartbeat line must be emitted when no turn ever starts; got:\n{log}"
+        );
+    }
+
+    /// TASK-26-111 termination: a short interval still allows the loop
+    /// to break on the `turn_ended` event rather than the deadline
+    /// branch. Mirrors `stream_output_terminates_with_stall_threshold_configured`
+    /// so the heartbeat path runs through the same exit semantics the
+    /// other two watches already pass.
+    #[tokio::test]
+    async fn stream_output_terminates_with_heartbeat_configured() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+        tx.send(AgentEvent::turn_ended(TurnOutcome::Completed)).await.unwrap();
+
+        let interval = Duration::from_millis(50);
+        let (code, _changes, _summary) = stream_output(
+            rx,
+            OutputFormat::Text,
+            &[],
+            Instant::now(),
+            None,
+            Some(interval),
+            false,
+            io::sink(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }

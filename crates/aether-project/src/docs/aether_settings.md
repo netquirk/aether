@@ -114,9 +114,18 @@ CLI prints a one-line warning naming the elapsed wait. The warning fires
 once per stalled call while the turn is still live so a hung turn is
 visible instead of silent; `0` or omitted disables the warning.
 
+`heartbeatSeconds` sets the interval (in seconds) between heartbeat log
+lines the CLI emits while an agent turn is in flight. Defaults to 30 s so
+a hung turn is visible in the run log out of the box; `0` disables the
+heartbeat. The line fires once per interval while a turn is active, so a
+turn that completes before the first tick logs nothing.
+
 ```json
 {
-  "run": { "providerStallWarnSeconds": 30 },
+  "run": {
+    "providerStallWarnSeconds": 30,
+    "heartbeatSeconds": 30
+  },
   "agents": [
     {
       "name": "Build",

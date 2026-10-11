@@ -157,7 +157,9 @@ pub struct AetherSettings {
     pub tool_output: Option<ToolOutputSettings>,
     /// Run-time knobs that affect the headless CLI only. The CLI surfaces a
     /// live one-line warning when a provider call exceeds
-    /// `providerStallWarnSeconds` and a hung turn is still in flight (TASK-24-378).
+    /// `providerStallWarnSeconds` and a hung turn is still in flight (TASK-24-378),
+    /// and emits a periodic heartbeat log line while a turn is in flight
+    /// (TASK-26-111, `heartbeatSeconds`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunSettings>,
     /// Extra environment variables that every shell command a run starts sees
@@ -207,7 +209,24 @@ pub struct RunSettings {
     /// hung turn is visible instead of silent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_stall_warn_seconds: Option<u64>,
+    /// Seconds between heartbeat log lines the CLI emits while an agent turn
+    /// is in flight (TASK-26-111). Defaults to
+    /// [`DEFAULT_HEARTBEAT_SECONDS`] (30 s) so a hung turn is visible in the
+    /// run log without any user configuration. Unset inherits the default;
+    /// `0` disables the heartbeat so a caller can opt out via the settings
+    /// file. Like the provider-stall warning, the heartbeat only fires while
+    /// a turn is active, so a turn that finishes before the first interval
+    /// does not log anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_seconds: Option<u64>,
 }
+
+/// Default interval (in seconds) between heartbeat log lines emitted by the
+/// headless CLI while an agent turn is in flight (TASK-26-111). Configurable
+/// via the top-level `run.heartbeatSeconds` setting; `0` (and an unset
+/// `heartbeatSeconds` after the default is applied via
+/// [`RunSettings::heartbeat_interval`]) disables the heartbeat.
+pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 30;
 
 impl RunSettings {
     /// Threshold as a `Duration`; `None` when unset or zero so callers can
@@ -216,12 +235,35 @@ impl RunSettings {
         self.provider_stall_warn_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
     }
 
+    /// Heartbeat interval as a `Duration`. Falls back to
+    /// [`DEFAULT_HEARTBEAT_SECONDS`] when the field is unset (so the
+    /// heartbeat is on by default) and returns `None` when the resolved value
+    /// is zero (so a caller who explicitly sets `0` opts out). Keeping the
+    /// default and the "zero disables" rule here means callers do not need to
+    /// duplicate the resolution: an absent `run` block still produces a
+    /// 30 s heartbeat.
+    pub fn heartbeat_interval(&self) -> Option<Duration> {
+        let seconds = self.heartbeat_seconds.unwrap_or(DEFAULT_HEARTBEAT_SECONDS);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    }
+
+    /// Default heartbeat interval for a wholly-absent `run` block. Equivalent
+    /// to [`RunSettings::heartbeat_interval`] on a default-constructed
+    /// `RunSettings`; exposed so callers that only hold an
+    /// `Option<RunSettings>` (e.g. the headless CLI's `RunConfig`
+    /// constructors) can resolve the default without constructing a fresh
+    /// `RunSettings` themselves.
+    pub fn default_heartbeat_interval() -> Option<Duration> {
+        RunSettings::default().heartbeat_interval()
+    }
+
     // Pass-by-value matches the merge pattern on `TelemetrySettings` /
-    // `TelemetryContentSettings` even though the single-field body does not
-    // need to own `next`; the symmetry matters more than the micro-savings.
+    // `TelemetryContentSettings` even though the body owns a single field
+    // each; the symmetry matters more than the micro-savings.
     #[allow(clippy::needless_pass_by_value)]
     fn merge(&mut self, next: Self) {
         merge_field(&mut self.provider_stall_warn_seconds, next.provider_stall_warn_seconds);
+        merge_field(&mut self.heartbeat_seconds, next.heartbeat_seconds);
     }
 }
 
@@ -1990,5 +2032,143 @@ mod tests {
             Some(Duration::from_secs(30)),
             "empty overlay must inherit the base threshold",
         );
+    }
+
+    #[test]
+    fn parses_run_heartbeat_seconds() {
+        // TASK-26-111: the interval is a config key (`run.heartbeatSeconds`).
+        // The camelCase rename lets the JSON match the existing settings-file
+        // convention while the Rust field stays snake_case.
+        let config = AetherSettings::try_from(
+            json!({
+                "run": { "heartbeatSeconds": 5 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+
+        let run = config.run.expect("run block parsed");
+        assert_eq!(run.heartbeat_seconds, Some(5));
+        assert_eq!(run.heartbeat_interval(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn run_heartbeat_defaults_when_unset() {
+        // No `heartbeatSeconds` and no `run` block: the resolver still picks
+        // up the 30 s default so a wholly-absent `run` block emits a heartbeat
+        // out of the box.
+        let absent =
+            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
+        assert!(absent.run.is_none());
+        assert_eq!(
+            RunSettings::default().heartbeat_interval(),
+            Some(Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS)),
+            "the default interval is exposed as a constant and the resolver uses it",
+        );
+        assert_eq!(
+            RunSettings::default_heartbeat_interval(),
+            Some(Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS)),
+            "default_heartbeat_interval mirrors RunSettings::default().heartbeat_interval",
+        );
+    }
+
+    #[test]
+    fn run_heartbeat_zero_disables() {
+        // `0` is the explicit off switch; the resolver returns `None` so the
+        // CLI's `RunConfig` skips the heartbeat path.
+        let zero = AetherSettings::try_from(
+            json!({
+                "run": { "heartbeatSeconds": 0 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+        assert_eq!(zero.run.unwrap().heartbeat_interval(), None);
+    }
+
+    #[test]
+    fn run_heartbeat_overlay_overrides_base_value() {
+        // Explicit overlay value wins over the base layer so a project file
+        // can tighten the interval without losing the merge surface to lower
+        // layers. The same merge path is used for `providerStallWarnSeconds`
+        // (TASK-24-378), so a regression here would show up there too.
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "heartbeatSeconds": 60 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "heartbeatSeconds": 5 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.run.unwrap().heartbeat_interval(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn run_heartbeat_overlay_zero_disables_over_nonzero_base() {
+        // A non-zero base is overwritten by an explicit `0` overlay so the
+        // "zero disables" rule survives merging — a regression that left the
+        // base value in place would silently keep heartbeating after the
+        // caller opted out.
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "heartbeatSeconds": 60 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "heartbeatSeconds": 0 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.run.unwrap().heartbeat_interval(), None);
+    }
+
+    #[test]
+    fn run_heartbeat_merge_inherits_unspecified_field() {
+        // An overlay that omits `heartbeatSeconds` inherits the base value,
+        // mirroring the existing `providerStallWarnSeconds` merge semantics.
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "heartbeatSeconds": 15 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.run.unwrap().heartbeat_interval(), Some(Duration::from_secs(15)));
     }
 }

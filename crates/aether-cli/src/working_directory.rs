@@ -112,7 +112,11 @@ mod tests {
     /// task's done-when: "a message naming that directory".
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::items_after_statements, clippy::elidable_lifetime_names, reason = "drop guard stays scoped to the test")]
+    #[allow(
+        clippy::items_after_statements,
+        clippy::elidable_lifetime_names,
+        reason = "drop guard stays scoped to the test"
+    )]
     fn refuses_a_read_only_directory_and_names_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");

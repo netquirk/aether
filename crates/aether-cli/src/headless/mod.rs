@@ -143,6 +143,14 @@ pub struct RunConfig {
     /// `run.providerStallWarnSeconds` block before the agent starts so the
     /// headless loop can race the deadline without re-reading settings.
     pub provider_stall_warn: Option<Duration>,
+    /// Interval between heartbeat log lines the headless CLI emits while an
+    /// agent turn is in flight (TASK-26-111). Resolved from the top-level
+    /// `run.heartbeatSeconds` setting before the agent starts so the
+    /// headless loop can race the deadline without re-reading settings; the
+    /// default is 30 s so a wholly-absent `run` block still emits
+    /// heartbeats out of the box, and `0` disables the heartbeat so the
+    /// pre-existing silent-on-hung-turn behaviour can be opted back into.
+    pub heartbeat_interval: Option<Duration>,
     /// Caller-capped wall-clock budget for the run (TASK-25-18). When set,
     /// the headless event loop returns the distinct
     /// [`crate::run_timeout::TIMEOUT_EXIT_CODE`] the first time
@@ -434,6 +442,13 @@ impl RunConfig {
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
         let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
+        // Heartbeat default lives on `RunSettings::default_heartbeat_interval`
+        // so a wholly-absent `run` block still emits a heartbeat (TASK-26-111);
+        // `settings.run.as_ref().and_then(...)` would silently disable the
+        // watch in that case. An explicit `0` in the settings file maps to
+        // `None` and disables the heartbeat.
+        let heartbeat_interval =
+            settings.run.as_ref().map_or_else(RunSettings::default_heartbeat_interval, RunSettings::heartbeat_interval);
         let selection = initial_selection(args.agent, args.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -464,6 +479,7 @@ impl RunConfig {
             settings_tool_output,
             shell_environment,
             provider_stall_warn,
+            heartbeat_interval,
             transcript_jsonl: args.transcript_jsonl,
             transcript_max_bytes: args.transcript_max_bytes,
             timeout: args.timeout,
@@ -485,6 +501,13 @@ impl RunConfig {
         // Capture before `settings` is moved into `resolve_agent_from_settings`.
         let shell_environment = settings.shell_environment.clone();
         let provider_stall_warn = settings.run.as_ref().and_then(RunSettings::provider_stall_warn);
+        // Heartbeat default lives on `RunSettings::default_heartbeat_interval`
+        // so a wholly-absent `run` block still emits a heartbeat (TASK-26-111);
+        // `settings.run.as_ref().and_then(...)` would silently disable the
+        // watch in that case. An explicit `0` in the settings file maps to
+        // `None` and disables the heartbeat.
+        let heartbeat_interval =
+            settings.run.as_ref().map_or_else(RunSettings::default_heartbeat_interval, RunSettings::heartbeat_interval);
         let selection = initial_selection(options.agent, options.model)?;
         let resolved = resolve_agent_from_settings(&cwd, settings, provider_connections, &selection)
             .map_err(map_selection_error)?;
@@ -530,6 +553,7 @@ impl RunConfig {
             settings_tool_output,
             shell_environment,
             provider_stall_warn,
+            heartbeat_interval,
             transcript_jsonl: options.transcript_jsonl,
             transcript_max_bytes: options.transcript_max_bytes,
             timeout: None,
