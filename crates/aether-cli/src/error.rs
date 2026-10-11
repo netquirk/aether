@@ -29,6 +29,8 @@ pub enum CliError {
     LogFileOpen { path: PathBuf, source: io::Error },
     #[error("failed to read system prompt from {path}: {source}")]
     SystemPromptFile { path: PathBuf, source: io::Error },
+    #[error("system prompt file {path} is empty; provide a non-empty file or omit --system-prompt-file")]
+    EmptySystemPromptFile { path: PathBuf },
     #[error("Agent error: {0}")]
     AgentError(String),
     #[error("Credential store error: {0}")]
@@ -76,4 +78,21 @@ Its lock file is {path}; delete it if no run is active."
         #[source]
         source: io::Error,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_system_prompt_file_message_includes_path_text() {
+        let path = PathBuf::from("/tmp/aether-empty-system-prompt.txt");
+        let error = CliError::EmptySystemPromptFile { path: path.clone() };
+        let rendered = error.to_string();
+        let expected = path.to_string_lossy().into_owned();
+        assert!(
+            rendered.contains(&expected),
+            "message {rendered:?} must contain the path {expected:?}"
+        );
+    }
 }
