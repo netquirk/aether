@@ -219,6 +219,14 @@ pub struct RunSettings {
     /// does not log anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_seconds: Option<u64>,
+    /// Seconds a tool-spawned shell command (the `bash` tool of the built-in
+    /// `coding` MCP server) may run before it is killed (TASK-26-395). Unset
+    /// (or `0`) disables the limit so the existing run shape is preserved when
+    /// the block is absent. Resolved via
+    /// [`RunSettings::shell_command_timeout`] so the disabled path returns
+    /// `None` and callers can treat it as "no limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_command_timeout_seconds: Option<u64>,
 }
 
 /// Default interval (in seconds) between heartbeat log lines emitted by the
@@ -257,6 +265,13 @@ impl RunSettings {
         RunSettings::default().heartbeat_interval()
     }
 
+    /// Per-command shell timeout as a `Duration`; `None` when unset or zero
+    /// so callers can treat the disabled path as "no limit" and skip the
+    /// kill path entirely.
+    pub fn shell_command_timeout(&self) -> Option<Duration> {
+        self.shell_command_timeout_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
+    }
+
     // Pass-by-value matches the merge pattern on `TelemetrySettings` /
     // `TelemetryContentSettings` even though the body owns a single field
     // each; the symmetry matters more than the micro-savings.
@@ -264,6 +279,7 @@ impl RunSettings {
     fn merge(&mut self, next: Self) {
         merge_field(&mut self.provider_stall_warn_seconds, next.provider_stall_warn_seconds);
         merge_field(&mut self.heartbeat_seconds, next.heartbeat_seconds);
+        merge_field(&mut self.shell_command_timeout_seconds, next.shell_command_timeout_seconds);
     }
 }
 
@@ -2170,5 +2186,104 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.run.unwrap().heartbeat_interval(), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn parses_run_shell_command_timeout_seconds() {
+        // TASK-26-395: per-command shell timeout lives at
+        // `run.shellCommandTimeoutSeconds`. The camelCase rename keeps the
+        // JSON spelling aligned with the settings-file convention while the
+        // Rust field stays snake_case, mirroring `providerStallWarnSeconds`
+        // and `heartbeatSeconds`.
+        let config = AetherSettings::try_from(
+            json!({
+                "run": { "shellCommandTimeoutSeconds": 1 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+
+        let run = config.run.expect("run block parsed");
+        assert_eq!(run.shell_command_timeout_seconds, Some(1));
+        assert_eq!(run.shell_command_timeout(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn run_shell_command_timeout_unset_or_zero_disables() {
+        // Absent: no timeout, default-constructed `RunSettings` resolves to
+        // `None` so callers can take the "no limit" path.
+        let absent =
+            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
+        assert!(absent.run.is_none());
+        assert!(absent.run.as_ref().and_then(RunSettings::shell_command_timeout).is_none());
+        assert_eq!(RunSettings::default().shell_command_timeout(), None);
+
+        // Explicit `0` disables the limit, matching the `providerStallWarnSeconds`
+        // and `heartbeatSeconds` "zero is off" contract.
+        let zero = AetherSettings::try_from(
+            json!({
+                "run": { "shellCommandTimeoutSeconds": 0 },
+                "agents": [agent_json("alpha", "Alpha")]
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+        assert_eq!(zero.run.unwrap().shell_command_timeout(), None);
+    }
+
+    #[test]
+    fn run_shell_command_timeout_overlay_overrides_base_value() {
+        // Explicit overlay value wins over the base layer so a project file
+        // can tighten (or relax) the limit without losing the merge surface
+        // to lower layers. The same merge path is used for the existing
+        // `run` fields, so a regression here would show up there too.
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "shellCommandTimeoutSeconds": 60 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "shellCommandTimeoutSeconds": 1 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.run.unwrap().shell_command_timeout(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn run_shell_command_timeout_merge_inherits_unspecified_field() {
+        // An overlay that omits `shellCommandTimeoutSeconds` inherits the
+        // base value, mirroring the existing `providerStallWarnSeconds` and
+        // `heartbeatSeconds` merge semantics.
+        let config = AetherSettings::load(
+            Path::new("/project"),
+            [
+                AetherSettingsSource::Json(
+                    json!({
+                        "run": { "shellCommandTimeoutSeconds": 60 },
+                        "agents": []
+                    })
+                    .to_string(),
+                ),
+                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.run.unwrap().shell_command_timeout(), Some(Duration::from_secs(60)));
     }
 }

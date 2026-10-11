@@ -120,11 +120,19 @@ a hung turn is visible in the run log out of the box; `0` disables the
 heartbeat. The line fires once per interval while a turn is active, so a
 turn that completes before the first tick logs nothing.
 
+`shellCommandTimeoutSeconds` bounds a tool-spawned shell command (the
+`bash` tool of the built-in `coding` MCP server). When a command runs past
+the configured number of seconds it is killed and the run continues. Omit
+the key (or set it to `0`) to disable the limit so an unbounded command
+is allowed. The limit is independent of the whole-run `--timeout` flag and
+of the `providerStallWarnSeconds` warning.
+
 ```json
 {
   "run": {
     "providerStallWarnSeconds": 30,
-    "heartbeatSeconds": 30
+    "heartbeatSeconds": 30,
+    "shellCommandTimeoutSeconds": 30
   },
   "agents": [
     {
