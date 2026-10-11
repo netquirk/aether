@@ -46,4 +46,10 @@ pub enum CliError {
 Its lock file is {path}; delete it if no run is active."
     )]
     RunLocked { path: PathBuf },
+    #[error("failed to resume from transcript {path}: {source}")]
+    Resume {
+        path: PathBuf,
+        #[source]
+        source: crate::transcript::TranscriptError,
+    },
 }

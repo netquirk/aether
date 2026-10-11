@@ -112,13 +112,26 @@ async fn run_agent(config: RunConfig, telemetry: Option<Arc<TelemetryRuntime>>) 
     let deps =
         AgentDeps::new(config.oauth_credential_store, telemetry.as_ref().map(|runtime| runtime.observer_factory()))
             .with_agent_registry(registry);
+    // `--resume PATH` (TASK-26-20): load the prior-turn messages from the
+    // saved transcript BEFORE MCP setup so a malformed file fails the run with
+    // a path-naming error rather than spinning up MCP and a provider call
+    // first. The empty `Vec::new()` default preserves every pre-existing
+    // caller's behaviour: a run without `--resume` still starts with only
+    // the system prompt + new prompt. The path is read at most once per
+    // `run_agent` invocation; subsequent runs re-read the same path from the
+    // updated transcript.
+    let resume_messages = match &config.resume {
+        Some(path) => crate::transcript::load_resume_messages(path)
+            .map_err(|source| CliError::Resume { path: path.clone(), source })?,
+        None => Vec::new(),
+    };
     let (agent, _mcp_snapshot) = RuntimeBuilder::from_spec(config.cwd.clone(), spec)
         .mcp_sources(config.mcp_config_sources)
         .settings_tool_output(config.settings_tool_output.clone())
         .shell_environment(config.shell_environment.clone())
         .disable_tools(config.disable_tools.clone())
         .agent_deps(deps)
-        .build_ready(vec![])
+        .build_ready(resume_messages)
         .await?;
 
     let prompt = expand_prompt(agent.mcp_runtime.handle(), config.prompt).await;

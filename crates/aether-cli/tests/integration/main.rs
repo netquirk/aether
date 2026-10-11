@@ -21,6 +21,7 @@ mod log_file;
 mod log_format;
 mod log_level;
 mod mcp_command;
+mod resume;
 mod retry_reporting;
 mod run_init;
 mod run_log_elapsed;

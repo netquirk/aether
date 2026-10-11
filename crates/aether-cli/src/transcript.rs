@@ -42,8 +42,11 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use aether_core::events::{AgentEvent, TurnEvent};
+use aether_core::events::{AgentEvent, MessageEvent, ToolEvent, TurnEvent};
+use llm::types::IsoString;
+use llm::{AssistantReasoning, ChatMessage, MessageId};
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::headless::CliEventKind;
 use crate::headless::run::event_kind;
@@ -226,9 +229,238 @@ pub fn has_cli_event_kind(event: &AgentEvent) -> bool {
     event_kind(event).is_some()
 }
 
+/// Errors that [`load_resume_messages`] can return. Each variant's `Display`
+/// implementation names *what* was wrong so a caller reading the message can
+/// act on the failure without re-running the loader.
+#[derive(Debug, Error)]
+pub enum TranscriptError {
+    #[error("failed to read transcript: {0}")]
+    Io(#[from] io::Error),
+    #[error("line {line} is not valid JSON: {source}")]
+    InvalidJson { line: usize, source: serde_json::Error },
+    #[error(
+        "first line is not a transcript header: expected a JSON object with \"type\":\"header\" (see --transcript-jsonl)"
+    )]
+    MissingHeader,
+    #[error("line {line} is not a readable transcript record: {detail}")]
+    UnknownFormat { line: usize, detail: String },
+}
+
+/// Load the prior-turn messages recorded in a JSON Lines transcript produced
+/// by [`JsonlTranscript`]. Used by `aether headless --resume PATH` to seed the
+/// next run's context without replaying the whole conversation.
+///
+/// The reader is permissive about ordering and the exact set of events in the
+/// file: it walks the lines once, reconstructs the
+/// [`Vec<ChatMessage>`] from the
+/// events whose contents appear in the transcript, and silently ignores the
+/// lines that the run logged purely for observability
+/// (`llm_call_*`, `turn_ended`, `*_progress`, etc.). A bad path, a missing
+/// header, or a line that does not match the schema is reported via
+/// [`TranscriptError`] with a `Display` that names the offending line so a
+/// user can tell at a glance which line to inspect.
+///
+/// Only one slot of the rotation contract is reachable in practice: a single
+/// call to [`JsonlTranscript::rotate`] renames the live file to `<stem>.1` and
+/// only the most recent sibling survives. Passing `<stem>.1` to `--resume`
+/// therefore yields at most the most recent rotation's worth of turns; older
+/// history is intentionally not preserved.
+pub fn load_resume_messages(path: &Path) -> Result<Vec<ChatMessage>, TranscriptError> {
+    let raw = std::fs::read_to_string(path)?;
+    // Numbered with the 0-based line index (the file's `Line 0` is the header)
+    // so the error message aligns with the byte the user sees when they `cat`
+    // the file. `lines()` skips the trailing empty string a file ending in a
+    // newline would otherwise introduce, which is harmless here.
+    let mut lines = raw.lines().enumerate();
+    let (header_index, header_line) = lines.next().ok_or(TranscriptError::MissingHeader)?;
+    let header_value: serde_json::Value = serde_json::from_str(header_line)
+        .map_err(|source| TranscriptError::InvalidJson { line: header_index, source })?;
+    let header_is_well_formed = header_value
+        .as_object()
+        .is_some_and(|obj| obj.get("type").and_then(serde_json::Value::as_str) == Some("header"));
+    if !header_is_well_formed {
+        return Err(TranscriptError::MissingHeader);
+    }
+
+    // Walk the rest of the file with the helper that folds events into messages
+    // and reports a header-aware line number back to the caller on failure.
+    let mut builder = ResumeBuilder::default();
+    for (index, line) in lines {
+        let raw_value: serde_json::Value =
+            serde_json::from_str(line).map_err(|source| TranscriptError::InvalidJson { line: index, source })?;
+        let Some(object) = raw_value.as_object() else {
+            return Err(TranscriptError::UnknownFormat {
+                line: index,
+                detail: format!("expected a JSON object, got {raw_value:?}"),
+            });
+        };
+        if !object.contains_key("turn") || !object.contains_key("type") || !object.contains_key("event") {
+            return Err(TranscriptError::UnknownFormat {
+                line: index,
+                detail: format!("transcript record must carry `turn`, `type`, and `event` (got {raw_value:?})"),
+            });
+        }
+        let event_value = object.get("event").cloned().unwrap_or(serde_json::Value::Null);
+        let event: AgentEvent =
+            serde_json::from_value(event_value).map_err(|source| TranscriptError::UnknownFormat {
+                line: index,
+                detail: format!("`event` does not match the AgentEvent schema: {source}"),
+            })?;
+        builder.feed(event);
+    }
+    Ok(builder.finish())
+}
+
+/// State machine that folds the per-event lines of a saved transcript back
+/// into the [`ChatMessage`] stream the next run should seed.
+///
+/// The builder exists so [`load_resume_messages`] can keep its top-level
+/// control flow readable: it walks the lines and dispatches them here. The
+/// state is just enough to remember the in-progress assistant turn so a later
+/// `tool_call` can be folded onto the most recent `ChatMessage::Assistant`'s
+/// `tool_calls` vec without needing a separate message for the request.
+#[derive(Default)]
+struct ResumeBuilder {
+    messages: Vec<ChatMessage>,
+    /// Index of the most recent [`ChatMessage::Assistant`] in `messages`, or
+    /// `None` if the next `tool_call` event has nothing to attach to (in which
+    /// case the builder synthesises a fresh empty assistant carrying just the
+    /// request). Kept as an `Option<usize>` rather than a borrowed index into
+    /// `messages` because pushes into `messages` would invalidate the borrow.
+    last_assistant: Option<usize>,
+}
+
+impl ResumeBuilder {
+    /// Apply the next event from the transcript. Events that carry no chat
+    /// content (streaming fragments, `turn_ended`, `llm_call_*`, etc.) are
+    /// ignored on purpose; the writer chose to record them for observability
+    /// only, not because they affect what the next run should see.
+    fn feed(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Turn(TurnEvent::Started { content }) => {
+                // Drop any leftover `User` message still pending at the end of
+                // the transcript from a turn that never produced a reply —
+                // we'd otherwise load a `User` with no answering assistant,
+                // which the LLM might misinterpret as a stranded prompt. The
+                // happens-before ordering means the trailing partial turn is
+                // never seen by callers because `finish()` discards it.
+                self.last_assistant = None;
+                self.messages.push(ChatMessage::User {
+                    message_id: MessageId::new(),
+                    content,
+                    timestamp: IsoString::now(),
+                });
+            }
+            AgentEvent::Message(MessageEvent::Text { message_id, chunk, is_complete: true }) => {
+                self.last_assistant = Some(self.messages.len());
+                self.messages.push(ChatMessage::Assistant {
+                    message_id,
+                    content: chunk,
+                    reasoning: AssistantReasoning::default(),
+                    timestamp: IsoString::now(),
+                    tool_calls: Vec::new(),
+                });
+            }
+            AgentEvent::Tool(ToolEvent::Call { request }) => {
+                if let Some(index) = self.last_assistant
+                    && let ChatMessage::Assistant { tool_calls, .. } = &mut self.messages[index]
+                {
+                    tool_calls.push(request);
+                } else {
+                    // No assistant to attach to (e.g. a `tool_call` recorded
+                    // before any `text` chunk landed, which the writer's own
+                    // `has_cli_event_kind` doesn't guarantee because the JSONL
+                    // format sorts by the order events were observed).
+                    // Synthesise a fresh empty-content assistant so the
+                    // request has somewhere to live; the next event will
+                    // still rewrite `last_assistant` if a real text event
+                    // follows.
+                    self.last_assistant = Some(self.messages.len());
+                    self.messages.push(ChatMessage::Assistant {
+                        message_id: MessageId::new(),
+                        content: String::new(),
+                        reasoning: AssistantReasoning::default(),
+                        timestamp: IsoString::now(),
+                        tool_calls: vec![request],
+                    });
+                }
+            }
+            AgentEvent::Tool(ToolEvent::Result { result, .. }) => {
+                self.last_assistant = None;
+                self.messages.push(ChatMessage::ToolCallResult(Ok(result)));
+            }
+            AgentEvent::Tool(ToolEvent::Error { error }) => {
+                self.last_assistant = None;
+                self.messages.push(ChatMessage::ToolCallResult(Err(error)));
+            }
+            AgentEvent::Message(_)
+            | AgentEvent::Tool(
+                ToolEvent::CallUpdate { .. }
+                | ToolEvent::ExecutionStarted { .. }
+                | ToolEvent::Progress { .. }
+                | ToolEvent::SubAgentProgress { .. }
+                | ToolEvent::DisplayUpdate { .. }
+                | ToolEvent::TaskCreated { .. }
+                | ToolEvent::TaskStatus { .. }
+                | ToolEvent::TaskCompleted { .. }
+                | ToolEvent::TaskFailed { .. }
+                | ToolEvent::TaskCancelled { .. }
+                | ToolEvent::Refused { .. }
+                | ToolEvent::DefinitionsUpdated { .. },
+            )
+            | AgentEvent::Turn(
+                TurnEvent::Ended { .. }
+                | TurnEvent::RetryScheduled { .. }
+                | TurnEvent::LlmCallStarted { .. }
+                | TurnEvent::LlmCallEnded { .. }
+                | TurnEvent::AutoContinue { .. },
+            )
+            | AgentEvent::Context(_)
+            | AgentEvent::Model(_)
+            | AgentEvent::SessionUsage(_) => {
+                // Everything above is observability / lifecycle metadata the
+                // transcript writes but that does *not* change the chat
+                // context the model would see on the next run:
+                //
+                // - `AgentEvent::Message(_)` covers streaming `Text`/`Thought`
+                //   fragments (`is_complete: false`) and thoughts — bookkeeping
+                //   for the live run, not part of the chat context.
+                // - The unhandled `ToolEvent` variants are run-time metadata
+                //   (`call_update`, execution progress, task lifecycle).
+                //   `TaskCompleted`/`TaskFailed`/`TaskCancelled` are
+                //   intentionally *not* converted into
+                //   `ChatMessage::User` task-status messages: replaying them
+                //   would re-add background-task status into the new run's
+                //   history even when the original task no longer exists,
+                //   which is misleading and out of scope for this task.
+                // - `TurnEvent::{Ended,RetryScheduled,LlmCall*}` are
+                //   lifecycle / observability; intentionally not folded in.
+                // - `Context`/`Model`/`SessionUsage` are session accounting.
+            }
+        }
+    }
+
+    /// Finalise the recovered messages. Trims any trailing
+    /// [`ChatMessage::User`] left in place by a partial turn the transcript
+    /// didn't finish — see [`Self::feed`] for the rationale.
+    ///
+    /// The trailing `User` is dropped regardless of its `content`: a partial
+    /// turn that emitted `TurnStarted { content: vec![text("...")] }` followed
+    /// by nothing is a stranded prompt, and seeding the new run with it
+    /// would leave the LLM with an unanswered question at the start of its
+    /// context.
+    fn finish(mut self) -> Vec<ChatMessage> {
+        if matches!(self.messages.last(), Some(ChatMessage::User { .. })) {
+            self.messages.pop();
+        }
+        self.messages
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aether_core::events::{AgentEvent, StreamState, ToolEvent, TurnEvent, TurnOutcome};
+    use llm::ContentBlock;
 
     use super::*;
 
@@ -647,5 +879,195 @@ mod tests {
             serde_json::from_str(rotated_lines[1]).unwrap_or_else(|error| panic!("rotated event is not JSON: {error}"));
         assert_eq!(rotated_event["turn"], 1);
         assert_eq!(rotated_event["type"], "turn_started");
+    }
+
+    /// Build a two-turn transcript with the writer, then feed it through
+    /// [`load_resume_messages`] and assert the recovered [`ChatMessage`] list
+    /// carries both prior user prompts and both prior assistant replies in
+    /// order. This is the round-trip the `--resume` flag depends on: if the
+    /// loader is asked to reconstruct a two-turn conversation, the LLM's first
+    /// provider request on the resumed run sees both prompts.
+    #[test]
+    fn load_resume_messages_round_trips_two_turn_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+
+        let mut transcript = JsonlTranscript::create(&path).expect("create writer");
+        transcript.write_header(env!("CARGO_PKG_VERSION"), "2026-10-10T08:54:00+00:00").expect("write header");
+
+        // Turn 1: user asks the first question, the assistant streams a
+        // complete text reply, the turn ends cleanly.
+        let first_user = vec![ContentBlock::text("first question")];
+        transcript.record(&AgentEvent::Turn(TurnEvent::Started { content: first_user.clone() })).expect("turn 1 start");
+        transcript.record(&text("m-1", "first answer")).expect("turn 1 text");
+        transcript.record(&AgentEvent::turn_ended(TurnOutcome::Completed)).expect("turn 1 ended");
+
+        // Turn 2: same shape, different content. The reader must keep both
+        // turns in document order.
+        let second_user = vec![ContentBlock::text("second question")];
+        transcript
+            .record(&AgentEvent::Turn(TurnEvent::Started { content: second_user.clone() }))
+            .expect("turn 2 start");
+        transcript.record(&text("m-2", "second answer")).expect("turn 2 text");
+        transcript.record(&AgentEvent::turn_ended(TurnOutcome::Completed)).expect("turn 2 ended");
+
+        transcript.flush().expect("flush");
+
+        let messages = load_resume_messages(&path).expect("two-turn transcript loads");
+
+        // Four messages: user 1, assistant 1, user 2, assistant 2. The order
+        // matters because the LLM sees the list verbatim.
+        assert_eq!(messages.len(), 4, "expected four messages (2× user + 2× assistant); got {messages:?}");
+
+        let render = |message: &ChatMessage| -> String {
+            match message {
+                ChatMessage::User { content, .. } => ContentBlock::join_text(content),
+                ChatMessage::Assistant { content, .. } => content.clone(),
+                other => format!("{other:?}"),
+            }
+        };
+        assert_eq!(render(&messages[0]), "first question");
+        assert_eq!(render(&messages[1]), "first answer");
+        assert_eq!(render(&messages[2]), "second question");
+        assert_eq!(render(&messages[3]), "second answer");
+    }
+
+    /// A header that does not look like a transcript header is rejected with
+    /// [`TranscriptError::MissingHeader`]. The matching `Display` must name
+    /// both "header" and "JSON object" so a user pasting in a different file
+    /// can tell what the loader wanted.
+    #[test]
+    fn load_resume_messages_rejects_file_without_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-transcript.jsonl");
+        std::fs::write(&path, "{\"not\":\"a transcript\"}\n").expect("seed file");
+
+        let error = load_resume_messages(&path).expect_err("missing header must fail");
+        match error {
+            TranscriptError::MissingHeader => {}
+            other => panic!("expected MissingHeader, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(rendered.contains("header"), "error must mention 'header': {rendered}");
+        assert!(rendered.contains("JSON object"), "error must mention 'JSON object': {rendered}");
+    }
+
+    /// An empty file is treated as "no header" so the caller does not silently
+    /// get an empty message list and confuse themselves into thinking the
+    /// conversation is empty.
+    #[test]
+    fn load_resume_messages_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, "").expect("seed empty");
+
+        let error = load_resume_messages(&path).expect_err("empty file must fail");
+        assert!(matches!(error, TranscriptError::MissingHeader), "got {error:?}");
+    }
+
+    /// A header followed by a malformed event line is rejected with
+    /// [`TranscriptError::UnknownFormat`] whose `Display` names the offending
+    /// line so the failure is diagnosable. The header has to be valid for the
+    /// loader to even get to the second line; the bad row proves the
+    /// post-header handling is rigorous.
+    #[test]
+    fn load_resume_messages_rejects_unknown_format_on_later_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("malformed.jsonl");
+        // Build a valid header followed by a payload that satisfies the
+        // `turn`/`type`/`event` shape but whose `event` is a string instead
+        // of an object — enough to make the AgentEvent deserialiser fail and
+        // surface as `UnknownFormat { line: 1, .. }`. Using a string keeps the
+        // "UnknownFormat on a later line" intent obvious in the test file.
+        std::fs::write(
+            &path,
+            "{\"type\":\"header\",\"aetherVersion\":\"0.0.0\",\"startedAt\":\"2026-10-10T08:54:00+00:00\"}\n{\"turn\":1,\"type\":\"text\",\"event\":\"not a real event\"}\n",
+        )
+        .expect("seed file");
+
+        let error = load_resume_messages(&path).expect_err("malformed event must fail");
+        match error {
+            TranscriptError::UnknownFormat { line, .. } => assert_eq!(line, 1, "the bad line must be named as line 1"),
+            other => panic!("expected UnknownFormat, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(rendered.contains('1'), "error must mention the offending line number: {rendered}");
+    }
+
+    /// A line in the body that is not valid JSON at all is rejected with
+    /// [`TranscriptError::InvalidJson`] whose `Display` names the source error
+    /// and the line. This is the failure mode a corrupted transcript hits —
+    /// not a schema drift, but a half-flushed byte sequence.
+    #[test]
+    fn load_resume_messages_rejects_invalid_json_on_later_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("invalid-json.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"header\",\"aetherVersion\":\"0.0.0\",\"startedAt\":\"2026-10-10T08:54:00+00:00\"}\nnot-json\n",
+        )
+        .expect("seed file");
+
+        let error = load_resume_messages(&path).expect_err("invalid JSON must fail");
+        match error {
+            TranscriptError::InvalidJson { line, .. } => assert_eq!(line, 1),
+            other => panic!("expected InvalidJson, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(rendered.contains("line 1"), "error must mention the line: {rendered}");
+    }
+
+    /// A transcript whose final turn only contains a `Turn(TurnEvent::Started)`
+    /// (no assistant reply yet) must not load a stray empty `User` message —
+    /// that would leave the new run with an unanswered prompt at the end of
+    /// its context.
+    #[test]
+    fn load_resume_messages_drops_trailing_partial_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("partial.jsonl");
+
+        let mut transcript = JsonlTranscript::create(&path).expect("create writer");
+        transcript.write_header(env!("CARGO_PKG_VERSION"), "2026-10-10T08:54:00+00:00").expect("write header");
+
+        // Turn 1 fully complete.
+        transcript
+            .record(&AgentEvent::Turn(TurnEvent::Started { content: vec![ContentBlock::text("first question")] }))
+            .expect("turn 1 start");
+        transcript.record(&text("m-1", "first answer")).expect("turn 1 text");
+        transcript.record(&AgentEvent::turn_ended(TurnOutcome::Completed)).expect("turn 1 ended");
+
+        // Turn 2 only emitted `TurnStarted` — the transcript was cut before
+        // any assistant reply landed. The reader should drop the trailing
+        // user message so the resumed run does not see a stranded prompt.
+        transcript
+            .record(&AgentEvent::Turn(TurnEvent::Started { content: vec![ContentBlock::text("partial question")] }))
+            .expect("turn 2 start");
+        transcript.flush().expect("flush");
+
+        let messages = load_resume_messages(&path).expect("partial transcript loads");
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected the partial turn's trailing User to be dropped; got {} messages: {messages:?}",
+            messages.len()
+        );
+
+        // The first turn (user + assistant) must still be there in order.
+        let render_user = |message: &ChatMessage| -> String {
+            match message {
+                ChatMessage::User { content, .. } => ContentBlock::join_text(content),
+                ChatMessage::Assistant { content, .. } => content.clone(),
+                other => format!("{other:?}"),
+            }
+        };
+        assert_eq!(render_user(&messages[0]), "first question");
+        assert_eq!(render_user(&messages[1]), "first answer");
+
+        // The trailing partial prompt must NOT appear in the loaded messages.
+        let trailing_partial = messages.iter().any(|message| {
+            matches!(message, ChatMessage::User { content, .. }
+                if content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "partial question")))
+        });
+        assert!(!trailing_partial, "trailing partial prompt must not appear in the loaded messages: {messages:?}");
     }
 }

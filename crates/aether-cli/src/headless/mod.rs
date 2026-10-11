@@ -161,6 +161,16 @@ pub struct RunConfig {
     /// into the runtime via
     /// [`crate::runtime::RuntimeBuilder::disable_tools`].
     pub disable_tools: Vec<String>,
+    /// Path to a JSON Lines transcript written by a previous run (TASK-26-20).
+    /// When set, the headless run reads the file before the agent is built,
+    /// reconstructs the recorded `ChatMessage` stream from it, and seeds the
+    /// next run's context with those messages so the first provider request
+    /// sees the prior conversation. `None` (the default) preserves the
+    /// pre-existing single-shot behaviour: the run starts with only the
+    /// system prompt + new prompt. A malformed file fails the run before
+    /// any provider call (via `CliError::Resume`), so a bad transcript
+    /// cannot produce a misleading resumed context.
+    pub resume: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -203,6 +213,12 @@ pub struct HeadlessOptions {
     pub transcript_jsonl: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_max_bytes: Option<u64>,
+    /// Mirror of the `--resume` flag for `--options-json` callers (TASK-26-20).
+    /// When set, the run reads this path as a JSON Lines transcript before the
+    /// agent is built and seeds the new context with the recovered messages.
+    /// `None` (the default) preserves the pre-existing single-shot behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<PathBuf>,
 }
 
 pub async fn run_headless(args: HeadlessArgs) -> Result<ExitCode, CliError> {
@@ -365,6 +381,18 @@ pub struct HeadlessArgs {
     /// configured `tools` block already uses.
     #[arg(long = "disable-tool", value_name = "NAME")]
     pub disable_tools: Vec<String>,
+
+    /// Continue the session from a saved transcript (TASK-26-20). PATH must
+    /// point at a JSON Lines transcript previously written by
+    /// `--transcript-jsonl`. The CLI reads the file before the agent is built
+    /// and seeds the new context with the recovered prior turns so the first
+    /// provider request on the new run sees the conversation that came
+    /// before. A missing, malformed, or non-transcript file fails the run
+    /// (with a message that names the offending line/path) before any
+    /// provider call. Without `--resume` the run starts fresh, matching the
+    /// pre-existing single-shot behaviour.
+    #[arg(long = "resume", value_name = "PATH")]
+    pub resume: Option<PathBuf>,
 }
 
 impl RunConfig {
@@ -417,6 +445,7 @@ impl RunConfig {
             timeout: args.timeout,
             max_tool_calls: args.max_tool_calls,
             disable_tools: args.disable_tools,
+            resume: args.resume,
         })
     }
 
@@ -480,6 +509,13 @@ impl RunConfig {
             // `--disable-tool`; the run sees no per-run withholds, matching
             // the pre-existing behaviour.
             disable_tools: Vec::new(),
+            // `--options-json` callers (TASK-26-20) do not yet expose
+            // `--resume` from the flag; tests can still reach this through
+            // the `resume` field on the options struct (or, for the runtime
+            // hook, through the `RunConfig::resume` value itself). The field
+            // is wired here so `--options-json` mirrors the CLI flag,
+            // mirroring how `transcript_jsonl` is plumbed on the same struct.
+            resume: options.resume,
         })
     }
 }
@@ -839,6 +875,25 @@ mod tests {
 
         let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("absent --log-file parses").args;
         assert!(parsed.log_file.is_none(), "absent --log-file must be None, not a default");
+    }
+
+    #[test]
+    fn resume_flag_round_trips_through_clap() {
+        // The clap-level check (TASK-26-20): `--resume PATH` must round-trip
+        // into `HeadlessArgs.resume` as `Some(PathBuf)` so the CLI flag
+        // reaches the loader unchanged. The absent-flag case must stay
+        // `None` so every pre-existing caller (and every test that does
+        // not pass `--resume`) sees the pre-existing single-shot
+        // behaviour.
+        use clap::Parser as _;
+        let parsed = QuietHarness::try_parse_from(["aether", "--resume", "/tmp/aether.jsonl", "hello"])
+            .expect("--resume PATH parses")
+            .args;
+        assert_eq!(parsed.resume.as_deref(), Some(std::path::Path::new("/tmp/aether.jsonl")));
+        assert_eq!(parsed.prompt, vec!["hello".to_string()]);
+
+        let parsed = QuietHarness::try_parse_from(["aether", "hello"]).expect("absent --resume parses").args;
+        assert!(parsed.resume.is_none(), "absent --resume must be None, not a default");
     }
 
     #[test]
