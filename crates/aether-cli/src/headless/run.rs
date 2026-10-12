@@ -123,6 +123,20 @@ pub async fn run(config: RunConfig) -> Result<ExitCode, CliError> {
     // model in use; `AlloyedModelProvider` only swaps providers on failure).
     let (provider, model_id) = run_model_identity(&config.spec.model);
     info!(provider = %provider, model_id = %model_id, "run starting");
+    // Unconditional run-start banner (TASK-27-17 / TASK-26-858): an
+    // operator must be able to see which settings file and profile a run
+    // used without passing `--log-level`, so this is a plain `eprintln!`
+    // rather than a `tracing` record (which `--log-level` / `--quiet` /
+    // `--log-file` could hide or divert). Borrowed before `config` is
+    // moved into `run_agent` below.
+    match &config.settings_path {
+        Some(path) => {
+            eprintln!("aether: loaded config {} (profile '{}')", path.display(), config.spec.name);
+        }
+        None => {
+            eprintln!("aether: loaded config <inline settings> (profile '{}')", config.spec.name);
+        }
+    }
     warn_if_not_a_repository(&config.cwd);
 
     let telemetry = build_telemetry_runtime(config.telemetry.as_ref(), config.trace_context.clone())?;

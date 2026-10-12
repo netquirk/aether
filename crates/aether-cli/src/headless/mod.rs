@@ -62,6 +62,11 @@ pub struct RunConfig {
     pub mcp_config_sources: Vec<McpConfigSource>,
     pub spec: AgentSpec,
     pub agent_catalog: AgentCatalog,
+    /// Path of the settings file this run actually resolved (TASK-27-17,
+    /// from TASK-26-858), or `None` when settings came inline (`--settings-json`
+    /// / `settings` in `--options-json`). Printed by `run` as the run-start
+    /// banner. Resolved from `SettingsSourceArgs::config_path`.
+    pub settings_path: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub output: OutputFormat,
     pub verbose: bool,
@@ -481,6 +486,11 @@ impl RunConfig {
         let prompt = resolve_prompt(&args)?;
         let cwd = args.cwd.canonicalize().map_err(CliError::IoError)?;
         let settings = args.settings_source.load_settings(&cwd)?;
+        // Capture the resolved settings path before `args.settings_source`
+        // is shadowed by later moves; the run-start banner prints it
+        // (TASK-27-17 / TASK-26-858). Mirrors the per-source logic of
+        // `SettingsSourceArgs::config_path`.
+        let settings_path = args.settings_source.config_path(&cwd);
         let provider_connections = args.provider_connection.clone().into_overrides();
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
@@ -507,6 +517,7 @@ impl RunConfig {
             mcp_config_sources,
             spec: resolved.spec,
             agent_catalog: resolved.catalog,
+            settings_path,
             system_prompt: resolve_system_prompt(args.system_prompt, args.system_prompt_file)?,
             output: args.output,
             verbose: args.verbose,
@@ -541,6 +552,12 @@ impl RunConfig {
     fn from_options(options: HeadlessOptions) -> Result<Self, CliError> {
         let prompt = options.prompt.ok_or(CliError::NoPrompt)?;
         let cwd = options.cwd.unwrap_or_else(|| PathBuf::from(".")).canonicalize().map_err(CliError::IoError)?;
+        // Compute the resolved settings path before `options.settings` /
+        // `options.settings_file` are moved into `from_json_options` below;
+        // the run-start banner prints it (TASK-27-17 / TASK-26-858). An
+        // inline `settings` object means there is no path to report, so
+        // we surface `<inline settings>` for that case at the print site.
+        let settings_path = if options.settings.is_some() { None } else { options.settings_file.clone() };
         let settings_source = SettingsSourceArgs::from_json_options(options.settings, options.settings_file)?;
         let settings = settings_source.load_settings(&cwd)?;
         let provider_connections = ProviderConnectionOverrides::new(options.providers.unwrap_or_default());
@@ -574,6 +591,7 @@ impl RunConfig {
             mcp_config_sources,
             spec: resolved.spec,
             agent_catalog: resolved.catalog,
+            settings_path,
             system_prompt: resolve_system_prompt(options.system_prompt, options.system_prompt_file)?,
             output: options.output.unwrap_or(OutputFormat::Text),
             verbose: options.verbose.unwrap_or(false),
