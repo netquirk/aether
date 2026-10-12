@@ -17,6 +17,16 @@ packages/website/dist/
 packages/website/.astro/
 packages/website/*.log
 .DS_Store
-.prairie/
+# Runtime state under .prairie/ that the runner creates at run-time and
+# must NEVER land in the repo (PRAIRIE_* files, per-run logs, deploy state,
+# injected-skill state, conflict markers). The deploy recipe files
+# (.prairie/deploy.sh, deploy.toml, deploy-state.sh, rollback.sh, healthd.py)
+# are NOT ignored and are committed normally.
+.prairie/todo.json
+.prairie/injected-skills
+.prairie/done
+.prairie/deployed-commit
+.prairie/healthd.pid
+.prairie/healthd.log
 .prairie-conflicts/
 .prairie-conflicts-NOTE.md
