@@ -1,5 +1,6 @@
 use aether_project::{
     AetherSettings, AetherSettingsSource, AgentCatalog, SettingsError, SettingsFileSource, ToolOutputSettings,
+    project_settings_path, user_settings_path,
 };
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -61,6 +62,34 @@ impl SettingsSourceArgs {
             Some(source) => AetherSettings::load(cwd, [source]),
             None => AetherSettings::load_default(cwd),
         }
+    }
+
+    /// The settings file that [`Self::load_settings`] will actually read for
+    /// `cwd`: an explicit `--config`, then `--settings-file`, then the default
+    /// project-level (`.aether/settings.json`) and user-level files that exist.
+    /// `None` when `--settings-json` supplies settings inline, or when neither
+    /// default file exists. Used to report which config a run loaded.
+    pub fn config_path(&self, cwd: &Path) -> Option<PathBuf> {
+        if let Some(path) = &self.config {
+            return Some(path.clone());
+        }
+        if let Some(path) = &self.settings_file {
+            return Some(path.clone());
+        }
+        if self.settings_json.is_some() {
+            return None;
+        }
+
+        let project = project_settings_path(cwd);
+        if project.is_file() {
+            return Some(project);
+        }
+        if let Some(user) = user_settings_path() {
+            if user.is_file() {
+                return Some(user);
+            }
+        }
+        None
     }
 
     /// Verify that a settings file named explicitly on the command line
@@ -267,6 +296,27 @@ mod tests {
             settings_file: None,
         };
         args.verify_explicit_source().expect("verify_explicit_source must be a no-op when only --settings-json is set");
+    }
+
+    #[test]
+    fn config_path_reports_the_loaded_settings_file() {
+        // An explicit --config path is returned verbatim.
+        let explicit = PathBuf::from("explicit-settings.json");
+        let args = SettingsSourceArgs { settings_json: None, config: Some(explicit.clone()), settings_file: None };
+        assert_eq!(args.config_path(Path::new("/workspace")), Some(explicit));
+
+        // Inline --settings-json means there is no file path.
+        let args = SettingsSourceArgs::from_json_options(Some(AetherSettings::default()), None).unwrap();
+        assert_eq!(args.config_path(Path::new("/workspace")), None);
+
+        // No flags: the project-level default in the given cwd is reported.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".aether")).expect("create .aether");
+        let project_settings = dir.path().join(".aether").join("settings.json");
+        std::fs::write(&project_settings, "{}").expect("write project settings");
+
+        let args = SettingsSourceArgs::default();
+        assert_eq!(args.config_path(dir.path()), Some(project_settings));
     }
 
     /// Write a settings document with one or more user-invocable agents that
