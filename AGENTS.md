@@ -1,5 +1,7 @@
 # Agent Instructions
 
+For project context (purpose, stakeholders, problem, quality goals, constraints, out-of-scope, glossary, domain paths, open questions), see `.prairie/BRIEF.md`.
+
 ## Key Commands
 
 - **Compile** -- use LSP tools, or `just check` if you must
