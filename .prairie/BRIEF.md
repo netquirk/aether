@@ -88,7 +88,6 @@ A developer using an AI coding agent needs control over every token in the model
 
 ## Open questions
 
-- Should the brief name the end customers of Aether's users? The repository does not establish them (`unknown` today).
 - Should workspace crates/packages the README tables omit (`crates/aether-sessions`, `crates/aether-session-index`, `crates/acp-utils`, `crates/aether-auth`, `crates/aether-schemas`, `crates/aether-telemetry`, `crates/mcp-utils`, `crates/llm-codegen`, `crates/utils`, `crates/doctest`, `crates/internal-evals`, `packages/aether-evals`) get `## Domain paths` entries, and what maps to what?
 - Define "Transcript" for the `## Glossary` entry that currently reads `unknown`, or confirm it stays undefined.
 - Is the raw unauthenticated `aether server` acceptable long-term, or is built-in authentication planned? The README today mandates a tunnel, private network or authenticating TLS proxy.
@@ -99,3 +98,4 @@ A developer using an AI coding agent needs control over every token in the model
 ## Decisions
 
 - Rank the quality goals: the repository lists them but states no priority order; what is the order? — "Control-first (README order)" (a), 2026-10-15, chosen by operator.
+- Should the brief name the end customers of Aether's users? The repository does not establish them (`unknown` today). — "Scope them out of the brief" (a), 2026-10-15, chosen by operator.
