@@ -52,6 +52,38 @@ A developer using an AI coding agent needs control over every token in the model
 
 ## Glossary
 
+- **Aether** — the AI coding agent harness written in Rust that gives the user control over every token in context (README.md:10).
+- **Agent** — begins as a blank slate with no system prompt and zero tools; the user adds prompts and tools (README.md:37).
+- **Prompt (system prompt)** — supplied as an array of markdown files the user composes (README.md:39).
+- **Tool** — capability an agent may call; obtained exclusively via MCP servers (README.md:40).
+- **MCP** — Model Context Protocol; the only route by which agents get tools, supported in any language, local or remote (including OAuth) (README.md:40).
+- **Provider** — an LLM backend; eleven are supported out of the box (Anthropic, OpenAI, OpenRouter, DeepSeek, Fireworks AI, Gemini, Microsoft Foundry, Moonshot, ZAI, Llama.cpp, Ollama) plus the `StreamingModelProvider` trait for bring-your-own providers (README.md:41); each usage event records a `provider` (`migrations/002_session_usage.sql`).
+- **Alloy** — combining multiple providers/models to round-robin across providers per turn (README.md:41, README.md:122).
+- **Session** — an agent conversation recorded in the session index; one `session_files` row per session, and the `sessions` view selects rows whose `status = 'indexed'` (`migrations/001_session_index.sql`).
+- **Event** — a record of something that happened in a session, stored in the `events` table (`migrations/001_session_index.sql`); the library names these `AgentEvent` / `TurnEvent` (README.md:135).
+- **Turn** — a unit of model interaction, indexed as `turn_index` on `events` (`migrations/001_session_index.sql`); README refers to "per turn" alloying (README.md:122).
+- **Tool call** — an `events` row with `event_type = 'tool_call'`, exposed as the `tool_calls` view (`migrations/001_session_index.sql`).
+- **Tool result** — an `events` row with `event_type = 'tool_result'`, exposed as the `tool_results` view (`migrations/001_session_index.sql`).
+- **Context usage** — token usage against a context limit; surfaced by the `context_usage` view and recorded by the `usage_ratio` / `context_limit` columns on `events` (`migrations/001_session_index.sql`).
+- **Sub-agent** — an agent spawned by another; the index records `agent_id` / `parent_agent_id` (`migrations/002_session_usage.sql`), and Aether ships sub-agents as a first-party MCP (README.md:40).
+- **Skill** — a first-party capability delivered through MCP (README.md:40).
+- **ACP** — Agent Client Protocol v2; Aether is an ACP v2 agent, so v1-only editor clients are not compatible (README.md:44).
+- **TUI** — the interactive terminal UI for Aether (README.md:43).
+- **Headless** — running Aether as an agent that streams structured JSON logs (README.md:45).
+- **Transcript** — unknown (not defined in README.md or `crates/aether-sessions/migrations/*.sql`).
+
 ## Domain paths
+
+- `aether-agent-core` → `crates/aether-core` (README.md:180).
+- `llm` → `crates/llm` (README.md:181).
+- `wisp` → `crates/wisp` (README.md:182).
+- `aether-agent-cli` → `crates/aether-cli` (README.md:183).
+- `mcp-servers` → `crates/mcp-servers` (README.md:184).
+- `aether-evals` → `crates/aether-evals` (README.md:185).
+- `aether-lspd` → `crates/aether-lspd` (README.md:186).
+- `aether-project` → `crates/aether-project` (README.md:187).
+- `@aether-agent/sdk` → `packages/aether-sdk` (README.md:193).
+- `@aether-agent/website` → `packages/website` (README.md:194).
+- Additional workspace crates present under `crates/` (e.g. `aether-sessions`, `aether-session-index`) and TypeScript packages under `packages/` (e.g. `packages/aether-evals`) exist on disk but are not listed in the README's crate/package tables; their mapping to README entries is unknown.
 
 ## Open questions
