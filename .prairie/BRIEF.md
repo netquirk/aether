@@ -90,7 +90,6 @@ A developer using an AI coding agent needs control over every token in the model
 
 - Should workspace crates/packages the README tables omit (`crates/aether-sessions`, `crates/aether-session-index`, `crates/acp-utils`, `crates/aether-auth`, `crates/aether-schemas`, `crates/aether-telemetry`, `crates/mcp-utils`, `crates/llm-codegen`, `crates/utils`, `crates/doctest`, `crates/internal-evals`, `packages/aether-evals`) get `## Domain paths` entries, and what maps to what?
 - Define "Transcript" for the `## Glossary` entry that currently reads `unknown`, or confirm it stays undefined.
-- Is the raw unauthenticated `aether server` acceptable long-term, or is built-in authentication planned? The README today mandates a tunnel, private network or authenticating TLS proxy.
 - Are merged task titles (`TASK-*`) acceptable evidence in this brief, or must every claim cite README.md/a source file? The `## Quality goals` list rests on task titles.
 - Deployment/hosting: the board still carries open work to deploy aether to production and bind its production secrets (`TASK-26-143`, `TASK-27-488`) while `## Constraints`/`## Out of scope` name no hosting target; should the brief state one?
 - Confirm this draft (assembled by `TASK-27-19`/`-20`/`-21`/`-22` from README.md, AGENTS.md and merged task titles) as the canonical brief for aether, or name what must change.
@@ -99,3 +98,4 @@ A developer using an AI coding agent needs control over every token in the model
 
 - Rank the quality goals: the repository lists them but states no priority order; what is the order? — "Control-first (README order)" (a), 2026-10-15, chosen by operator.
 - Should the brief name the end customers of Aether's users? The repository does not establish them (`unknown` today). — "Scope them out of the brief" (a), 2026-10-15, chosen by operator.
+- Is the raw unauthenticated `aether server` acceptable long-term, or is built-in authentication planned? The README today mandates a tunnel, private network or authenticating TLS proxy. — "Keep unauthenticated; codify the tunnel/proxy mandate" (a), 2026-10-18, chosen by default (no answer by deadline).
