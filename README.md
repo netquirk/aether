@@ -77,7 +77,7 @@ Aether takes a different approach. Agents begin as blank slates with _no_ system
 
    For personal defaults that apply outside a project, run `aether settings init --user`.
 
-   ```
+   ```text
    ✓ Created .aether/settings.json   — agent definitions (model, prompts, tools)
    ✓ Created .aether/SYSTEM.md       — base system prompt
    ✓ Created .aether/agents/...      — preset agent assets when selected
@@ -129,7 +129,7 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
 
 2. **Write your agent**
 
-   ```rust
+   ```rust,no_run
    use aether_core::{
        core::{Prompt, agent},
        events::{AgentEvent, Command, MessageEvent, TurnEvent, TurnOutcome},
@@ -172,6 +172,8 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
        Ok(())
    }
    ```
+
+   CI compiles this snippet against `aether-agent-core`, so it cannot drift from the crate's public API.
 
 ## Rust crates
 

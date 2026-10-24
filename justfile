@@ -55,6 +55,10 @@ sqlx-check:
 doc-check *PKGS:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --all-features {{ if PKGS == "" { "--workspace --examples" } else { PKGS } }}
 
+# Run the doc tests, which compile the examples in the READMEs
+doc-test *PKGS:
+    cargo test --doc {{ if PKGS == "" { "--workspace --exclude internal-evals" } else { PKGS } }}
+
 # Regenerate the AetherSettings JSON Schema consumed by the website and SDK
 gen-schema:
     cargo run -q -p aether-project --bin aether-settings-schema > packages/website/src/data/aether-settings.schema.json
@@ -80,7 +84,7 @@ error-lint:
     cargo run -q -p internal-lints
 
 # Run all CI checks
-ci: fmt-check lint test-ci doc-check sqlx-check error-lint
+ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test

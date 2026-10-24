@@ -117,7 +117,7 @@ jobs:
   docs:
     name: Docs
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
     steps:
@@ -135,6 +135,8 @@ jobs:
         run: cargo build -p aether-lspd
       - name: Check documentation
         run: just doc-check
+      - name: Run doc tests
+        run: just doc-test
 
   website:
     name: Website
