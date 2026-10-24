@@ -309,8 +309,8 @@ async fn spawn_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm::testing::llm_response;
     use llm::ToolDefinition;
+    use llm::testing::llm_response;
     use mcp_utils::testing::{FakeMcpServer, FakeTool, FakeToolResponse};
     use serde_json::json;
     use std::error::Error;
@@ -352,12 +352,8 @@ mod tests {
         let in_root_args = json!({ "filePath": "notes.txt" }).to_string();
 
         let llm_responses = [
-            llm_response()
-                .tool_call("escape", "coding__read_file", &[&escape_args])
-                .build(),
-            llm_response()
-                .tool_call("in-root", "coding__read_file", &[&in_root_args])
-                .build(),
+            llm_response().tool_call("escape", "coding__read_file", &[&escape_args]).build(),
+            llm_response().tool_call("in-root", "coding__read_file", &[&in_root_args]).build(),
             llm_response().text(&["done"]).build(),
         ];
 
@@ -372,11 +368,7 @@ mod tests {
             .run()
             .await?;
 
-        assert_eq!(
-            messages.len(),
-            events.lock().unwrap().len(),
-            "observer must see every event the agent emits"
-        );
+        assert_eq!(messages.len(), events.lock().unwrap().len(), "observer must see every event the agent emits");
 
         let observer_events = events.lock().unwrap();
 

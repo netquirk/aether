@@ -1,3 +1,4 @@
+use super::health::{self, PrefixedStream};
 use super::state::{AcpState, ClientGuard};
 use super::{AcpArgs, AcpRunError, create_acp_state};
 use crate::output::OutputFormat;
@@ -172,6 +173,36 @@ impl AcpServer {
 
 #[expect(clippy::result_large_err, reason = "tungstenite's handshake callback requires an HTTP error response")]
 async fn serve_connection(socket: TcpStream, peer: SocketAddr, guard: Option<ClientGuard>, stop: CancellationToken) {
+    let mut socket = socket;
+    let head = tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            if let Some(guard) = guard {
+                guard.release().await;
+            }
+            return;
+        },
+        result = health::read_head(&mut socket) => match result {
+            Ok(head) => head,
+            Err(error) => {
+                warn!(%peer, %error, "ACP connection read failed");
+                if let Some(guard) = guard {
+                    guard.release().await;
+                }
+                return;
+            }
+        },
+    };
+    if health::is_health_request(&head) {
+        if let Some(guard) = guard {
+            guard.release().await;
+        }
+        if let Err(error) = health::write_health_response(&mut socket).await {
+            warn!(%peer, %error, "ACP health response failed");
+        }
+        return;
+    }
+
     let handshake = tokio::select! {
         biased;
         () = stop.cancelled() => {
@@ -180,7 +211,7 @@ async fn serve_connection(socket: TcpStream, peer: SocketAddr, guard: Option<Cli
             }
             return;
         },
-        result = tokio_tungstenite::accept_hdr_async(socket, |_request: &Request, response| {
+        result = tokio_tungstenite::accept_hdr_async(PrefixedStream::new(socket, head), |_request: &Request, response| {
             if guard.is_some() {
                 Ok(response)
             } else {

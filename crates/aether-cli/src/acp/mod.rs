@@ -1,6 +1,7 @@
 pub(crate) mod agent;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod fake_prompt_mcp;
+pub(crate) mod health;
 pub(crate) mod message_log;
 pub(crate) mod protocol;
 pub mod server;

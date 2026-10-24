@@ -153,16 +153,16 @@ fn bash_fields(result: &rmcp::model::CallToolResult) -> Result<(bool, i64, Strin
     let output = value
         .get("output")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| -> Box<dyn Error> { format!("bash structured_content must carry an `output` string; got: {value}").into() })?
+        .ok_or_else(|| -> Box<dyn Error> {
+            format!("bash structured_content must carry an `output` string; got: {value}").into()
+        })?
         .to_string();
-    let killed = value
-        .get("killed")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| -> Box<dyn Error> { format!("bash structured_content must carry a `killed` boolean; got: {value}").into() })?;
-    let exit_code = value
-        .get("exitCode")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| -> Box<dyn Error> { format!("bash structured_content must carry an `exitCode` integer; got: {value}").into() })?;
+    let killed = value.get("killed").and_then(serde_json::Value::as_bool).ok_or_else(|| -> Box<dyn Error> {
+        format!("bash structured_content must carry a `killed` boolean; got: {value}").into()
+    })?;
+    let exit_code = value.get("exitCode").and_then(serde_json::Value::as_i64).ok_or_else(|| -> Box<dyn Error> {
+        format!("bash structured_content must carry an `exitCode` integer; got: {value}").into()
+    })?;
     Ok((killed, exit_code, output))
 }
 
@@ -292,8 +292,8 @@ async fn shell_command_timeout_marker_lands_in_jsonl_transcript_record() -> Test
     let mut saw_marker = false;
     let mut saw_no_marker = false;
     for (index, line) in raw.lines().enumerate() {
-        let value: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("line {index} is not valid JSON: {e}; line={line:?}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("line {index} is not valid JSON: {e}; line={line:?}"))?;
         // The transcript wraps every event under `event.event` (the outer
         // `event` is the `TranscriptRecord` envelope carrying `turn` / `type`,
         // the inner `event` is the serialized `AgentEvent` itself, and the

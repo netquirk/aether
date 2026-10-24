@@ -90,9 +90,6 @@ mod tests {
         let error = CliError::EmptySystemPromptFile { path: path.clone() };
         let rendered = error.to_string();
         let expected = path.to_string_lossy().into_owned();
-        assert!(
-            rendered.contains(&expected),
-            "message {rendered:?} must contain the path {expected:?}"
-        );
+        assert!(rendered.contains(&expected), "message {rendered:?} must contain the path {expected:?}");
     }
 }

@@ -1,4 +1,5 @@
 mod client;
+mod health;
 mod websocket;
 
 use aether_cli::acp::testing::AcpTestHarness;
