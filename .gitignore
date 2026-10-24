@@ -30,3 +30,4 @@ packages/website/*.log
 .prairie/healthd.log
 .prairie-conflicts/
 .prairie-conflicts-NOTE.md
+test-results/
