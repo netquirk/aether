@@ -36,14 +36,15 @@ The sequence the runner performs: build the image in the project's sandbox, push
 ## What an agent does, and does not do
 
 - **Does not** request panel, registry or node access (`prairie need-access`): a run token is refused that access by design. The deploy token bound to the deploy is what talks to the panel and the registry.
+- **Does not** put the deploy to a person: it does not file a decision card, a task, a comment or an access request asking which target production is, which host or node it runs on, which registry it pulls from, or for panel, registry or node access. The contract's `target` names the hosting target and the runner drives it; the owner's values and the deploy's secrets are the owner's and the deploy's to supply.
 - **Does not** bypass the contract: a deploy runs through the project's deploy path (`prairie deploy`, which the contract drives), never as hand-rolled `docker push`, `docker run` or SSH steps.
 - **Does not** pick a secret name out of `prairie secrets`, and never asks for a secret that is bound to the deploy.
-- **Does** run `prairie deploy check` and report its verdict, and name the exact missing key when the contract is incomplete -- `image`, `panel_container`/`panel_node`, the `[[health]]` URL, a secret binding -- so the owner or the tracked task can supply it.
+- **Does** run `prairie deploy check` and report its verdict, and name the exact missing key when the contract is incomplete -- `image`, `panel_container`/`panel_node`, the `[[health]]` URL, a secret binding -- in the run's own report, so the owner or the tracked task can supply it.
 
 ## Status today
 
-`prairie deploy check` prints `OFF no .prairie/deploy.sh`: aether declares no deploy contract, so nothing here reaches production automatically. A `target = "panel"` contract needs no `.prairie/deploy.sh` -- the runner drives the panel itself -- while the recipe scripts belong to the `host-script` target. The rest is tracked on the board:
+`prairie deploy check` prints `OFF no .prairie/deploy.sh`: aether declares no deploy contract, so nothing here reaches production automatically. A `target = "panel"` contract needs no `.prairie/deploy.sh` -- the runner drives the panel itself -- while the recipe scripts belong to the `host-script` target. What is missing is therefore the owner's `.prairie/deploy.toml` -- its `image`, its `panel_container`/`panel_node`, its `[[health]]` URL -- and the `CP_API_KEY` binding to this project's deploys: not a recipe and not a deploy host. The rest is tracked on the board:
 
-- `TASK-2B-1040` -- commit the executable recipe and its state/rollback helpers.
-- `TASK-2B-1041` -- declare `.prairie/deploy.toml` so `prairie deploy check` returns OK.
+- `TASK-2B-1041` -- declare `.prairie/deploy.toml` (the panel shape in `.prairie/deploy.toml.template`, with no `state` and no `rollback`: the runner refuses both on that target) so `prairie deploy check` returns OK.
 - `TASK-26-143` -- run the production deploy and verify the live criteria; the deploy's health gate re-verifies `TASK-26-110` against the live system.
+- `TASK-2B-1040` -- the `host-script` recipe and its state/rollback helpers: off this project's path.
