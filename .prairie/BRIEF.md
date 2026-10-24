@@ -92,7 +92,6 @@ A developer using an AI coding agent needs control over every token in the model
 
 - Should workspace crates/packages the README tables omit (`crates/aether-sessions`, `crates/aether-session-index`, `crates/acp-utils`, `crates/aether-auth`, `crates/aether-schemas`, `crates/aether-telemetry`, `crates/mcp-utils`, `crates/llm-codegen`, `crates/utils`, `crates/doctest`, `crates/internal-evals`, `packages/aether-evals`) get `## Domain paths` entries, and what maps to what?
 - Define "Transcript" for the `## Glossary` entry that currently reads `unknown`, or confirm it stays undefined.
-- Deployment/hosting: the board still carries open work to deploy aether to production and bind its production secrets (`TASK-26-143`, `TASK-27-488`) while `## Constraints`/`## Out of scope` name no hosting target; should the brief state one?
 
 ## Decisions
 
@@ -101,3 +100,4 @@ A developer using an AI coding agent needs control over every token in the model
 - Is the raw unauthenticated `aether server` acceptable long-term, or is built-in authentication planned? The README today mandates a tunnel, private network or authenticating TLS proxy. — "Keep unauthenticated; codify the tunnel/proxy mandate" (a), 2026-10-18, chosen by default (no answer by deadline).
 - Are merged task titles (`TASK-*`) acceptable evidence in this brief, or must every claim cite README.md/a source file? The `## Quality goals` list rests on task titles. — "Two-tier - a source path is required and the task title stays as a supporting reference" (c), 2026-10-18, chosen by default (no answer by deadline).
 - Confirm this draft (assembled by `TASK-27-19`/`-20`/`-21`/`-22` from README.md, AGENTS.md and merged task titles) as the canonical brief for aether, or name what must change. — "Confirm as-is" (a), 2026-10-19, chosen by default (no answer by deadline).
+- Deployment/hosting: the board still carries open work to deploy aether to production and bind its production secrets (`TASK-26-143`, `TASK-27-488`) while `## Constraints`/`## Out of scope` name no hosting target; should the brief state one? — none of the paths: declined (Prairie capability gap: the deploy contract owns panel, registry and node access; a run token cannot create a container, so this is not an owner decision), 2026-10-24, chosen by agent-runner.
