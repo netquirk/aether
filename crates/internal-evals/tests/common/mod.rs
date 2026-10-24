@@ -1,6 +1,9 @@
 //! Shared helpers for the eval tests in this directory.
 
 #![allow(dead_code)]
+// `EvalHarnessError` carries the full failing payload on purpose; the lint
+// is suppressed here rather than changing the public error shape.
+#![allow(clippy::result_large_err)]
 
 use aether_evals::Workspace;
 use internal_evals::EvalHarnessError;

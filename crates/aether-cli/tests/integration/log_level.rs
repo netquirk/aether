@@ -143,7 +143,7 @@ fn log_level_filters_settings_load_warnings() -> TestResult {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
-        assert!(output.status.success(), "--log-level {level} must exit 0, got {:?}", output.status.code(),);
+        assert!(output.status.success(), "--log-level {level} must exit 0, got {:?}", output.status.code());
         Ok((String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned()))
     };
 

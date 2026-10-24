@@ -72,7 +72,7 @@ fn run_start_names_config_file_and_non_default_profile() -> TestResult {
     };
     let endpoint = format!("http://{addr}");
 
-    let _output = Command::new(env!("CARGO_BIN_EXE_aether"))
+    let output = Command::new(env!("CARGO_BIN_EXE_aether"))
         .arg("headless")
         .arg("--config")
         .arg(&config_path)
@@ -90,7 +90,7 @@ fn run_start_names_config_file_and_non_default_profile() -> TestResult {
         .stderr(Stdio::piped())
         .output()?;
 
-    let stderr = String::from_utf8_lossy(&_output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let config_display = config_path.display().to_string();
 
     assert!(stderr.contains(&config_display), "stderr must name the config path {config_display:?}; got:\n{stderr}");

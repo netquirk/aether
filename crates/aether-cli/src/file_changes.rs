@@ -101,7 +101,7 @@ impl FileChanges {
         if paths.is_empty() {
             return None;
         }
-        Some(format!("Files read but not changed: {} ({})", paths.len(), paths.join(", "),))
+        Some(format!("Files read but not changed: {} ({})", paths.len(), paths.join(", ")))
     }
 }
 

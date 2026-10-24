@@ -1120,7 +1120,7 @@ mod tests {
         // fallback keeps that observable working without forcing the run to
         // fail before any provider work happens.
         assert_eq!(run_model_identity("custom:my-local-model"), ("custom".to_string(), "my-local-model".to_string()));
-        assert_eq!(run_model_identity("plain-no-colon"), ("".to_string(), "plain-no-colon".to_string()));
+        assert_eq!(run_model_identity("plain-no-colon"), (String::new(), "plain-no-colon".to_string()));
     }
 
     #[test]
@@ -1161,11 +1161,9 @@ mod tests {
         assert!(!should_emit(&msg, &[CliEventKind::ToolCall]));
     }
 
-    #[test]
-    fn event_kind_covers_every_cli_event_kind() {
-        use clap::ValueEnum;
-
-        let samples = vec![
+    /// The agent-side events the CLI maps onto a `CliEventKind`.
+    fn agent_event_kind_samples() -> Vec<(AgentEvent, CliEventKind)> {
+        vec![
             (AgentEvent::text("id", "x", StreamState::Complete), CliEventKind::Text),
             (AgentEvent::thought("id", "x", StreamState::Complete), CliEventKind::Thought),
             (tool_call_msg(), CliEventKind::ToolCall),
@@ -1203,6 +1201,13 @@ mod tests {
                 CliEventKind::ModelFallback,
             ),
             (tool_progress(1.0, None, None), CliEventKind::ToolProgress),
+        ]
+    }
+
+    /// The session, turn, and lifecycle events the CLI maps onto a
+    /// `CliEventKind`.
+    fn session_event_kind_samples() -> Vec<(AgentEvent, CliEventKind)> {
+        vec![
             (
                 AgentEvent::Context(ContextEvent::CompactionStarted {
                     compaction_id: "compaction".into(),
@@ -1262,7 +1267,15 @@ mod tests {
                 }),
                 CliEventKind::ToolRefused,
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn event_kind_covers_every_cli_event_kind() {
+        use clap::ValueEnum;
+
+        let mut samples = agent_event_kind_samples();
+        samples.extend(session_event_kind_samples());
 
         for kind in CliEventKind::value_variants() {
             assert!(samples.iter().any(|(_, k)| k == kind), "samples is missing a case for {kind:?}");

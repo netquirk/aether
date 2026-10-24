@@ -70,11 +70,11 @@ fn run_log_records_whole_second_elapsed() -> TestResult {
     let log = std::fs::read_to_string(&log_path)?;
 
     // The end-of-run line must be present in the log.
-    assert!(log.contains("elapsed_seconds="), "run log must carry an elapsed_seconds field; got:\n{log}",);
+    assert!(log.contains("elapsed_seconds="), "run log must carry an elapsed_seconds field; got:\n{log}");
     // And it must be paired with the `run finished` message the implementation
     // uses, so an unrelated `elapsed_seconds=` substring cannot satisfy the
     // assertion.
-    assert!(log.contains("run finished"), "run log must carry the run-finished line; got:\n{log}",);
+    assert!(log.contains("run finished"), "run log must carry the run-finished line; got:\n{log}");
 
     // Parse the value as a `u64`: the implementation uses `as_secs()`, so a
     // float, a duration string, or any unit suffix would all be rejected by
@@ -89,7 +89,7 @@ fn run_log_records_whole_second_elapsed() -> TestResult {
         .nth(1)
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
         .unwrap_or("");
-    assert!(!value_str.is_empty(), "elapsed_seconds value must not be empty; got line: {line:?}",);
+    assert!(!value_str.is_empty(), "elapsed_seconds value must not be empty; got line: {line:?}");
     let parsed: u64 = value_str.parse().unwrap_or_else(|error| {
         panic!("elapsed_seconds value must be a whole-second integer, got {value_str:?}: {error}")
     });

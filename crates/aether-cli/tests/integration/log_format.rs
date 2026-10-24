@@ -114,9 +114,8 @@ fn json_format_emits_one_json_object_per_line() -> TestResult {
         assert!(object.contains_key("timestamp"), "object must carry a top-level `timestamp` key: {line:?}");
 
         let level = object["level"].as_str().unwrap_or_else(|| panic!("`level` must be a string; got {line:?}"));
-        assert_eq!(
+        assert!(
             level.eq_ignore_ascii_case("WARN"),
-            true,
             "settings-load warning must be a WARN-level event; got {level:?} in {line:?}"
         );
 

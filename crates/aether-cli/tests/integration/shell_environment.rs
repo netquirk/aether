@@ -52,11 +52,7 @@ const CODING_SERVER_SOURCE: &str = r#"{"servers":{"coding":{"type":"in-memory","
 /// caller's intent.
 #[test]
 fn shell_environment_block_deserializes_into_settings() -> TestResult {
-    let json = format!(
-        r#"{{ "agents": [], "shellEnvironment": {{ "{name}": "{value}" }} }}"#,
-        name = ENV_VAR_NAME,
-        value = ENV_VAR_VALUE
-    );
+    let json = format!(r#"{{ "agents": [], "shellEnvironment": {{ "{ENV_VAR_NAME}": "{ENV_VAR_VALUE}" }} }}"#);
     let settings = AetherSettings::try_from(json.as_str())?;
 
     assert_eq!(
@@ -128,7 +124,7 @@ async fn bash_tool_inherits_configured_shell_environment() -> TestResult {
                     "the bash tool must observe the configured env var; got stdout/stderr: {output:?}"
                 );
                 assert_eq!(
-                    structured.get("exitCode").and_then(|value| value.as_i64()),
+                    structured.get("exitCode").and_then(serde_json::Value::as_i64),
                     Some(0),
                     "the bash command must exit 0; structured_content: {structured:?}"
                 );
@@ -140,11 +136,13 @@ async fn bash_tool_inherits_configured_shell_environment() -> TestResult {
             ToolCallEvent::TaskComplete { .. } => {
                 return Err("coding__bash must complete inline, not via an MCP Task".into());
             }
-            ToolCallEvent::Cancelled { .. } | ToolCallEvent::Progress(_) | ToolCallEvent::TaskCreated(_) => {
+            ToolCallEvent::Cancelled { .. }
+            | ToolCallEvent::Progress(_)
+            | ToolCallEvent::TaskCreated(_)
+            | ToolCallEvent::TaskStatus(_) => {
                 // Ignore lifecycle events; we only act on the terminal
                 // `Complete` / `TaskComplete` outcome.
             }
-            ToolCallEvent::TaskStatus(_) => {}
         }
     }
     Err("MCP manager stopped before returning the bash result".into())

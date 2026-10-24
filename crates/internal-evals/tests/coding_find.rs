@@ -1,3 +1,6 @@
+// `EvalHarnessError` carries the full failing payload on purpose; the lint
+// is suppressed here rather than changing the public error shape.
+#![allow(clippy::result_large_err)]
 use aether_evals::{Task, Transcript, Workspace};
 use internal_evals::{EvalAgent, EvalHarnessError};
 use serde_json::Value;

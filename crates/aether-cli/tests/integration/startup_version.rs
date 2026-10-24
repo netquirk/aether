@@ -26,8 +26,8 @@ fn first_stderr_line_names_aether_version_and_protocol_version() -> TestResult {
         first.contains(env!("CARGO_PKG_VERSION")),
         "first stderr line should name the aether build version, got {first:?}",
     );
-    assert!(first.contains("ACP"), "first stderr line should reference ACP, got {first:?}",);
-    assert!(first.contains('2'), "first stderr line should name the ACP protocol version, got {first:?}",);
+    assert!(first.contains("ACP"), "first stderr line should reference ACP, got {first:?}");
+    assert!(first.contains('2'), "first stderr line should name the ACP protocol version, got {first:?}");
 
     let _ = child.kill();
     let _ = child.wait();

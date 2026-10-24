@@ -67,13 +67,6 @@ impl WorkspaceBoundaryPolicy {
         let root = given.canonicalize().unwrap_or(given);
         Self { root }
     }
-
-    /// The canonical root path. Exposed for tests and integration call
-    /// sites that need to reason about what the policy will accept.
-    #[cfg(test)]
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
 }
 
 impl ToolPolicy for WorkspaceBoundaryPolicy {
@@ -203,7 +196,7 @@ mod tests {
         (dir, root, policy)
     }
 
-    /// A `..` escape attempt from a namespaced read_file call must be
+    /// A `..` escape attempt from a namespaced `read_file` call must be
     /// refused and the reason must name both the offending raw path and
     /// the root the policy was built against. This is the headline
     /// acceptance criterion from the task body: "a file tool call whose
@@ -215,7 +208,7 @@ mod tests {
         let reason = policy
             .refuse(&request("coding__read_file", r#"{"filePath":"../secret"}"#))
             .expect("a ../ escape must be refused");
-        assert!(reason.contains("../secret"), "reason must name the offending raw path `../secret`; got: {reason}",);
+        assert!(reason.contains("../secret"), "reason must name the offending raw path `../secret`; got: {reason}");
         assert!(
             reason.contains(&*root.to_string_lossy()),
             "reason must name the root `{}`; got: {reason}",
@@ -252,7 +245,7 @@ mod tests {
         let reason = policy
             .refuse(&request("coding__read_file", &args))
             .expect("an absolute path outside the root must be refused");
-        assert!(reason.contains(&raw), "reason must name the offending raw absolute path `{raw}`; got: {reason}",);
+        assert!(reason.contains(&raw), "reason must name the offending raw absolute path `{raw}`; got: {reason}");
         assert!(
             reason.contains(&*root.to_string_lossy()),
             "reason must name the root `{}`; got: {reason}",

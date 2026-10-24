@@ -82,7 +82,7 @@ async fn bash_tool_one_mib_output_gets_capped_and_full_bytes_recoverable() -> Te
     // 4. The model-visible result must be at most the cap, must start with
     //    the truncation marker, and must contain the on-disk path so the
     //    model can read the file back.
-    assert!(capped.result.len() <= CAP_BYTES, "capped result {} bytes exceeds cap {}", capped.result.len(), CAP_BYTES,);
+    assert!(capped.result.len() <= CAP_BYTES, "capped result {} bytes exceeds cap {}", capped.result.len(), CAP_BYTES);
     assert!(
         capped.result.starts_with("[aether: output truncated;"),
         "capped result missing truncation marker: {}",
@@ -110,8 +110,7 @@ async fn bash_tool_one_mib_output_gets_capped_and_full_bytes_recoverable() -> Te
         .path()
         .read_dir()
         .map_err(|e| test_error(format!("read spillover dir: {e}")))?
-        .filter_map(Result::ok)
-        .next()
+        .find_map(Result::ok)
         .ok_or_else(|| test_error("cap should have written the full bash output to disk"))?
         .path();
     let on_disk = std::fs::read(&saved_path).map_err(|e| test_error(format!("read saved file: {e}")))?;

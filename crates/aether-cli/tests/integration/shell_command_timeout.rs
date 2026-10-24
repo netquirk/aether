@@ -130,11 +130,13 @@ async fn call_bash(
             ToolCallEvent::TaskComplete { .. } => {
                 return Err("coding__bash must complete inline, not via an MCP Task".into());
             }
-            ToolCallEvent::Cancelled { .. } | ToolCallEvent::Progress(_) | ToolCallEvent::TaskCreated(_) => {
+            ToolCallEvent::Cancelled { .. }
+            | ToolCallEvent::Progress(_)
+            | ToolCallEvent::TaskCreated(_)
+            | ToolCallEvent::TaskStatus(_) => {
                 // Ignore lifecycle events; we only act on the terminal
                 // `Complete` / `TaskComplete` outcome.
             }
-            ToolCallEvent::TaskStatus(_) => {}
         }
     }
     Err("MCP manager stopped before returning the bash result".into())

@@ -18,7 +18,7 @@ fn acp_cwd_roots_the_session_at_the_given_directory() -> TestResult {
     let log_dir = tempfile::tempdir()?;
     let workspace = tempfile::tempdir()?;
     let expected_cwd = workspace.path().canonicalize()?;
-    let response = run_acp_initialize(acp_cwd_command(log_dir.path(), &workspace.path()))?;
+    let response = run_acp_initialize(acp_cwd_command(log_dir.path(), workspace.path()))?;
     assert_remote_cwd(&response, &expected_cwd)
 }
 

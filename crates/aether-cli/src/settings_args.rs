@@ -84,10 +84,10 @@ impl SettingsSourceArgs {
         if project.is_file() {
             return Some(project);
         }
-        if let Some(user) = user_settings_path() {
-            if user.is_file() {
-                return Some(user);
-            }
+        if let Some(user) = user_settings_path()
+            && user.is_file()
+        {
+            return Some(user);
         }
         None
     }

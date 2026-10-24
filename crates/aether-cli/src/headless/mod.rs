@@ -1150,7 +1150,7 @@ mod tests {
         for raw in cases {
             let error = parse_timeout(raw).err().unwrap_or_else(|| panic!("{raw:?} must be rejected by parse_timeout"));
             assert!(!error.is_empty(), "{raw:?}: rejection message must not be empty");
-            assert!(error.contains("--timeout"), "rejection for {raw:?} must name the --timeout flag: {error:?}",);
+            assert!(error.contains("--timeout"), "rejection for {raw:?} must name the --timeout flag: {error:?}");
         }
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("--timeout {raw:?} must be rejected by clap"));
             let rendered = error.to_string();
-            assert!(rendered.contains("--timeout"), "diagnostic must name the --timeout flag for {raw:?}: {rendered}",);
+            assert!(rendered.contains("--timeout"), "diagnostic must name the --timeout flag for {raw:?}: {rendered}");
         }
     }
 
@@ -1232,7 +1232,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("--timeout {raw:?} must be rejected: sub-second values are not runnable"));
             let rendered = error.to_string();
-            assert!(rendered.contains("--timeout"), "diagnostic for {raw:?} must name the --timeout flag: {rendered}",);
+            assert!(rendered.contains("--timeout"), "diagnostic for {raw:?} must name the --timeout flag: {rendered}");
         }
 
         // The boundary still accepts exactly one second so legitimate

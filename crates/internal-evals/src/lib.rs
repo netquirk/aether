@@ -20,6 +20,14 @@ pub struct EvalAgent {
     output: OutputFormat,
 }
 
+/// Errors raised by the eval harness.
+///
+/// The variants aggregate large payloads (the transcript error alone is 168
+/// bytes), so every `Result` that carries this error trips
+/// `clippy::result_large_err`. The size is deliberate: each variant keeps the
+/// full offending payload so a caller can render a useful diagnostic, and
+/// boxing it would change the public error shape. The lint is therefore
+/// suppressed at the `Result` sites instead.
 #[derive(Debug, Error)]
 pub enum EvalHarnessError {
     #[error("workspace setup failed: {0}")]
@@ -62,6 +70,7 @@ impl EvalAgent {
         self
     }
 
+    #[allow(clippy::result_large_err)]
     pub async fn run(
         self,
         workspace: &Workspace,
@@ -108,6 +117,7 @@ impl Default for EvalAgent {
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn eval_model() -> Result<String, EvalHarnessError> {
     env::var("AETHER_EVAL_MODEL")
         .ok()
@@ -116,6 +126,7 @@ pub fn eval_model() -> Result<String, EvalHarnessError> {
         .ok_or(EvalHarnessError::MissingEvalModel)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn eval_reasoning_effort() -> Result<Option<ReasoningEffort>, EvalHarnessError> {
     let Ok(value) = env::var("AETHER_EVAL_REASONING_EFFORT") else {
         return Ok(None);
@@ -123,6 +134,7 @@ pub fn eval_reasoning_effort() -> Result<Option<ReasoningEffort>, EvalHarnessErr
     ReasoningEffort::parse(value.trim()).map_err(|error| EvalHarnessError::InvalidEvalReasoningEffort { value, error })
 }
 
+#[allow(clippy::result_large_err)]
 pub fn batteries_included_settings() -> Result<AetherSettings, EvalHarnessError> {
     let harnesses = [HarnessIntegration::Agents];
     let model = eval_model()?;

@@ -1,0 +1,50 @@
+{
+  "key": "e3923c5babf46ae09fafa147e04a1c49a8e4e16dac460a09e48d910ece004d8a",
+  "enforced": false,
+  "ok": false,
+  "problems": [
+    "AC-1: `cargo clippy --all-targets --all-features --workspace -- -D warnings` fails on your work",
+    "AC-2: `cargo fmt --all --check` passes at the base commit cf659d4880a8 too, without your change, so it proves nothing about it. Make the check exercise what you changed; if the criterion was already true before this task, write AC-2: already holds: `\u003ccommand\u003e`",
+    "AC-3: `cargo test -p aether-agent-cli --lib \u0026\u0026 cargo test -p aether-agent-cli --test integration \u0026\u0026 cargo test -p aether-mcp-servers --test integration tool_output_cap_e2e \u0026\u0026 cargo test -p internal-evals --no-run` fails on your work",
+    "AC-4: `cargo run -q -p internal-lints` passes at the base commit cf659d4880a8 too, without your change, so it proves nothing about it. Make the check exercise what you changed; if the criterion was already true before this task, write AC-4: already holds: `\u003ccommand\u003e`"
+  ],
+  "items": [
+    {
+      "criterion": "AC-1",
+      "kind": "check",
+      "command": "cargo clippy --all-targets --all-features --workspace -- -D warnings",
+      "change": "fail",
+      "base": "skipped"
+    },
+    {
+      "criterion": "AC-2",
+      "kind": "check",
+      "command": "cargo fmt --all --check",
+      "change": "pass",
+      "base": "green",
+      "baseCommit": "cf659d4880a8"
+    },
+    {
+      "criterion": "AC-3",
+      "kind": "check",
+      "command": "cargo test -p aether-agent-cli --lib \u0026\u0026 cargo test -p aether-agent-cli --test integration \u0026\u0026 cargo test -p aether-mcp-servers --test integration tool_output_cap_e2e \u0026\u0026 cargo test -p internal-evals --no-run",
+      "change": "fail",
+      "base": "skipped"
+    },
+    {
+      "criterion": "AC-4",
+      "kind": "check",
+      "command": "cargo run -q -p internal-lints",
+      "change": "pass",
+      "base": "green",
+      "baseCommit": "cf659d4880a8"
+    },
+    {
+      "criterion": "AC-5",
+      "kind": "not_checkable",
+      "reason": "the workspace-wide `cargo test --workspace --exclude internal-evals` still fails on three targets that predate this change and are not caused by it - `aether-evals --test docker_agent_tests` needs `/var/run/docker.sock` (absent in this sandbox), 8 LSP e2e tests in `mcp-servers --test integration` poll an LSP server for 60 s, and 2 `aether-project --lib` settings tests fail on the base commit in a crate this change does not touch",
+      "followUp": "TASK-2J-278"
+    }
+  ],
+  "at": "2026-10-24T13:08:03.576791255Z"
+}
