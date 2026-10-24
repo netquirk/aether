@@ -113,3 +113,48 @@ fn check_config_prints_the_error_and_exits_non_zero_for_a_malformed_config() -> 
 
     Ok(())
 }
+
+/// The settings Aether owns — the project-level `.aether/settings.json` — may
+/// not carry a top-level key Aether does not know: the run would otherwise
+/// start with a setting the operator believes is in effect but is not. The
+/// diagnostic must name the offending key so the typo can be fixed.
+///
+/// `AETHER_HOME` points at an empty directory so the check reads the project
+/// file alone and does not depend on the settings of the machine the test
+/// runs on.
+#[test]
+fn check_config_names_an_unknown_top_level_key_in_the_project_settings() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let home = tempfile::tempdir()?;
+    fs::create_dir_all(dir.path().join(".aether"))?;
+    fs::write(
+        dir.path().join(".aether").join("settings.json"),
+        r#"{
+            "credentialsStore": { "type": "memory" },
+            "completelyMadeUpKey": 42,
+            "agents": []
+        }"#,
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aether"))
+        .arg("--check-config")
+        .current_dir(dir.path())
+        .env("AETHER_HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "--check-config must exit non-zero for an unknown top-level key, got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code(),
+    );
+
+    assert!(stderr.contains("completelyMadeUpKey"), "the diagnostic must name the offending key; got:\n{stderr}");
+
+    Ok(())
+}

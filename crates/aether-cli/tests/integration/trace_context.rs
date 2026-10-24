@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::path::Path;
 use std::process::{Command, Output};
 
 const INVALID_TRACEPARENT: &str = "00-00000000000000000000000000000000-0123456789abcdef-01";
@@ -9,37 +10,47 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
 fn acp_rejects_an_invalid_trace_context_when_telemetry_is_enabled() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let options = format!(
         r#"{{"settings":{{"credentialsStore":{{"type":"memory"}},"agents":[],{TELEMETRY_SETTINGS}}},"traceContext":{{"traceparent":"{INVALID_TRACEPARENT}"}}}}"#
     );
-    let output = aether(&["acp", "--options-json", &options]).output()?;
+    let output = aether(dir.path(), &["acp", "--options-json", &options]).output()?;
     assert_rejected(&output, "traceparent");
     Ok(())
 }
 
 #[test]
 fn headless_rejects_an_invalid_trace_context_when_telemetry_is_enabled() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let options = format!(
         r#"{{"prompt":"hello","settings":{{"agents":[],{TELEMETRY_SETTINGS}}},"traceContext":{{"traceparent":"{INVALID_TRACEPARENT}"}}}}"#
     );
-    let output = aether(&["headless", "--options-json", &options]).output()?;
+    let output = aether(dir.path(), &["headless", "--options-json", &options]).output()?;
     assert_rejected(&output, "traceparent");
     Ok(())
 }
 
 #[test]
 fn headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let options = format!(
         r#"{{"prompt":"hello","settings":{{"agents":[],{TELEMETRY_SETTINGS}}},"traceContext":{{"traceparent":"{VALID_TRACEPARENT}","tracestate":"not a valid tracestate"}}}}"#
     );
-    let output = aether(&["headless", "--options-json", &options]).output()?;
+    let output = aether(dir.path(), &["headless", "--options-json", &options]).output()?;
     assert_rejected(&output, "tracestate");
     Ok(())
 }
 
-fn aether(args: &[&str]) -> Command {
+/// Build the `aether` command for `args`, running in `cwd`.
+///
+/// Each test gets its own working directory: a run holds the per-working
+/// directory lock (`.aether/run.lock`) while it is in progress, so tests that
+/// ran in the crate directory refused each other's run with "another aether run
+/// is already using this working directory".
+fn aether(cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aether"));
     command.args(args);
+    command.arg("--cwd").arg(cwd);
     command
 }
 

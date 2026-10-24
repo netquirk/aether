@@ -1,8 +1,14 @@
 use std::path::Path;
 
 fn main() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let models_json = manifest_dir.join("models.json");
+    // Read the manifest directory when the build script runs, not when it is
+    // compiled. The compiled build script is cached in the target directory,
+    // and a path baked in at compile time names the checkout that compiled
+    // it: a target directory shared with another checkout (a second worktree,
+    // a CI job that runs the base commit) would then look for `models.json`
+    // in the wrong tree.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR for build scripts");
+    let models_json = Path::new(&manifest_dir).join("models.json");
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let output_path = Path::new(&out_dir).join("generated.rs");
 

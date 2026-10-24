@@ -1,6 +1,6 @@
 use aether_project::{
     AetherSettings, AetherSettingsSource, AgentCatalog, SettingsError, SettingsFileSource, ToolOutputSettings,
-    project_settings_path, user_settings_path,
+    UnknownKeyPolicy, project_settings_path, user_settings_path,
 };
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -59,7 +59,12 @@ impl SettingsSourceArgs {
 
     pub fn load_settings(&self, cwd: &Path) -> Result<AetherSettings, SettingsError> {
         match self.source(cwd) {
-            Some(source) => AetherSettings::load(cwd, [source]),
+            // A document the operator names explicitly may have been written by
+            // another Aether build, so warn about the keys this build does not
+            // know and keep running. The documents Aether owns (the user-level
+            // and the project-level file) are loaded by `load_default`, which
+            // refuses an unknown key instead of dropping it silently.
+            Some(source) => AetherSettings::load_with_policy(cwd, [source], UnknownKeyPolicy::Warn),
             None => AetherSettings::load_default(cwd),
         }
     }

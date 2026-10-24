@@ -32,6 +32,26 @@ pub fn tool_output_dir_from_env() -> Option<PathBuf> {
     std::env::var(PRAIRIE_TOOL_OUTPUT_DIR_ENV).ok().map(PathBuf::from).filter(|path| !path.as_os_str().is_empty())
 }
 
+/// What the settings loader does with a top-level key that [`AetherSettings`]
+/// does not declare.
+///
+/// A key Aether does not recognise is either a typo or a setting written by a
+/// newer Aether. The policy decides whether the document that carries it is
+/// refused or loaded with the key ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownKeyPolicy {
+    /// Refuse the document: the loader returns a [`SettingsError::ParseError`]
+    /// that names the offending key. The settings Aether owns — the user-level
+    /// and the project-level file — are loaded with this policy, so a key the
+    /// operator believes is in effect cannot be dropped without saying so.
+    #[default]
+    Reject,
+    /// Warn about every offending key and ignore it. A document the operator
+    /// named explicitly may have been written by another Aether build, so the
+    /// run starts and the warning names the key the operator has to remove.
+    Warn,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum CredentialsStoreConfig {
@@ -177,9 +197,9 @@ pub struct AetherSettings {
 }
 
 /// Top-level keys that the [`AetherSettings`] deserialiser recognises. Every
-/// other key in the root JSON object is treated as a user-authored typo or
-/// forward-compat slot and produces a one-line `tracing::warn!` rather than a
-/// hard parse error. Keep this list in sync with the
+/// other key in the root JSON object is either refused — with a parse error
+/// that names it — or warned about and ignored, depending on the
+/// [`UnknownKeyPolicy`] the loader applies. Keep this list in sync with the
 /// `#[derive(schemars::JsonSchema)]` definition of [`AetherSettings`]; the
 /// `known_top_level_keys_match_schema` test in this module will fail the build
 /// if they ever drift.
@@ -463,16 +483,31 @@ impl SettingsFileSource {
 }
 
 impl AetherSettings {
+    /// Load the settings Aether owns for `project_root`: the user-level
+    /// (`$AETHER_HOME/settings.json`) and the project-level
+    /// (`.aether/settings.json`) documents. A top-level key neither document
+    /// declares is refused, so a setting the operator believes is in effect
+    /// cannot be dropped without the run saying so.
     pub fn load_default(project_root: &Path) -> Result<Self, SettingsError> {
-        Self::load(project_root, default_sources(project_root))
+        Self::load_with_policy(project_root, default_sources(project_root), UnknownKeyPolicy::Reject)
     }
 
     pub fn load(
         project_root: &Path,
         sources: impl IntoIterator<Item = AetherSettingsSource>,
     ) -> Result<Self, SettingsError> {
+        Self::load_with_policy(project_root, sources, UnknownKeyPolicy::Reject)
+    }
+
+    /// Load settings from `sources`, applying `policy` to every top-level key
+    /// the documents do not declare.
+    pub fn load_with_policy(
+        project_root: &Path,
+        sources: impl IntoIterator<Item = AetherSettingsSource>,
+        policy: UnknownKeyPolicy,
+    ) -> Result<Self, SettingsError> {
         sources.into_iter().try_fold(Self::default(), |config, source| {
-            let next = Self::load_source(project_root, source)?;
+            let next = Self::load_source(project_root, source, policy)?;
             Ok(config.merge(next))
         })
     }
@@ -547,11 +582,15 @@ impl AetherSettings {
         Ok(())
     }
 
-    fn load_source(project_root: &Path, source: AetherSettingsSource) -> Result<Self, SettingsError> {
+    fn load_source(
+        project_root: &Path,
+        source: AetherSettingsSource,
+        policy: UnknownKeyPolicy,
+    ) -> Result<Self, SettingsError> {
         match source {
-            AetherSettingsSource::File(source) => load_file_source(project_root, source, false),
-            AetherSettingsSource::OptionalFile(source) => load_file_source(project_root, source, true),
-            AetherSettingsSource::Json(json) => Self::try_from(json.as_str()),
+            AetherSettingsSource::File(source) => load_file_source(project_root, source, false, policy),
+            AetherSettingsSource::OptionalFile(source) => load_file_source(project_root, source, true, policy),
+            AetherSettingsSource::Json(json) => parse_settings(json.as_str(), policy),
             AetherSettingsSource::Value(settings) => Ok(*settings),
         }
     }
@@ -575,10 +614,11 @@ fn load_file_source(
     project_root: &Path,
     source: SettingsFileSource,
     missing_is_empty: bool,
+    policy: UnknownKeyPolicy,
 ) -> Result<AetherSettings, SettingsError> {
     let root = resolve_against(project_root, source.root);
     let path = resolve_against(&root, source.path);
-    let settings = load_file(&path, missing_is_empty)?;
+    let settings = load_file(&path, missing_is_empty, policy)?;
     let source_root = (root != project_root).then_some(root.as_path());
     Ok(normalize_resource_paths(settings, source_root))
 }
@@ -587,10 +627,10 @@ fn resolve_against(base: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() { path } else { base.join(path) }
 }
 
-fn load_file(path: &Path, missing_is_empty: bool) -> Result<AetherSettings, SettingsError> {
+fn load_file(path: &Path, missing_is_empty: bool, policy: UnknownKeyPolicy) -> Result<AetherSettings, SettingsError> {
     match read_to_string(path) {
         Ok(content) if content.trim().is_empty() => Ok(AetherSettings::default()),
-        Ok(content) => AetherSettings::try_from(content.as_str()),
+        Ok(content) => parse_settings(content.as_str(), policy),
         Err(error) if missing_is_empty && error.kind() == std::io::ErrorKind::NotFound => Ok(AetherSettings::default()),
         Err(error) => Err(SettingsError::IoError(format!("Failed to read {}: {}", path.display(), error))),
     }
@@ -688,26 +728,48 @@ impl TryFrom<&str> for AetherSettings {
     type Error = SettingsError;
 
     fn try_from(content: &str) -> Result<Self, Self::Error> {
-        // Parse once into a generic `Value` so we can warn about unknown
-        // top-level keys and drop them before serde's `deny_unknown_fields`
-        // turns them into a hard error. This keeps the contract that
-        // "an unrecognised key prints a warning naming it and the run
-        // still starts" true even when the field policy is strict.
-        let mut value: serde_json::Value =
-            serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))?;
+        parse_settings(content, UnknownKeyPolicy::Reject)
+    }
+}
 
-        if let serde_json::Value::Object(ref mut map) = value {
-            let unknown = unrecognized_settings_keys(map);
-            for key in &unknown {
-                tracing::warn!("Unrecognised key '{key}' in Aether settings; ignoring it");
+/// Parse a settings document, applying `policy` to the top-level keys the
+/// document declares but [`AetherSettings`] does not.
+fn parse_settings(content: &str, policy: UnknownKeyPolicy) -> Result<AetherSettings, SettingsError> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))?;
+
+    if let serde_json::Value::Object(ref mut map) = value {
+        let unknown = unrecognized_settings_keys(map);
+        match policy {
+            UnknownKeyPolicy::Reject => {
+                if !unknown.is_empty() {
+                    return Err(unknown_top_level_key_error(&unknown));
+                }
             }
-            for key in &unknown {
-                map.remove(key);
+            UnknownKeyPolicy::Warn => {
+                for key in &unknown {
+                    tracing::warn!("Unrecognised key '{key}' in Aether settings; ignoring it");
+                }
+                for key in &unknown {
+                    map.remove(key);
+                }
             }
         }
-
-        serde_json::from_value(value).map_err(|e| SettingsError::ParseError(e.to_string()))
     }
+
+    serde_json::from_value(value).map_err(|e| SettingsError::ParseError(e.to_string()))
+}
+
+/// The parse error for a document that names top-level keys [`AetherSettings`]
+/// does not declare. The message names every offending key so the operator can
+/// see which one to fix.
+fn unknown_top_level_key_error(keys: &[String]) -> SettingsError {
+    let named = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
+    let label = if keys.len() == 1 { "key" } else { "keys" };
+    SettingsError::ParseError(format!(
+        "unknown top-level {label} in Aether settings: {named} (known keys: {})",
+        KNOWN_TOP_LEVEL_KEYS.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -1321,7 +1383,12 @@ mod tests {
         assert_eq!(unknown, vec!["mcpServers".to_string(), "typoField".to_string()]);
 
         let observed = capture_warnings(|| {
-            AetherSettings::try_from(value.to_string().as_str()).expect("unknown keys are warned, not rejected");
+            AetherSettings::load_with_policy(
+                Path::new("/project"),
+                [AetherSettingsSource::Json(value.to_string())],
+                UnknownKeyPolicy::Warn,
+            )
+            .expect("unknown keys are warned, not rejected");
         });
         assert_eq!(observed.len(), 2, "one warning per unknown key: {observed:?}");
         assert!(observed.iter().any(|line| line.contains("'mcpServers'")), "{observed:?}");
@@ -1345,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_key_does_not_abort_load_default() {
+    fn warn_policy_ignores_unknown_top_level_key_in_the_project_settings() {
         let project = project();
         project.write(
             ".aether/settings.json",
@@ -1358,8 +1425,8 @@ mod tests {
 
         let home = home();
         let aether_home = home.aether();
-        let config =
-            load_default_from_home(project.root(), &aether_home).expect("an unknown key is warned, not rejected");
+        let config = load_default_from_home_with_policy(project.root(), &aether_home, UnknownKeyPolicy::Warn)
+            .expect("an unknown key is warned, not rejected");
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "alpha");
     }
@@ -1731,7 +1798,19 @@ mod tests {
     }
 
     fn load_default_from_home(project_root: &Path, aether_home: &Path) -> Result<AetherSettings, SettingsError> {
-        AetherSettings::load(project_root, default_sources_for_home(project_root, Some(aether_home)))
+        load_default_from_home_with_policy(project_root, aether_home, UnknownKeyPolicy::Reject)
+    }
+
+    fn load_default_from_home_with_policy(
+        project_root: &Path,
+        aether_home: &Path,
+        policy: UnknownKeyPolicy,
+    ) -> Result<AetherSettings, SettingsError> {
+        AetherSettings::load_with_policy(
+            project_root,
+            default_sources_for_home(project_root, Some(aether_home)),
+            policy,
+        )
     }
 
     #[test]
