@@ -1,0 +1,37 @@
+# Aether's production deploy contract.
+#
+# Copy this file to `.prairie/deploy.toml`, fill in every value marked OWNER,
+# then run `prairie deploy check`: it must print
+#   prairie deploy: OK production (each commit needs approval), target panel, 1 health check, ...
+# and exit 0. The runner then drives the deploy: it builds and pushes the image
+# tag, asks the panel to upgrade the container, polls the panel task, checks
+# [[health]], and on a failed health check asks the panel to upgrade back to the
+# prior tag.
+#
+# The OWNER placeholders are deliberately not valid values: `prairie deploy
+# check` refuses this file until every one of them is filled in, so a copied
+# template can never be deployed as it stands. An agent must not invent them,
+# and must not ask for panel, registry or node access to find them: a run token
+# is refused that access by design, and the deploy token bound to this project's
+# deploys is what talks to the panel.
+
+production = true
+target = "panel"
+
+# OWNER: the registry path the panel pulls from; the runner builds and pushes
+# the new tag itself. It has to start with registry.netquirk.com/.
+image = "registry.netquirk.com/OWNER/aether"
+
+# OWNER: the container the panel upgrades -- its id, or its name together with
+# the node it runs on. Uncomment one of the two forms below and fill it in.
+# panel_container = "<container id>"
+# panel_node = "<node>"
+
+# The panel API bearer token, bound to this project's deploys (never to an
+# agent run). The runner passes it to the panel, not to the recipe.
+secrets = ["CP_API_KEY"]
+
+[[health]]
+# OWNER: the production health URL of the deployed container.
+url = "OWNER-health-url"
+timeout = "60s"

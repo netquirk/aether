@@ -9,6 +9,16 @@ For project context (purpose, stakeholders, problem, quality goals, constraints,
 - **Lint** -- `just lint`
 - **Format** -- `just fmt`
 
+## Deployment
+
+Production is reached through the project's **deploy contract**, `.prairie/deploy.toml`, which the prairie runner drives: `prairie deploy check` validates the contract, and the runner checks out one commit, performs the deploy, gates it on the contract's health checks and rolls back when they fail. The contract is the only place a deployment's specifics live; `.prairie/DEPLOY.md` records its shape and the rules below.
+
+1. **Never ask for panel, registry or node access.** `prairie need-access` for the container panel (cp.netquirk.com), the registry (registry.netquirk.com) or a deploy host is always wrong: a run token is refused that access by design, and the contract's `target = "panel"` creates and upgrades the container itself through the deploy token the owner binds to the *deploy* (never to an agent run). The deploy's secrets are bound to the deploy for the same reason.
+2. **Stop at the contract boundary.** When the contract or its recipe is missing, or a value in it is unknown, stop there and name the exact missing piece -- `image`, `panel_container`/`panel_node`, the `[[health]]` URL, a secret binding -- for the owner or the tracked deploy task to supply. Never invent a production identifier, never pick a secret name out of `prairie secrets`, and never fall back to manual steps (registry push, `docker`, SSH) that bypass the contract.
+3. **Read the contract before planning a deploy.** `prairie deploy check` prints the verdict (`OK production, target ...`, `OFF`, or `ERROR`) and `prairie secrets` lists what this run may read. Report that output instead of asking for access.
+
+Today `prairie deploy check` prints `OFF no .prairie/deploy.sh`: aether declares no deploy contract yet, so nothing here reaches production automatically. The rest is tracked on the board: `TASK-2B-1040` (the recipe), `TASK-2B-1041` (the contract), `TASK-26-143` (the deploy itself, whose health gate re-verifies `TASK-26-110` against the live system).
+
 ## Workflows 
 
 1. When making code changes, rely on your LSP tools for compile/error checking (as its much faster) and run only targeted tests. Then, run other `just` verification checks only at the end. 

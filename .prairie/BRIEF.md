@@ -38,6 +38,7 @@ A developer using an AI coding agent needs control over every token in the model
 - Tests must exercise only the public API and must not embed timeouts (AGENTS.md:34–35).
 - The SQLite session-index schema is fixed by `crates/aether-sessions/migrations/001_session_index.sql` and `002_session_usage.sql`; checked queries must match the schema (`just sqlx-check`, justfile:44–52).
 - CI gates: `just ci` runs `fmt-check`, `lint` (clippy `-D warnings`), `test-ci`, `doc-check` (rustdoc `-D warnings`), and `sqlx-check`, followed by `pnpm fmt-check`, `pnpm sdk:typecheck`, and `pnpm sdk:test` (justfile:78–82; .github/workflows/ci.yml).
+- Production is reached through the project's deploy contract (`.prairie/deploy.toml`), which the prairie runner drives; a run is never given panel, registry or node access, because the deploy token bound to the deploy creates and upgrades the container itself (`.prairie/DEPLOY.md`).
 - License: MIT (README.md:196–198; LICENSE).
 - All GitHub operations go through the `gh` CLI (AGENTS.md:46).
 
