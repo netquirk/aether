@@ -91,6 +91,11 @@ age = "0.12.1"
 # Error handling
 thiserror = "2.0"
 
+# Lint tooling (the internal error-handling lint parses the repository)
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+syn = { version = "2.0.119", features = ["full", "visit"] }
+toml = "0.5.11"
+
 # Storage
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 

@@ -53,6 +53,8 @@ jobs:
         run: cargo build -p aether-lspd
       - name: Clippy check
         run: just lint
+      - name: Error-handling lint
+        run: just error-lint
 
   test:
     name: Test

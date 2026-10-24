@@ -52,6 +52,7 @@ Today `prairie deploy check` prints `OFF no .prairie/deploy.sh`: aether declares
 1. Never add `anyhow` or `color-eyere` as dependencies. Use standard Rust `enum`'s instead, e.g. `enum ApiError { ... }`
 2. Prefer using specific enum types over `Box<dyn std::error::Error>` as the later makes it impossible for the caller to pattern match on specific errors.
 3. Leverage `map`, `flat_map`, `and_then` etc to flatten nested `match` statements like `Ok(Ok(foo)) => {...}`.
+4. `just error-lint` enforces rules 1 and 2: it scans every crate of the Cargo workspace and every TypeScript package, and fails naming the file, the line and the forbidden item.
 
 ## Workflows
 

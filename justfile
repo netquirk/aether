@@ -75,8 +75,12 @@ sdk-e2e *ARGS:
     pnpm sdk:build
     pnpm sdk:e2e {{ARGS}}
 
+# Ban the forbidden error-handling crates and boxed public errors (AGENTS.md)
+error-lint:
+    cargo run -q -p internal-lints
+
 # Run all CI checks
-ci: fmt-check lint test-ci doc-check sqlx-check
+ci: fmt-check lint test-ci doc-check sqlx-check error-lint
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test

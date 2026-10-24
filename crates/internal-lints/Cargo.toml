@@ -1,0 +1,31 @@
+[package]
+name = "internal-lints"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Repository lints that enforce the Aether conventions"
+license = "MIT"
+repository = "https://github.com/contextbridge/aether"
+
+[package.metadata.dist]
+dist = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "internal_lints"
+path = "src/lib.rs"
+
+[[bin]]
+name = "internal-lints"
+path = "src/main.rs"
+
+[dependencies]
+proc-macro2 = { workspace = true }
+serde_json = { workspace = true }
+syn = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

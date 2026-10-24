@@ -230,13 +230,9 @@ mod tests {
     async fn command_timeout_kills_a_long_running_command() {
         let environment = BashEnvironment::new().with_command_timeout(Duration::from_millis(200));
         let started = Instant::now();
-        let output = execute_command(
-            BashInput { command: "sleep 5".into(), ..Default::default() },
-            None,
-            &environment,
-        )
-        .await
-        .unwrap();
+        let output = execute_command(BashInput { command: "sleep 5".into(), ..Default::default() }, None, &environment)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert!(output.killed, "long-running command should be marked killed");
@@ -247,25 +243,18 @@ mod tests {
             output.output
         );
         assert!(
-            output.meta.as_ref().map(|meta| format!("{meta:?}").contains("timed out")).unwrap_or(false),
+            output.meta.as_ref().is_some_and(|meta| format!("{meta:?}").contains("timed out")),
             "display meta should mention the timed-out status"
         );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "command should die well under 5s, elapsed = {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(2), "command should die well under 5s, elapsed = {elapsed:?}");
     }
 
     #[tokio::test]
     async fn nonzero_exit_is_not_marked_killed() {
         let environment = BashEnvironment::new().with_command_timeout(Duration::from_millis(200));
-        let output = execute_command(
-            BashInput { command: "exit 3".into(), ..Default::default() },
-            None,
-            &environment,
-        )
-        .await
-        .unwrap();
+        let output = execute_command(BashInput { command: "exit 3".into(), ..Default::default() }, None, &environment)
+            .await
+            .unwrap();
 
         assert!(!output.killed, "a non-zero exit must not be flagged as killed");
         assert_eq!(output.exit_code, 3);

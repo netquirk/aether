@@ -1,0 +1,12 @@
+# A fixture crate for the error-handling lint: it uses the forbidden `anyhow` crate.
+[package]
+name = "anyhow-crate-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+
+# Its own workspace, so the fixture stays out of the Aether workspace.
+[workspace]
