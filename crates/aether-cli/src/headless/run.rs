@@ -544,23 +544,22 @@ async fn stream_output<W: io::Write>(
 
         match msg {
             AgentEvent::Turn(TurnEvent::Started { .. }) => {
-                // Sample `now` once so the per-turn timings, the
-                // provider-wait tracker, the stall watch, and the
-                // heartbeat (TASK-26-111) all agree on the turn's start
-                // instant; the heartbeat in particular uses it to anchor
-                // the next deadline at `started + interval`.
+                // The per-turn timings measure on the wall clock; the
+                // heartbeat (TASK-26-111) measures on the runtime clock,
+                // the same clock the loop's timer race sleeps on, so a
+                // test that pauses tokio's clock can drive the heartbeat
+                // without waiting in real time.
                 let now = Instant::now();
                 timings.begin(now);
-                beat.observe(msg, now);
+                beat.observe(msg, TokioInstant::now());
             }
             AgentEvent::Turn(TurnEvent::Ended { .. }) => {
-                // Same `now` sample so the per-turn timings close and the
-                // heartbeat disarms from a consistent instant; a mismatch
-                // here would leave the heartbeat armed past the turn's
-                // terminal event and log a spurious line.
+                // The heartbeat disarms on the runtime clock too; a
+                // mismatch here would leave the heartbeat armed past the
+                // turn's terminal event and log a spurious line.
                 let now = Instant::now();
                 timings.end(now);
-                beat.observe(msg, now);
+                beat.observe(msg, TokioInstant::now());
             }
             AgentEvent::Turn(TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. }) => {
                 // Sample `now` once so the live stall warning and the per-call
@@ -759,12 +758,15 @@ async fn await_with_deadlines<W: io::Write, T: io::Write>(
         stall: &mut ProviderStallWatch<W>,
         beat: &mut HeartbeatWatch,
         timeout: &mut RunTimeoutWatch<T>,
-        now: Instant,
+        now: TokioInstant,
     ) -> Option<RaceOutcome> {
-        if timeout.expire_if_due(now).unwrap_or(false) {
+        // The stall and timeout watches measure on the wall clock; the
+        // heartbeat measures on the runtime clock.
+        let wall_now = now.into_std();
+        if timeout.expire_if_due(wall_now).unwrap_or(false) {
             return Some(RaceOutcome::TimedOut);
         }
-        if stall.warn_if_stalled(now).unwrap_or(false) {
+        if stall.warn_if_stalled(wall_now).unwrap_or(false) {
             return Some(RaceOutcome::StallWarned);
         }
         if beat.beat_if_due(now) {
@@ -784,11 +786,10 @@ async fn await_with_deadlines<W: io::Write, T: io::Write>(
         // No watch armed: straight to the channel receive.
         return NextEvent::Received(rx.recv().await.map(Box::new));
     };
-    let tokio_deadline = TokioInstant::from_std(earliest_d);
     let outcome = tokio::select! {
         biased;
-        () = sleep_until(tokio_deadline) => {
-            let now = Instant::now();
+        () = sleep_until(earliest_d) => {
+            let now = TokioInstant::now();
             // The selected deadline may no longer be the only one due:
             // re-poll all three in priority order so the run-timeout
             // still wins ties (and the heartbeat still fires last).
@@ -813,8 +814,13 @@ async fn await_with_deadlines<W: io::Write, T: io::Write>(
 /// Pick the earliest of the three watches' deadlines, ignoring `None`
 /// (the watch is not armed). Returns `None` only when every deadline is
 /// unset, which the caller turns into a plain `recv().await`.
-fn pick_earliest(stall: Option<Instant>, beat: Option<Instant>, timeout: Option<Instant>) -> Option<Instant> {
-    [stall, beat, timeout].into_iter().flatten().min()
+///
+/// The stall and timeout deadlines are wall-clock instants and the
+/// heartbeat deadline is a runtime-clock instant; both live on the same
+/// timeline, so they are compared in the runtime-clock domain the loop
+/// sleeps in.
+fn pick_earliest(stall: Option<Instant>, beat: Option<TokioInstant>, timeout: Option<Instant>) -> Option<TokioInstant> {
+    [stall.map(TokioInstant::from_std), beat, timeout.map(TokioInstant::from_std)].into_iter().flatten().min()
 }
 
 /// Per-run tally of turns started and tool calls made by `stream_output`.
@@ -2229,13 +2235,11 @@ mod tests {
     /// flight long enough to fire a heartbeat) or finish the turn
     /// immediately (the negative path).
     ///
-    /// Both the loop and the driver run on real wall-clock `tokio::time`
-    /// primitives rather than under `start_paused = true`: the loop's
-    /// `await_with_deadlines` race drives the heartbeat watcher forward by
-    /// actually waiting for the timer's `Instant`, and a paused runtime
-    /// would never advance past a `tokio::time::sleep` whose only waiter
-    /// is the test body itself. The intervals are small (a few tens of
-    /// milliseconds) so the suite stays fast.
+    /// Both the loop and the driver run on tokio's virtual clock
+    /// (`start_paused = true`): the heartbeat watch measures on the
+    /// runtime clock, so the paused clock advances the watch's deadline
+    /// without any real-time wait, and the test ends as soon as the
+    /// runtime has no work left to do.
     async fn capture_heartbeat_log<F, Fut>(heartbeat_interval: Option<Duration>, intermediate: F) -> String
     where
         F: FnOnce(mpsc::Sender<AgentEvent>) -> Fut,
@@ -2268,12 +2272,12 @@ mod tests {
         // that it never shadows the deliverable's `heartbeat:` prefix.
         tracing::info!("TASK-26-111 probe");
 
-        // Start a turn immediately so the heartbeat is armed.
-        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
-        // Hand the only remaining sender to the driver, then drop our copy
-        // so the channel actually closes when the driver completes —
-        // otherwise `stream_output` blocks on `rx.recv()` forever once the
-        // events are drained, and the join never resolves.
+        // Hand the only sender to the driver, then drop our copy so the
+        // channel actually closes when the driver completes — otherwise
+        // `stream_output` blocks on `rx.recv()` forever once the events
+        // are drained, and the join never resolves. The driver owns the
+        // turn events, so a driver that sends no `TurnEvent::Started`
+        // leaves the heartbeat watch unarmed.
         let driver_tx = tx.clone();
         drop(tx);
         let driver = intermediate(driver_tx);
@@ -2322,14 +2326,15 @@ mod tests {
     /// the lower bound (a `contains` check, not a count) lets the test
     /// run without coupling to the exact number of beats the loop
     /// manages to fire, while still pinning the headline guarantee.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(start_paused = true)]
     async fn stream_output_emits_heartbeat_while_turn_in_flight() {
         let interval = Duration::from_millis(40);
         let log = capture_heartbeat_log(Some(interval), |tx| async move {
+            tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
             // Five intervals: the loop should have plenty of beats to
-            // log at this point. Real wall-clock sleep so the loop's
-            // tokio time advances and the heartbeat tick fires; total
-            // wait is ~200ms.
+            // log at this point. The sleep runs on the paused clock,
+            // which advances to the next pending timer when the runtime
+            // is idle, so no real time passes.
             tokio::time::sleep(interval * 5).await;
             tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
                 .await
@@ -2363,9 +2368,10 @@ mod tests {
     /// no heartbeat line is emitted even if a turn is in flight long
     /// enough to cross many intervals. The sentinel still lands so the
     /// buffer is non-vacuously non-empty.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_interval_is_none() {
         let log = capture_heartbeat_log(None, |tx| async move {
+            tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
             // Well past any sane interval; with `None` the watch is
             // disabled regardless of duration, but the loop must still
             // see this sleep to keep the test from finishing
@@ -2389,10 +2395,11 @@ mod tests {
     /// tick and no line is emitted. The watch's `Ended` arm clears
     /// `next_beat` so the `await_with_deadlines` race falls back to a
     /// plain `recv()` for the rest of the run.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_turn_ends_before_first_interval() {
         let interval = Duration::from_millis(40);
         let log = capture_heartbeat_log(Some(interval), |tx| async move {
+            tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
             // Well below the first tick so the watch never gets a
             // chance to fire.
             tokio::time::sleep(interval / 4).await;
@@ -2415,12 +2422,15 @@ mod tests {
     /// loop sleeps. Pairs with the "turn ends before first interval"
     /// negative above so a regression that arms the watch on the wrong
     /// event surfaces as a hard failure.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_no_turn_starts() {
-        let log = capture_heartbeat_log(Some(Duration::from_millis(40)), |_tx| async move {
-            // Multiple intervals' worth of wall-clock; no `Started`
-            // ever arrives, so the watch never arms.
+        let log = capture_heartbeat_log(Some(Duration::from_millis(40)), |tx| async move {
+            // Multiple intervals' worth of virtual time; no `Started`
+            // ever arrives, so the watch never arms. The sender is held
+            // until the sleep is over so the loop waits for the channel
+            // instead of seeing it closed right away.
             tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(tx);
         })
         .await;
 

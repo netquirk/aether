@@ -24,10 +24,16 @@
 //! when the resolved interval is `None` — i.e. when the `run` block has
 //! `heartbeatSeconds: 0` — so an operator who explicitly opts out never
 //! sees the line.
+//!
+//! The watch measures on the runtime clock (`tokio::time::Instant`), the
+//! same clock the headless loop's timer race sleeps on. A test that pauses
+//! tokio's clock therefore drives the heartbeat without waiting in real
+//! time, which is what keeps the heartbeat tests free of fixed waits.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aether_core::events::{AgentEvent, TurnEvent};
+use tokio::time::Instant;
 
 /// Exact log message the headless CLI emits once per heartbeat interval
 /// while an agent turn is in flight (TASK-26-111). Pinned by
@@ -80,6 +86,9 @@ impl HeartbeatWatch {
     /// at `started + interval`; `TurnEvent::Ended` disarms it. Any other
     /// event variant is ignored, mirroring the bracket-on-start /
     /// bracket-on-end pattern the per-turn bookkeeping already follows.
+    ///
+    /// `now` is a runtime-clock instant, so a test that pauses tokio's
+    /// clock arms and disarms the watch on that clock.
     pub(crate) fn observe(&mut self, event: &AgentEvent, now: Instant) {
         match event {
             AgentEvent::Turn(TurnEvent::Started { .. }) => {

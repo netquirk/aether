@@ -1,9 +1,13 @@
-//! Lints that enforce the error-handling convention of `AGENTS.md`.
+//! Lints that enforce the conventions of `AGENTS.md`.
 //!
 //! `AGENTS.md` forbids the `anyhow` and `color-eyre` crates and asks for concrete error enums
-//! instead of `Box<dyn std::error::Error>` in a public type. This crate reads the repository and
-//! reports every occurrence of those constructs. It only reads files: it writes nothing, opens no
-//! socket and needs no credential.
+//! instead of `Box<dyn std::error::Error>` in a public type, and it asks for tests without
+//! timeouts. This crate reads the repository and reports every occurrence of those constructs. It
+//! only reads files: it writes nothing, opens no socket and needs no credential.
+//!
+//! - [`scan`] and the types around it are the error-handling lint (`just error-lint`).
+//! - [`scan_workspace_waits`] and the types around it are the fixed-wait lint (`just wait-lint`),
+//!   which reports the wall-clock waits in the test functions of the workspace.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +15,12 @@ use std::path::{Path, PathBuf};
 mod manifests;
 mod rust_scan;
 mod text_scan;
+mod wait_scan;
+
+pub use wait_scan::{
+    ExemptionReason, WaitExemption, WaitFinding, WaitKind, WaitReport, default_allowlist_path, scan_workspace_waits,
+    scan_workspace_waits_allowing,
+};
 
 /// The forbidden error-handling construct a [`Finding`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +158,7 @@ pub fn scan(path: &Path) -> Report {
     Report::default()
 }
 
-fn workspace_members(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn workspace_members(root: &Path) -> Vec<PathBuf> {
     let manifest = root.join("Cargo.toml");
     let Ok(text) = fs::read_to_string(&manifest) else {
         return Vec::new();
@@ -236,7 +246,7 @@ fn expand_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
     directories
 }
 
-fn crate_files(crate_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn crate_files(crate_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_files(crate_root, &mut files, &is_rust_file, true);
     files

@@ -1,0 +1,13 @@
+# A fixture crate for the fixed-wait lint: its tests hold the wall-clock waits
+# the lint must report and the two waits it must leave alone.
+[package]
+name = "waiting-crate-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
+
+# Its own workspace, so the fixture stays out of the Aether workspace.
+[workspace]

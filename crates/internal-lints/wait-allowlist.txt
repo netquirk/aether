@@ -1,0 +1,21 @@
+# The tests the fixed-wait lint does not report.
+#
+# A test that waits for something it cannot fake needs a bound: the wait ends
+# when the thing happens, and the bound only turns a stuck wait into a failed
+# test instead of a test that hangs. Every entry names one such test, with the
+# reason it cannot run on a fake clock.
+#
+# Format: <path relative to the repository root>::<test function name>
+
+# The wait ends when the queue drains, which the test drives itself. The bound
+# is the safety net for a waiter that never wakes.
+crates/aether-lspd/src/refresh_queue.rs::wait_for_current_generation_resolves_when_drained
+crates/aether-lspd/src/refresh_queue.rs::bootstrap_completion_without_pending_wakes_waiters
+
+# The wait ends when the language server answers, and the server is a process
+# the test cannot fake. The bound is the safety net for a server that never
+# answers.
+crates/aether-lspd/tests/e2e/e2e_lifecycle.rs::workspace_bootstrap_diagnostics_are_available_without_explicit_open
+crates/aether-lspd/tests/e2e/e2e_lifecycle.rs::workspace_diagnostics_refresh_after_external_edit_without_explicit_open
+crates/mcp-servers/tests/integration/lsp_diagnostics_e2e.rs::test_workspace_diagnostics_after_edit_without_file_check
+crates/mcp-servers/tests/integration/lsp_diagnostics_e2e.rs::test_workspace_diagnostics_clear_after_fix_without_file_check
