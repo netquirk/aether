@@ -347,7 +347,7 @@ fn format_settings_paths(paths: &[std::path::PathBuf]) -> String {
 /// command is launched and handed the override via argv so the configured
 /// model is bypassed for this run only. `--log-level` is forwarded the same
 /// way so the spawned child sees the same tracing level the TUI was given.
-fn default_agent_command(model: Option<&str>, log_level: Option<LogLevel>) -> String {
+pub(crate) fn default_agent_command(model: Option<&str>, log_level: Option<LogLevel>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(model) = model {
         parts.push(format!("--model {model}"));
@@ -372,7 +372,7 @@ fn default_agent_command(model: Option<&str>, log_level: Option<LogLevel>) -> St
 /// The validated model string is then interpolated into the agent
 /// subprocess argv, so this also constrains what can land on the child's
 /// command line.
-fn validate_model_override(model: &str) -> Result<(), MainError> {
+pub(crate) fn validate_model_override(model: &str) -> Result<(), MainError> {
     if model.parse::<LlmModel>().is_err() {
         return Err(MainError::Cli(CliError::ModelError(format!(
             "--model '{model}' is not a recognised provider:model id"

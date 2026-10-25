@@ -28,6 +28,37 @@ on a crate that breaks the rule.
 The lint only reads files. It needs no network, no credential, no model provider and no deployed
 service.
 
+## The private-item lint
+
+`AGENTS.md` asks for tests that exercise only the public API: a test that reaches a private item
+couples the test to the internals of the crate. `just private-lint` runs the lint over the
+repository:
+
+```
+just private-lint
+```
+
+The lint scans every test function of the workspace and reports the private item of the crate under
+test that the test reaches:
+
+- a private function,
+- a private method,
+- a private field,
+- a private type,
+- a private constant.
+
+A unit test may reach the private items of the module it is written in: those are the internals of
+the module under test. The private items of the crate root are the internals of the whole crate,
+and no test reaches them. An integration test lives outside the crate, so it may use the public API
+of the crate only, and everything it declares itself.
+
+It prints every finding with its file, line, test function, kind of item and offending expression,
+how many test functions it scanned and how many it flagged. It exits with a non-zero status when it
+found one, so `just ci` fails on a test that breaks the rule.
+
+The lint only reads files. It needs no network, no credential, no model provider and no deployed
+service.
+
 ## The fixed-wait lint
 
 `AGENTS.md` asks for tests without timeouts: a fixed wait makes a test flaky on machines of

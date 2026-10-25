@@ -24,6 +24,7 @@ Aether is an AI coding agent harness, written in Rust, that gives _you_ control 
 - [Using Aether as a library](#using-aether-as-a-library)
 - [Rust crates](#rust-crates)
 - [TypeScript packages](#typescript-packages)
+- [CI](#ci)
 - [License](#license)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
@@ -196,6 +197,25 @@ The `@aether-agent/sdk` package is published at version `0.7.1`.
 |---------|-------------|
 | [`@aether-agent/sdk`](packages/aether-sdk) | TypeScript SDK for building agents programmatically |
 | [`@aether-agent/website`](packages/website) | Documentation website built with Astro
+
+## CI
+
+`just ci` runs every check of the repository:
+
+| Check | What it does |
+|-------|--------------|
+| `just fmt-check` | Checks the formatting of the Rust code |
+| `just lint` | Runs clippy with the workspace lints and fails on a warning |
+| `just test-ci` | Runs the test suite |
+| `just doc-test` | Runs the doc tests, which compile the examples of the READMEs |
+| `just doc-check` | Builds the documentation without a warning |
+| `just sqlx-check` | Checks the SQL queries against the session-index schema |
+| `just error-lint` | Bans `anyhow`, `color-eyre` and boxed public errors |
+| `just wait-lint` | Bans the fixed wall-clock waits in the tests |
+| `just private-lint` | Bans the tests that reach a private item of the crate under test |
+
+The three lints enforce the conventions `AGENTS.md` states. See
+[`crates/internal-lints`](crates/internal-lints) for what each one reports.
 
 ## License
 

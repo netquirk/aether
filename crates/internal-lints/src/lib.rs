@@ -8,15 +8,23 @@
 //! - [`scan`] and the types around it are the error-handling lint (`just error-lint`).
 //! - [`scan_workspace_waits`] and the types around it are the fixed-wait lint (`just wait-lint`),
 //!   which reports the wall-clock waits in the test functions of the workspace.
+//! - [`scan_workspace_private`] and the types around it are the private-item lint
+//!   (`just private-lint`), which reports the tests that reach a private item of the crate under
+//!   test.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 mod manifests;
+mod private_index;
+mod private_macro;
+mod private_reach;
+mod private_scan;
 mod rust_scan;
 mod text_scan;
 mod wait_scan;
 
+pub use private_scan::{PrivateFinding, PrivateItemKind, PrivateReport, scan_crate_private, scan_workspace_private};
 pub use wait_scan::{
     ExemptionReason, WaitExemption, WaitFinding, WaitKind, WaitReport, default_allowlist_path, scan_workspace_waits,
     scan_workspace_waits_allowing,

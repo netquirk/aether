@@ -95,8 +95,12 @@ readme-check:
 sdk-version-check:
     cargo run -q -p internal-sdk-version-check
 
+# Ban the tests that reach a private item of the crate under test (AGENTS.md)
+private-lint:
+    cargo run -q -p internal-lints --bin private-lint
+
 # Run all CI checks
-ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check sdk-version-check
+ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check sdk-version-check private-lint
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test

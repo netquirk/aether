@@ -57,6 +57,8 @@ jobs:
         run: just error-lint
       - name: Fixed-wait lint
         run: just wait-lint
+      - name: Private-item lint
+        run: just private-lint
       - name: README provider check
         run: just readme-check
       - name: SDK version check

@@ -415,7 +415,7 @@ pub fn generate(models_json_path: &Path) -> Result<GeneratedOutput, CodegenError
     })
 }
 
-fn build_provider_models(data: &ModelsDevData) -> Result<ProviderModels, CodegenError> {
+pub(crate) fn build_provider_models(data: &ModelsDevData) -> Result<ProviderModels, CodegenError> {
     let mut provider_models = ProviderModels::new();
 
     for cfg in PROVIDERS {
@@ -581,13 +581,13 @@ fn reasoning_levels_for_model(cfg: &ProviderConfig, model: &ModelData) -> Result
 }
 
 /// Returns true for "latest" alias IDs that just point to another model
-fn is_alias(id: &str) -> bool {
+pub(crate) fn is_alias(id: &str) -> bool {
     id.ends_with("-latest")
 }
 
 /// Convert a model ID like "claude-sonnet-4-5-20250929" into a `PascalCase` variant name.
 /// Treats `-`, `.`, `/`, and `:` as word separators.
-fn model_id_to_variant(id: &str) -> String {
+pub(crate) fn model_id_to_variant(id: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = true;
 
@@ -1017,7 +1017,7 @@ fn emit_transport_arms(models: &[ModelInfo]) -> TokenStream {
 
 /// Map a reasoning level string to its `ReasoningEffort` variant name
 /// (the serialized name with the first letter capitalized).
-fn level_str_to_variant(level: &str) -> String {
+pub(crate) fn level_str_to_variant(level: &str) -> String {
     let canonical =
         level.parse::<utils::ReasoningEffort>().unwrap_or_else(|_| panic!("Unknown reasoning level: {level}")).as_str();
     let mut variant = canonical.to_string();
@@ -1666,7 +1666,7 @@ fn push_transport_section(doc: &mut String, models: &[ModelInfo]) {
 }
 
 /// Format a token count as human-readable (e.g. `1_000_000` → `1M`, `200_000` → `200k`).
-fn format_context_window(tokens: u32) -> String {
+pub(crate) fn format_context_window(tokens: u32) -> String {
     if tokens == 0 {
         return "unknown".to_string();
     }
