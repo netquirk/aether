@@ -109,8 +109,8 @@ pub(crate) fn print_turn_summary(format: OutputFormat, timings: &TurnTimings, ru
 /// Accumulates the wall-clock time the agent spent waiting on the provider.
 ///
 /// Each provider request is bracketed by
-/// [`TurnEvent::LlmCallStarted`](aether_core::events::TurnEvent::LlmCallStarted)
-/// and [`TurnEvent::LlmCallEnded`](aether_core::events::TurnEvent::LlmCallEnded);
+/// [`TurnEvent::LlmCallStarted`]
+/// and [`TurnEvent::LlmCallEnded`];
 /// the headless event loop feeds every event through
 /// [`ProviderWaitTracker::observe`] with the matching `Instant::now()` so the
 /// tracker is independent of the `--events` filter and the turn lifecycle.

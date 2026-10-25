@@ -16,6 +16,7 @@ mod config_profile_banner;
 mod cwd_not_writable;
 mod disable_tool;
 mod dry_run;
+mod exit_codes;
 mod headless_system_prompt;
 mod list_profiles;
 mod list_tools;

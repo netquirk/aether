@@ -10,7 +10,7 @@
 //!
 //! The deadline takes precedence over the provider-stall warning: when both
 //! the stall deadline and the run deadline are due at the same time, the
-//! select loop fires the timeout branch and returns. [`expire_if_due`] latches
+//! select loop fires the timeout branch and returns. [`RunTimeoutWatch::expire_if_due`] latches
 //! on first write so a follow-up poll returns `Ok(false)` even if the headless
 //! loop's `select!` wakes again on the same tick; the line is printed exactly
 //! once per run.
@@ -25,7 +25,7 @@ use crate::output::format_duration;
 /// already key off `timeout(1)`'s exit code in their tooling recognise it
 /// without extra wiring. Distinct from [`std::process::ExitCode::SUCCESS`]
 /// (`0`) and [`std::process::ExitCode::FAILURE`] (`1`).
-pub(crate) const TIMEOUT_EXIT_CODE: u8 = 124;
+pub const TIMEOUT_EXIT_CODE: u8 = 124;
 
 /// Render the one-line timeout message the headless CLI prints when a run
 /// exceeds the caller-supplied limit. Pinned by
@@ -39,9 +39,9 @@ pub(crate) fn run_timeout_line(limit: Duration) -> String {
 /// one-line message the first time the deadline passes.
 ///
 /// Constructed once at the top of `stream_output`, fed no events: the deadline
-/// is fixed when the run starts (`started + limit`). [`deadline`] is
+/// is fixed when the run starts (`started + limit`). [`RunTimeoutWatch::deadline`] is
 /// `Some(deadline)` while the run is still inside its budget and `None` once
-/// [`expire_if_due`] has fired (so the headless loop falls back to a plain
+/// [`RunTimeoutWatch::expire_if_due`] has fired (so the headless loop falls back to a plain
 /// `recv().await` and exits through the timeout branch exactly once).
 ///
 /// Generic over `Write` so the unit tests can pin the exact bytes without
@@ -56,7 +56,7 @@ pub(crate) struct RunTimeoutWatch<W: Write> {
 
 impl<W: Write> RunTimeoutWatch<W> {
     /// Build a new watch. `limit = None` (or zero, see below) disables the
-    /// timeout: every poll is a no-op, [`deadline`] always returns `None`,
+    /// timeout: every poll is a no-op, [`RunTimeoutWatch::deadline`] always returns `None`,
     /// and the headless loop falls back to the plain `recv()` path.
     ///
     /// `limit = Some(zero)` is treated as disabled rather than "expire

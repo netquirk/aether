@@ -71,7 +71,7 @@ pub struct RunConfig {
     pub output: OutputFormat,
     pub verbose: bool,
     /// Explicit `--log-level` (TASK-25-41). `None` falls back to the
-    /// `--verbose` boolean via [`LogLevel::resolve`] so existing
+    /// `--verbose` boolean via [`crate::log_level::resolve`] so existing
     /// `--verbose` callers keep their `debug` level while new runs can pick
     /// `error`/`warn`/`info`/`debug`/`trace` directly.
     pub log_level: Option<LogLevel>,
@@ -171,7 +171,7 @@ pub struct RunConfig {
     pub heartbeat_interval: Option<Duration>,
     /// Caller-capped wall-clock budget for the run (TASK-25-18). When set,
     /// the headless event loop returns the distinct
-    /// [`crate::run_timeout::TIMEOUT_EXIT_CODE`] the first time
+    /// [`TIMEOUT_EXIT_CODE`](crate::TIMEOUT_EXIT_CODE) the first time
     /// `started + timeout` passes, regardless of whether the agent is still
     /// streaming events. `None` preserves the previous behaviour (no
     /// timeout). The limit applies to the event loop only; it does not cap
@@ -181,7 +181,7 @@ pub struct RunConfig {
     pub timeout: Option<Duration>,
     /// Caller-capped number of tool calls for the run (TASK-25-260). When
     /// set, the headless event loop returns the distinct
-    /// [`crate::run_max_tool_calls::MAX_TOOL_CALLS_EXIT_CODE`] (125) the
+    /// [`MAX_TOOL_CALLS_EXIT_CODE`](crate::MAX_TOOL_CALLS_EXIT_CODE) (125) the
     /// first time `summary.tool_calls` reaches the limit, regardless of
     /// whether the agent is still streaming events. `None` preserves the
     /// previous behaviour (no cap). The cap applies to the event loop only;
@@ -425,7 +425,7 @@ pub struct HeadlessArgs {
 
     /// Wall-clock run timeout (TASK-25-18). When the run has been going for
     /// longer than this the headless event loop ends it, prints one line
-    /// naming the limit, and exits with [`crate::run_timeout::TIMEOUT_EXIT_CODE`]
+    /// naming the limit, and exits with [`TIMEOUT_EXIT_CODE`](crate::TIMEOUT_EXIT_CODE)
     /// (`124`). Accepts the same suffixes as `--transcript-max-bytes`-style
     /// durations: `<n>ms`, `<n>s`, `<n>m`, `<n>h`, or a bare number of
     /// seconds. Values below one second — including zero, empty strings, and
@@ -438,7 +438,7 @@ pub struct HeadlessArgs {
     /// Cap the number of tool calls this run makes (TASK-25-260). Once the
     /// run has issued N tool calls the headless loop ends it, prints one
     /// line naming `--max-tool-calls`, and exits with
-    /// [`crate::run_max_tool_calls::MAX_TOOL_CALLS_EXIT_CODE`] (125).
+    /// [`MAX_TOOL_CALLS_EXIT_CODE`](crate::MAX_TOOL_CALLS_EXIT_CODE) (125).
     /// Accepts a bare non-negative integer (`<n>`). Zero/empty/non-numeric
     /// values are rejected at parse time. Without `--max-tool-calls` the
     /// run shape is preserved (no cap).

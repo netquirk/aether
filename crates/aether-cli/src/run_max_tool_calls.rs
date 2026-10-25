@@ -14,7 +14,7 @@
 //!
 //! The cap takes precedence over a regular `turn_ended` outcome: when both
 //! the cap and a turn outcome are due at the same time, the headless loop
-//! fires the cap branch and returns. [`stop_if_reached`] latches on first
+//! fires the cap branch and returns. [`MaxToolCallsWatch::stop_if_reached`] latches on first
 //! write so a follow-up poll returns `Ok(false)` even if the headless loop
 //! wakes again on the same tick; the line is printed exactly once per run.
 
@@ -22,14 +22,14 @@ use std::io::{self, Write};
 
 /// Distinct exit code the headless CLI returns when a run is capped by
 /// `--max-tool-calls`. Distinct from
-/// [`crate::run_timeout::TIMEOUT_EXIT_CODE`] (124),
+/// [`TIMEOUT_EXIT_CODE`](crate::TIMEOUT_EXIT_CODE) (124),
 /// [`std::process::ExitCode::SUCCESS`] (0), and
 /// [`std::process::ExitCode::FAILURE`] (1).
-pub(crate) const MAX_TOOL_CALLS_EXIT_CODE: u8 = 125;
+pub const MAX_TOOL_CALLS_EXIT_CODE: u8 = 125;
 
 /// Render the one-line "cap reached" message the headless CLI prints when
 /// the run reaches the caller-supplied `--max-tool-calls` cap. Pinned by
-/// [`tests::run_max_tool_calls_line_names_flag`] so a regression in phrasing
+/// `run_max_tool_calls_line_names_flag` so a regression in phrasing
 /// shows up immediately. The line includes the flag verbatim
 /// (`--max-tool-calls`) so callers can grep for it without ambiguity.
 pub(crate) fn run_max_tool_calls_line(limit: u32) -> String {

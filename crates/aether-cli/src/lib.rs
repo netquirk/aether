@@ -42,3 +42,5 @@ pub mod workspace;
 pub(crate) mod workspace_boundary;
 
 pub use acp::map_mcp_prompt_to_available_command;
+pub use run_max_tool_calls::MAX_TOOL_CALLS_EXIT_CODE;
+pub use run_timeout::TIMEOUT_EXIT_CODE;

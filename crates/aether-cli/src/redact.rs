@@ -129,9 +129,9 @@ impl SecretRedactor {
     ///   consults), plus the `custom` provider's `CUSTOM_API_KEY`.
     /// - Each `api_key` configured inline on `spec.provider_connections`
     ///   (the override struct's per-provider key).
-    /// - Each header **value** whose header **name** matches the
-    ///   [`crate::llm::providers::anthropic::provider::should_redact_header`]
-    ///   convention: `authorization`, `x-api-key`, or contains `secret` or
+    /// - Each header **value** whose header **name** matches the Anthropic
+    ///   provider's `should_redact_header` convention: `authorization`,
+    ///   `x-api-key`, or contains `secret` or
     ///   `token` (case-insensitive). The Anthropic provider redacts those
     ///   header values from its own request-id line; we mirror the rule here
     ///   so the same headers the model sees redacted do not leak through a

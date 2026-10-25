@@ -49,10 +49,10 @@ pub(crate) const HEARTBEAT_MESSAGE: &str = "heartbeat: agent turn still in fligh
 /// Fed the same events as the existing per-turn bookkeeping:
 /// `TurnEvent::Started` arms the watch with the turn's start instant and
 /// sets the first deadline at `started + interval`, `TurnEvent::Ended`
-/// disarms it. [`next_deadline`] is `Some` only while a turn is in flight
+/// disarms it. [`HeartbeatWatch::next_deadline`] is `Some` only while a turn is in flight
 /// (and the interval is non-zero), so the headless CLI's select loop
 /// sleeps until that instant and otherwise falls back to a plain `recv()`.
-/// [`beat_if_due`] writes one `info!` line per interval and advances the
+/// [`HeartbeatWatch::beat_if_due`] writes one `info!` line per interval and advances the
 /// deadline to `now + interval` so a subsequent poll returns the next
 /// deadline. When `interval = None` (the `run.heartbeatSeconds = 0` case),
 /// every poll is a no-op and `next_deadline` always returns `None`.
@@ -75,7 +75,7 @@ impl HeartbeatWatch {
     /// Build a new watch. `interval = None` (or resolved from
     /// `run.heartbeatSeconds = 0` via
     /// [`aether_project::RunSettings::heartbeat_interval`]) disables the
-    /// heartbeat: every poll is a no-op and [`next_deadline`] always
+    /// heartbeat: every poll is a no-op and [`HeartbeatWatch::next_deadline`] always
     /// returns `None`.
     pub(crate) fn new(interval: Option<Duration>) -> Self {
         Self { interval, active: None, next_beat: None }

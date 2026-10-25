@@ -39,10 +39,10 @@ pub(crate) fn provider_stall_warning_line(elapsed: Duration) -> String {
 ///
 /// Fed the same events as [`crate::output::ProviderWaitTracker`]:
 /// `LlmCallStarted` arms the watch with the call's start instant and resets
-/// the warn-once latch, `LlmCallEnded` disarms it. [`next_deadline`] is
+/// the warn-once latch, `LlmCallEnded` disarms it. [`ProviderStallWatch::next_deadline`] is
 /// `Some` only while a call is in flight and the warning has not yet been
 /// printed, so the headless CLI's select loop sleeps until that instant and
-/// otherwise falls back to a plain `recv()`. [`warn_if_stalled`] writes the
+/// otherwise falls back to a plain `recv()`. [`ProviderStallWatch::warn_if_stalled`] writes the
 /// line at most once per call; a follow-up poll returns `Ok(false)` so the
 /// loop does not spam the warning while the call is still hanging.
 ///
@@ -59,7 +59,7 @@ pub(crate) struct ProviderStallWatch<W: Write> {
 impl<W: Write> ProviderStallWatch<W> {
     /// Build a new watch. `threshold = None` (or zero, via
     /// [`aether_project::RunSettings::provider_stall_warn`]) disables the
-    /// warning: every poll is a no-op and [`next_deadline`] always returns
+    /// warning: every poll is a no-op and [`ProviderStallWatch::next_deadline`] always returns
     /// `None`.
     pub(crate) fn new(threshold: Option<Duration>, writer: W) -> Self {
         Self { threshold, writer, started: None, warned: false }
@@ -83,7 +83,7 @@ impl<W: Write> ProviderStallWatch<W> {
     }
 
     /// `started + threshold` while a call is in flight and the warning has
-    /// not yet been printed. `None` once [`warn_if_stalled`] has fired, when
+    /// not yet been printed. `None` once [`ProviderStallWatch::warn_if_stalled`] has fired, when
     /// the threshold is unset, or when no call is in flight — the watch
     /// then falls back to a plain event receive.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {

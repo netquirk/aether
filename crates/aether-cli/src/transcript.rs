@@ -23,7 +23,7 @@
 //! `{"type":"header","aetherVersion":<version>,"startedAt":<rfc3339 utc>}`
 //! that names which `aether` build produced the file and when the run
 //! started. Rotated files are also self-describing: the header is re-emitted
-//! at the top of every freshly-opened file (see [`Self::rotate`]). Tests and
+//! at the top of every freshly-opened file (see `rotate`). Tests and
 //! downstream readers must skip line 0 (or otherwise tolerate a non-event
 //! record) to reach the per-event lines that follow.
 //!
@@ -87,10 +87,10 @@ struct TranscriptHeader<'a> {
 /// increments on every `TurnEvent::Started`; events seen before the first
 /// `Started` are written with `turn: 0`.
 ///
-/// The [`SecretRedactor`] is applied (TASK-26-22) to every serialised line
+/// The `SecretRedactor` is applied (TASK-26-22) to every serialised line
 /// before it reaches the file so an API key or `bearer <token>` that lands
 /// in the run's event stream does not leak into the saved transcript. The
-/// default value is [`SecretRedactor::new`] so existing callers (and most
+/// default value is `SecretRedactor::new` so existing callers (and most
 /// existing tests) automatically pick up bearer-pattern redaction with no
 /// further wiring.
 pub struct JsonlTranscript {
@@ -149,11 +149,11 @@ impl JsonlTranscript {
 
     /// Replace the redactor used to scrub secret-looking values from every
     /// serialised line before it reaches disk. The default (installed by
-    /// [`Self::create_with_max_bytes`]) is an empty [`SecretRedactor`] that
+    /// [`Self::create_with_max_bytes`]) is an empty `SecretRedactor` that
     /// only runs the bearer-pattern pass; this builder lets a caller seed
     /// the configured provider API keys and inline credentials so the same
-    /// redaction rule applies to the transcript that [`crate::redact`]
-    /// applies to the run log.
+    /// redaction rule applies to the transcript that the crate's `redact`
+    /// module applies to the run log.
     ///
     /// Returns `self` for chaining so the typical pattern is:
     /// `JsonlTranscript::create_with_max_bytes(path, max).with_redactor(redactor)`.
@@ -166,7 +166,7 @@ impl JsonlTranscript {
     /// the transcript. The header names the `aether` build and the run's
     /// start time so a reader opening the saved file later knows which
     /// version produced it and when the run began. The same line is
-    /// re-emitted into every freshly-rotated file (see [`Self::rotate`]),
+    /// re-emitted into every freshly-rotated file (see `rotate`),
     /// keeping each produced transcript self-describing on its own.
     ///
     /// Writes the line + `\n`, adds its length to `bytes_written` so rotation
@@ -309,7 +309,7 @@ pub enum TranscriptError {
 /// user can tell at a glance which line to inspect.
 ///
 /// Only one slot of the rotation contract is reachable in practice: a single
-/// call to [`JsonlTranscript::rotate`] renames the live file to `<stem>.1` and
+/// call to `rotate` renames the live file to `<stem>.1` and
 /// only the most recent sibling survives. Passing `<stem>.1` to `--resume`
 /// therefore yields at most the most recent rotation's worth of turns; older
 /// history is intentionally not preserved.

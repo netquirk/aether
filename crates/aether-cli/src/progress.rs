@@ -4,7 +4,7 @@
 //! stderr naming the tool the agent is currently running. The line is replaced
 //! on every new `ToolEvent::ExecutionStarted` and cleared when that tool
 //! completes (result, error, refusal, or background-task completion). It is
-//! gated on [`OutputFormat::Text`] so machine-readable formats (JSON/Pretty)
+//! gated on [`crate::output::OutputFormat::Text`] so machine-readable formats (JSON/Pretty)
 //! stay clean.
 //!
 //! The mapping from [`AgentEvent`] to a [`ToolProgressUpdate`] is a pure

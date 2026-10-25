@@ -242,8 +242,9 @@ impl AgentBuilder {
 
     /// Install a fallback provider the agent swaps in when the primary
     /// fails with a server (5xx) error. The agent records the swap as a
-    /// [`ModelEvent::Fallback`] in the run transcript, naming the
-    /// provider that took over. The fallback is consumed on the first
+    /// [`ModelEvent::Fallback`](crate::events::ModelEvent::Fallback) in the run
+    /// transcript, naming the provider that took over. The fallback is
+    /// consumed on the first
     /// matching failure — a 5xx later in the same run does not trigger
     /// a second swap. `None` (the default) keeps the pre-existing
     /// retry-then-fail behaviour.

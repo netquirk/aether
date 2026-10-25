@@ -74,7 +74,7 @@ pub(crate) struct AgentConfig {
     pub context_window: Option<u32>,
     /// Optional cap on the number of LLM chat turns in a single run. When
     /// `Some(n)`, the run ends cleanly with
-    /// [`TurnOutcome::MaxTurnsReached`](crate::events::TurnOutcome::MaxTurnsReached)
+    /// [`TurnOutcome::MaxTurnsReached`]
     /// once `n` chat turns have started. `None` means unbounded.
     pub max_turns: Option<u32>,
     pub prompt_cache: PromptCache,

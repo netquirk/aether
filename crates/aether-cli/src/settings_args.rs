@@ -137,7 +137,7 @@ impl SettingsSourceArgs {
     }
 
     /// Return the top-level `toolOutput` block from the loaded settings, or
-    /// `None` if the source is missing the block. Used by [`SessionFactory`]
+    /// `None` if the source is missing the block. Used by the `SessionFactory`
     /// to thread the cap into the runtime without re-loading the catalog.
     pub fn tool_output_settings(&self) -> Result<Option<ToolOutputSettings>, SettingsError> {
         // The settings source may not point at a file at all (e.g. CLI args

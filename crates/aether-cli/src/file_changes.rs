@@ -1,7 +1,7 @@
 //! Aggregate the file changes a headless run performed.
 //!
-//! Coding MCP tools attach a [`FileDiff`] to their results via
-//! [`ToolResultMeta`]. The headless run streams every tool event past the
+//! Coding MCP tools attach a [`mcp_utils::display_meta::FileDiff`] to their
+//! results via [`ToolResultMeta`]. The headless run streams every tool event past the
 //! CLI, so the CLI can tally those diffs here and print a one-line summary
 //! at the end of the transcript.
 

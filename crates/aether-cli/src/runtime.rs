@@ -34,14 +34,14 @@ pub struct RuntimeBuilder {
     /// starts. Sourced from the top-level `shellEnvironment` block of the
     /// loaded settings; threaded into [`McpBuilder::with_shell_environment`]
     /// which merges them with the internal gateway socket inside
-    /// [`spawn_mcp`].
+    /// `spawn_mcp`.
     shell_environment: BTreeMap<String, String>,
     /// Per-command wall-clock ceiling applied to every shell command a run
     /// starts (the `bash` tool of the built-in `coding` MCP server). Sourced
     /// from the top-level `run.shellCommandTimeoutSeconds` block of the loaded
-    /// settings and resolved via [`RunSettings::shell_command_timeout`] so the
+    /// settings and resolved via [`aether_project::RunSettings::shell_command_timeout`] so the
     /// `None`/zero disabled path is preserved. Threaded into
-    /// [`McpBuilder::with_shell_command_timeout`] inside [`spawn_mcp`].
+    /// [`McpBuilder::with_shell_command_timeout`] inside `spawn_mcp`.
     shell_command_timeout: Option<Duration>,
     mcp_config_sources: Vec<McpConfigSource>,
     extra_mcp_servers: Vec<McpServer>,
@@ -88,7 +88,7 @@ impl RuntimeBuilder {
     /// Set the top-level `toolOutput` block from the loaded settings. The CLI
     /// resolves the per-agent cap together with this block and the
     /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` env vars
-    /// inside [`spawn_mcp`].
+    /// inside `spawn_mcp`.
     pub fn settings_tool_output(mut self, tool_output: Option<ToolOutputSettings>) -> Self {
         self.settings_tool_output = tool_output;
         self
@@ -96,7 +96,7 @@ impl RuntimeBuilder {
 
     /// Set the top-level `shellEnvironment` block from the loaded settings.
     /// The CLI threads it into [`McpBuilder::with_shell_environment`] inside
-    /// [`spawn_mcp`] so every shell command a run starts (the `bash` tool of
+    /// `spawn_mcp` so every shell command a run starts (the `bash` tool of
     /// the built-in `coding` MCP server) sees the configured variables
     /// merged over its process environment.
     pub fn shell_environment(mut self, vars: BTreeMap<String, String>) -> Self {
@@ -106,12 +106,12 @@ impl RuntimeBuilder {
 
     /// Set the top-level `run.shellCommandTimeoutSeconds` block from the
     /// loaded settings. The CLI threads it into
-    /// [`McpBuilder::with_shell_command_timeout`] inside [`spawn_mcp`] so the
+    /// [`McpBuilder::with_shell_command_timeout`] inside `spawn_mcp` so the
     /// built-in `coding` MCP server's `bash` tool kills any command that
     /// outruns the configured limit and marks the result with a `killed:
     /// true` plus a "timed out after …" marker in its structured output.
     /// `None` preserves the pre-existing no-cap behaviour, matching the
-    /// `0`/absent-settings path [`RunSettings::shell_command_timeout`]
+    /// `0`/absent-settings path [`aether_project::RunSettings::shell_command_timeout`]
     /// resolves to.
     pub fn shell_command_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.shell_command_timeout = timeout;
