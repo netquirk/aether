@@ -2,9 +2,22 @@
 # Verify the three environment-dependent workspace test targets.
 #
 # These targets cannot pass in a sandbox that lacks a container engine or a
-# usable language server, so this script first reports what the environment
-# provides and then runs every target, collecting the results instead of
-# stopping at the first failure. It exits non-zero when any target fails.
+# usable language server, so this script first provisions what the environment
+# can provide, reports what it found, and then runs every target, collecting
+# the results instead of stopping at the first failure. It exits non-zero when
+# any target fails.
+#
+# Provisioning the language server:
+#   The aether-lspd daemon spawns the analyzer itself and inherits the
+#   environment of the process that started the daemon.
+#   `scripts/provision-rust-analyzer.sh` therefore runs the analyzer from a
+#   toolchain that ships both `rust-analyzer` and `cargo`, with
+#   CARGO/RUSTUP_TOOLCHAIN pointing at that toolchain and without
+#   RUST_SRC_PATH: the analyzer type-checks against the precompiled sysroot
+#   metadata, so the standard library sources are not needed, and asking for
+#   them only makes the analyzer parse the whole standard library.
+#   The daemon spawns the analyzer through
+#   AETHER_LSPD_SERVER_COMMAND_RUST_ANALYZER, so the wrapper is installed here.
 #
 # Usage:
 #   scripts/verify-environment-dependent-tests.sh
@@ -19,9 +32,19 @@ cd "$repo_root"
 log_dir="${AETHER_ENV_TEST_LOG_DIR:-test-results}"
 log_file="$log_dir/environment-dependent-tests.log"
 mkdir -p "$log_dir"
-exec > >(tee "$log_file") 2>&1
 
 failed_targets=()
+
+provision_language_server() {
+    local wrapper="$repo_root/scripts/provision-rust-analyzer.sh"
+    if [ ! -x "$wrapper" ]; then
+        echo "language server: wrapper $wrapper is missing or not executable"
+        return
+    fi
+    export AETHER_LSPD_SERVER_COMMAND_RUST_ANALYZER="$wrapper"
+    echo "language server: AETHER_LSPD_SERVER_COMMAND_RUST_ANALYZER=$wrapper"
+    echo "language server: analyzer version $("$wrapper" --version 2>&1 | sed -n '1p')"
+}
 
 report_environment() {
     echo "== environment =="
@@ -30,13 +53,8 @@ report_environment() {
     echo "rustc: $(rustc --version 2>&1 || echo 'not available')"
     echo "cargo: $(cargo --version 2>&1 || echo 'not available')"
     echo "rust-analyzer: $(rust-analyzer --version 2>&1 || echo 'not available')"
+    echo "analyzer command: ${AETHER_LSPD_SERVER_COMMAND_RUST_ANALYZER:-rust-analyzer}"
     echo "RUST_SRC_PATH: ${RUST_SRC_PATH:-<unset>}"
-    echo "rust standard library sources:"
-    if [ -d "${RUST_SRC_PATH:-/nonexistent}" ]; then
-        echo "  $RUST_SRC_PATH"
-    else
-        echo "  (none found: rust-analyzer cannot type-check Cargo projects without them)"
-    fi
     echo "container engine:"
     if docker info >/dev/null 2>&1; then
         docker info 2>&1 | sed -n '1,20p'
@@ -60,24 +78,35 @@ run_target() {
     echo
 }
 
-report_environment
+main() {
+    echo "== provisioning =="
+    provision_language_server
+    echo
 
-run_target "aether-lspd e2e tests" \
-    cargo test -p aether-lspd --test e2e
+    report_environment
 
-run_target "aether-mcp-servers LSP diagnostics e2e tests" \
-    cargo test -p aether-mcp-servers --test integration lsp_diagnostics_e2e
+    run_target "aether-lspd e2e tests" \
+        cargo test -p aether-lspd --test e2e
 
-run_target "aether-evals docker agent tests" \
-    cargo test -p aether-evals --test docker_agent_tests
+    run_target "aether-mcp-servers LSP diagnostics e2e tests" \
+        cargo test -p aether-mcp-servers --test integration lsp_diagnostics_e2e
 
-echo "== summary =="
-if [ ${#failed_targets[@]} -eq 0 ]; then
-    echo "all environment-dependent targets passed"
-    exit 0
-fi
+    run_target "aether-evals docker agent tests" \
+        cargo test -p aether-evals --test docker_agent_tests
 
-for target in "${failed_targets[@]}"; do
-    echo "FAILED: $target"
-done
-exit 1
+    echo "== summary =="
+    if [ ${#failed_targets[@]} -eq 0 ]; then
+        echo "all environment-dependent targets passed"
+        return 0
+    fi
+
+    for target in "${failed_targets[@]}"; do
+        echo "FAILED: $target"
+    done
+    return 1
+}
+
+# The log is written with `tee` rather than a process substitution because
+# `/dev/fd` is not available in every sandbox this script runs in.
+main 2>&1 | tee "$log_file"
+exit "${PIPESTATUS[0]}"
