@@ -5004,6 +5004,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "internal-readme-check"
+version = "0.1.0"
+dependencies = [
+ "aether-llm",
+ "tempfile",
+]
+
+[[package]]
 name = "intl-memoizer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

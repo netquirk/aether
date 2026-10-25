@@ -81,14 +81,18 @@ sdk-e2e *ARGS:
 
 # Ban the forbidden error-handling crates and boxed public errors (AGENTS.md)
 error-lint:
-    cargo run -q -p internal-lints
+    cargo run -q -p internal-lints --bin internal-lints
 
 # Ban the fixed wall-clock waits AGENTS.md forbids in tests
 wait-lint:
     cargo run -q -p internal-lints --bin wait-lint
 
+# Check that the README names only providers the harness registers
+readme-check:
+    cargo run -q -p internal-readme-check
+
 # Run all CI checks
-ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint
+ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test

@@ -1,0 +1,24 @@
+[package]
+name = "internal-readme-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The CI check that keeps the README's provider list in step with the providers the harness registers"
+license = "MIT"
+repository = "https://github.com/contextbridge/aether"
+
+[package.metadata.dist]
+dist = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "readme-check"
+path = "src/main.rs"
+
+[dependencies]
+llm = { package = "aether-llm", path = "../llm", features = ["bedrock", "codex"], version = "0.9.4" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

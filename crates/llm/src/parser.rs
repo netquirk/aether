@@ -118,6 +118,15 @@ impl ModelProviderParser {
         self
     }
 
+    /// The provider names registered in this parser, sorted.
+    ///
+    /// A name is the one a user writes in a `provider:model` string, e.g. `azure-foundry`.
+    pub fn registered_providers(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.factories.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
     /// Create a provider from a typed `LlmModel`
     pub async fn create_provider(&self, model: &LlmModel) -> Result<Box<dyn StreamingModelProvider>> {
         let key = model.provider();
