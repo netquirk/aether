@@ -2028,6 +2028,9 @@ mod tests {
         fn snapshot(&self) -> Vec<u8> {
             self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
         }
+        fn clear(&self) {
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        }
     }
     impl std::io::Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2212,34 +2215,32 @@ mod tests {
     // TASK-26-111: the headless CLI emits a one-line `info!("heartbeat: ...")`
     // record at the configured interval while an agent turn is in flight.
     //
-    // The integration tests below drive `stream_output` directly with a
-    // synthetic event stream so the deadline race, the per-event bookkeeping,
-    // and the `tracing` subscriber all converge in one test. A
-    // `SharedWriter`-backed subscriber is installed via `set_default` so
-    // every `info!` the loop emits lands on the test's `Vec<u8>`; a sentinel
-    // `info!` pins the non-empty buffer requirement (the deliverable fires
-    // conditionally on `now >= next_beat`, so a regression that leaves the
-    // watch unarmed would otherwise produce an empty buffer that the
-    // negative assertions would trivially pass). Paired positive/negative
-    // cases prove the line is only emitted (i) at the configured cadence
-    // while a turn is in flight, and (ii) is absent when the watch is
-    // disabled (`None` / zero) or when the turn ends before the first
-    // interval.
+    // The tests below drive `stream_output` directly with a synthetic event
+    // stream, so the deadline race, the per-event bookkeeping, and the
+    // `tracing` subscriber converge in one test. A `SharedWriter`-backed
+    // subscriber is installed via `set_default` so every `info!` the loop
+    // emits lands on the test's `Vec<u8>`; a sentinel `info!` pins the
+    // non-empty buffer requirement, so a regression that leaves the watch
+    // unarmed cannot pass the negative assertions trivially. Paired cases
+    // prove the line is emitted only at the configured cadence while a turn
+    // is in flight, and absent when the watch is disabled (`None` / zero) or
+    // the turn ends before the first interval.
     // -----------------------------------------------------------------------
 
     /// Drive `stream_output` against a synthetic event stream while the
     /// headless loop's `tracing::info!` records land on the test's
-    /// `SharedWriter`. Used by the TASK-26-111 tests below; the
-    /// `intermediate` future is `join!`-ed alongside the loop so the test
-    /// can either send more events after some sleep (to keep the turn in
-    /// flight long enough to fire a heartbeat) or finish the turn
-    /// immediately (the negative path).
+    /// `SharedWriter`. The `intermediate` future is `join!`-ed alongside the
+    /// loop so the test can keep a turn in flight long enough to fire a
+    /// heartbeat, or finish the turn immediately (the negative path).
     ///
     /// Both the loop and the driver run on tokio's virtual clock
-    /// (`start_paused = true`): the heartbeat watch measures on the
-    /// runtime clock, so the paused clock advances the watch's deadline
-    /// without any real-time wait, and the test ends as soon as the
-    /// runtime has no work left to do.
+    /// (`start_paused = true`): the heartbeat watch measures on the runtime
+    /// clock, so the paused clock advances the watch's deadline without any
+    /// real-time wait. A driver that announces a turn must yield once right
+    /// after the `TurnEvent::Started` send: the yield is a scheduler
+    /// hand-off (it puts no time on the clock) that lets the loop observe
+    /// the turn and arm the heartbeat watch before the paused clock
+    /// auto-advances to the next pending timer.
     async fn capture_heartbeat_log<F, Fut>(heartbeat_interval: Option<Duration>, intermediate: F) -> String
     where
         F: FnOnce(mpsc::Sender<AgentEvent>) -> Fut,
@@ -2249,11 +2250,9 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let writer = SharedWriter::new();
-        // `info` is the level the deliverable uses (the heartbeat is a
-        // log record, not a warning) and matches the default
-        // `--log-level info` callers will run with. Lower-bound filter so
-        // a regression that accidentally emits at `warn`/`error` is still
-        // captured.
+        // `info` is the level the deliverable uses (the heartbeat is a log
+        // record, not a warning) and matches the default `--log-level info`
+        // callers run with.
         let filter = tracing_subscriber::filter::EnvFilter::new("info");
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(writer.clone())
@@ -2264,46 +2263,55 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
+        // Pin `tracing`'s process-wide interest cache for the heartbeat
+        // record before the scenario runs.
+        //
+        // `tracing` caches one `Interest` per callsite, process-wide, the
+        // first time the callsite is used — computed from the subscriber
+        // current on *that* thread. The heartbeat record is emitted only
+        // by `HeartbeatWatch::beat_if_due`, so a test that drives the
+        // watch with no subscriber installed (the unit tests in
+        // `crate::heartbeat`) can register the callsite as `never`; from
+        // then on every heartbeat record is dropped before it reaches any
+        // subscriber and the capture below misses the line. Beat once
+        // here, with this test's subscriber current, so the callsite is
+        // registered as enabled; the rebuild that follows repairs the
+        // cache if another thread had already registered it as `never`.
+        let mut warmup = HeartbeatWatch::new(Some(Duration::from_millis(1)));
+        let warmup_now = tokio::time::Instant::now();
+        warmup.observe(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }), warmup_now);
+        warmup.beat_if_due(warmup_now + Duration::from_millis(1));
+        writer.clear(); // the warm-up beat is not part of the scenario
+        tracing::callsite::rebuild_interest_cache();
+
         let (tx, rx) = mpsc::channel(8);
-        // Sentinel so the buffer is non-vacuously non-empty: every test
-        // asserts the absence or presence of a specific line, and a buffer
-        // the subscriber failed to populate would let both kinds of
-        // assertion pass. The probe line itself is grep-friendly enough
-        // that it never shadows the deliverable's `heartbeat:` prefix.
+        // Sentinel so the buffer is non-vacuously non-empty: a buffer the
+        // subscriber failed to populate would let both kinds of assertion
+        // pass. The probe never shadows the `heartbeat:` prefix.
         tracing::info!("TASK-26-111 probe");
 
         // Hand the only sender to the driver, then drop our copy so the
-        // channel actually closes when the driver completes — otherwise
-        // `stream_output` blocks on `rx.recv()` forever once the events
-        // are drained, and the join never resolves. The driver owns the
-        // turn events, so a driver that sends no `TurnEvent::Started`
-        // leaves the heartbeat watch unarmed.
+        // channel closes when the driver completes — otherwise
+        // `stream_output` blocks on `rx.recv()` forever.
         let driver_tx = tx.clone();
         drop(tx);
         let driver = intermediate(driver_tx);
 
-        // Run the loop and the driver concurrently. Awaiting
-        // `stream_output` on its own would never schedule the driver
-        // future, so the loop would block forever on a channel that
-        // nothing ever closes — exactly the failure mode the heartbeat
-        // tests guard against.
+        // Run the loop and the driver concurrently: awaiting `stream_output`
+        // alone would never schedule the driver.
         let (stream_result, _driver_done) = tokio::join!(
             stream_output(
                 rx,
                 OutputFormat::Text,
                 // Filter out everything so the only line emitted under the
-                // filter is the heartbeat. The deliverable must still
-                // land even with the filter set (it is `tracing::info!`,
-                // not a CLI event), so a regression that funnels the
-                // heartbeat through `print_message` would show up as an
-                // empty `heartbeat:` match.
+                // filter is the heartbeat; it must still land (it is
+                // `tracing::info!`, not a CLI event).
                 &[],
                 Instant::now(),
                 None,
                 heartbeat_interval,
                 // `quiet = true` keeps the live progress bytes off the
-                // captured `Vec<u8>` so the assertions only see the
-                // `tracing::info!` records.
+                // captured `Vec<u8>`, so assertions see only the records.
                 true,
                 io::sink(),
                 None,
@@ -2318,23 +2326,21 @@ mod tests {
     }
 
     /// TASK-26-111: with a configured interval and a turn that is still in
-    /// flight long enough to cross the deadline, `stream_output` emits
-    /// one `info!("heartbeat: agent turn still in flight")` line per
-    /// interval. The driver future sleeps `5 * interval` and then sends
-    /// `TurnEvent::Ended` so the run completes after several beats have
-    /// fired. The captured log must contain at least one heartbeat line;
-    /// the lower bound (a `contains` check, not a count) lets the test
-    /// run without coupling to the exact number of beats the loop
-    /// manages to fire, while still pinning the headline guarantee.
+    /// flight long enough to cross the deadline, `stream_output` emits one
+    /// `info!("heartbeat: agent turn still in flight")` line per interval.
+    /// The driver sleeps `5 * interval` before ending the turn, so several
+    /// beats have fired; the captured log must contain at least one.
     #[tokio::test(start_paused = true)]
     async fn stream_output_emits_heartbeat_while_turn_in_flight() {
         let interval = Duration::from_millis(40);
         let log = capture_heartbeat_log(Some(interval), |tx| async move {
             tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
-            // Five intervals: the loop should have plenty of beats to
-            // log at this point. The sleep runs on the paused clock,
-            // which advances to the next pending timer when the runtime
-            // is idle, so no real time passes.
+            // Hand the turn to the loop before the clock moves (see
+            // `capture_heartbeat_log`).
+            tokio::task::yield_now().await;
+            // Five intervals: plenty of beats to log. The sleep runs on the
+            // paused clock, which advances to the next pending timer when
+            // the runtime is idle, so no real time passes.
             tokio::time::sleep(interval * 5).await;
             tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
                 .await
@@ -2342,17 +2348,14 @@ mod tests {
         })
         .await;
 
-        // Non-empty guard: a regression in the subscriber wiring would
-        // produce an empty buffer and trivially pass the negative
-        // assertion below.
+        // Non-empty guard: a subscriber-wiring regression would produce an
+        // empty buffer and trivially pass the assertion below.
         assert!(
             !log.is_empty(),
             "the subscriber must have captured at least one line; got an empty buffer (subscriber isolation is broken): {log:?}"
         );
-        // Pin the deliverable: the canonical `heartbeat:` prefix the
-        // TASK-26-111 spec calls out, named exactly so a regression in
-        // the message body shows up as a literal failure rather than a
-        // silently-passing assertion.
+        // Pin the deliverable: the canonical `heartbeat:` prefix, named
+        // exactly so a regression in the message body fails loudly.
         assert!(
             log.contains(crate::heartbeat::HEARTBEAT_MESSAGE),
             "the run log must contain at least one `heartbeat: agent turn still in flight` line while the turn is in flight; got:\n{log}"
@@ -2363,19 +2366,18 @@ mod tests {
         assert!(log.contains("TASK-26-111 probe"), "the sentinel probe line must remain in the log; got:\n{log}");
     }
 
-    /// Negative path (TASK-26-111): when the heartbeat interval is `None`
-    /// (the `run.heartbeatSeconds = 0` opt-out), the watch is disabled and
-    /// no heartbeat line is emitted even if a turn is in flight long
-    /// enough to cross many intervals. The sentinel still lands so the
-    /// buffer is non-vacuously non-empty.
+    /// Negative path (TASK-26-111): with the interval `None` (the
+    /// `run.heartbeatSeconds = 0` opt-out) the watch is disabled, so no
+    /// heartbeat line is emitted however long the turn stays in flight.
     #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_interval_is_none() {
         let log = capture_heartbeat_log(None, |tx| async move {
             tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
+            // Yield so the loop observes the turn before the clock moves.
+            tokio::task::yield_now().await;
             // Well past any sane interval; with `None` the watch is
             // disabled regardless of duration, but the loop must still
-            // see this sleep to keep the test from finishing
-            // instantaneously.
+            // see this sleep to keep the test from finishing at once.
             tokio::time::sleep(Duration::from_millis(100)).await;
             tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
                 .await
@@ -2391,17 +2393,16 @@ mod tests {
     }
 
     /// Negative path (TASK-26-111): when the turn ends before the first
-    /// interval passes, the heartbeat is never armed past its first
-    /// tick and no line is emitted. The watch's `Ended` arm clears
-    /// `next_beat` so the `await_with_deadlines` race falls back to a
-    /// plain `recv()` for the rest of the run.
+    /// interval passes, the watch is disarmed by the `Ended` event and no
+    /// line is emitted.
     #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_turn_ends_before_first_interval() {
         let interval = Duration::from_millis(40);
         let log = capture_heartbeat_log(Some(interval), |tx| async move {
             tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
-            // Well below the first tick so the watch never gets a
-            // chance to fire.
+            // Yield so the loop observes the turn before the clock moves.
+            tokio::task::yield_now().await;
+            // Well below the first tick, so the watch never fires.
             tokio::time::sleep(interval / 4).await;
             tx.send(AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed }))
                 .await
@@ -2416,12 +2417,9 @@ mod tests {
         );
     }
 
-    /// Negative path (TASK-26-111): when no turn is ever started (the
-    /// run delivers nothing the watch cares about), the heartbeat is
-    /// never armed and no line is emitted regardless of how long the
-    /// loop sleeps. Pairs with the "turn ends before first interval"
-    /// negative above so a regression that arms the watch on the wrong
-    /// event surfaces as a hard failure.
+    /// Negative path (TASK-26-111): when no turn is ever started the watch
+    /// is never armed and no line is emitted, however long the loop
+    /// sleeps. Pairs with the negative above.
     #[tokio::test(start_paused = true)]
     async fn stream_output_does_not_emit_heartbeat_when_no_turn_starts() {
         let log = capture_heartbeat_log(Some(Duration::from_millis(40)), |tx| async move {
@@ -2441,11 +2439,9 @@ mod tests {
         );
     }
 
-    /// TASK-26-111 termination: a short interval still allows the loop
-    /// to break on the `turn_ended` event rather than the deadline
-    /// branch. Mirrors `stream_output_terminates_with_stall_threshold_configured`
-    /// so the heartbeat path runs through the same exit semantics the
-    /// other two watches already pass.
+    /// TASK-26-111 termination: a short interval still lets the loop break
+    /// on the `turn_ended` event rather than the deadline branch, so the
+    /// heartbeat path keeps the exit semantics the other watches have.
     #[tokio::test]
     async fn stream_output_terminates_with_heartbeat_configured() {
         let (tx, rx) = mpsc::channel(4);
