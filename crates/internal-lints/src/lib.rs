@@ -10,7 +10,7 @@
 //!   which reports the wall-clock waits in the test functions of the workspace.
 //! - [`scan_workspace_private`] and the types around it are the private-item lint
 //!   (`just private-lint`), which reports the tests that reach a private item of the crate under
-//!   test.
+//!   test, be it in a call, in a field access or in the `use` declaration that imports it.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -18,6 +18,10 @@ fn public_fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-crate")
 }
 
+fn importing_fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/importing-crate")
+}
+
 fn lint() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_private-lint"));
     command.current_dir(repo_root());
@@ -110,6 +114,49 @@ fn integration_test_reaching_a_private_item_is_reported() {
     assert_eq!(finding.kind, PrivateItemKind::Function);
     assert!(finding.path.ends_with("tests/reaches_private.rs"), "the finding must name the file: {:?}", finding.path);
     assert_eq!(report.tests_flagged, 4, "the fixture holds four tests the lint reports");
+}
+
+#[test]
+fn integration_test_importing_a_private_item_is_reported() {
+    let report = scan_workspace_private(&importing_fixture_root());
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.test == "imports_the_private_function")
+        .expect("the import of the private item is reported");
+    assert_eq!(finding.kind, PrivateItemKind::Function);
+    assert_eq!(finding.item, "private_helper");
+    assert!(finding.path.ends_with("tests/imports_private.rs"), "the finding must name the file: {:?}", finding.path);
+    let expected = line_of(
+        &importing_fixture_root().join("tests/imports_private.rs"),
+        "use importing_crate_fixture::private_helper;",
+    );
+    assert_eq!(finding.line, expected, "the finding must name the line of the import");
+    assert!(
+        finding.detail.contains("use importing_crate_fixture::private_helper;"),
+        "the finding must quote the import: {}",
+        finding.detail
+    );
+}
+
+#[test]
+fn unit_test_importing_a_private_item_of_the_crate_root_is_reported() {
+    let report = scan_workspace_private(&importing_fixture_root());
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.test == "imports_the_private_function_from_inside")
+        .expect("the import of the private item is reported");
+    assert_eq!(finding.kind, PrivateItemKind::Function);
+    assert_eq!(finding.item, "private_helper");
+    assert!(finding.path.ends_with("src/lib.rs"), "the finding must name the file: {:?}", finding.path);
+    let expected = line_of(&importing_fixture_root().join("src/lib.rs"), "use crate::private_helper;");
+    assert_eq!(finding.line, expected, "the finding must name the line of the import");
+    assert!(
+        finding.detail.contains("use crate::private_helper;"),
+        "the finding must quote the import: {}",
+        finding.detail
+    );
 }
 
 #[test]

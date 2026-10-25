@@ -5,6 +5,10 @@
 //! workspace that reaches a private item of the crate under test: a function, a method, a field
 //! or a type that a user of the crate cannot see.
 //!
+//! A reach is a reach in every form: the call, the method call, the field access, the struct
+//! literal and the `use` declaration that imports the item. An import reaches the item it names,
+//! even when the test never calls it.
+//!
 //! The scan is syntactic. It reads files, runs nothing, and needs no network, no credential, no
 //! model provider and no deployed service.
 //!
@@ -74,7 +78,7 @@ pub struct PrivateFinding {
     pub item: String,
     /// The module of the crate under test that declares the item.
     pub module: String,
-    /// The reach as it was written, for example `private_helper()`.
+    /// The reach as it was written, for example `private_helper()` or `use my_crate::private_helper;`.
     pub detail: String,
 }
 
@@ -277,6 +281,7 @@ fn scan_unit_tests(index: &CrateIndex, report: &mut PrivateReport) {
                 findings: Vec::new(),
                 locals: collect_locals(&test.body),
             };
+            visitor.check_imports();
             visitor.visit_block(&test.body);
             if !visitor.findings.is_empty() {
                 report.tests_flagged += 1;
@@ -314,6 +319,7 @@ fn scan_integration_tests(library: &CrateIndex, file: &Path, report: &mut Privat
                 findings: Vec::new(),
                 locals: collect_locals(&test.body),
             };
+            visitor.check_imports();
             visitor.visit_block(&test.body);
             if !visitor.findings.is_empty() {
                 report.tests_flagged += 1;

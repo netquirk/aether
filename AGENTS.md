@@ -47,7 +47,7 @@ Today `prairie deploy check` prints `OFF no .prairie/deploy.sh`: aether declares
 5. All tests must test _only_ the public API. Never write tests that test a private method as that couples the tests to implementation details and makes the code harder to refactor.
 6. Tests should be easy to write and easy to read, meaning they aren't verbose. Use the test builder pattern (see: https://jmmv.dev/2020/12/builder-pattern-for-tests.html). Prefer using and extending existing builders vs creating new bespoke ones.
 7. `just wait-lint` enforces rule 4: it scans every test function of the workspace and fails naming the file, the test function and the fixed wait. A test that waits on a fake clock or drives a fake provider is not reported.
-8. `just private-lint` enforces rule 5: it scans every test function of the workspace and fails naming the file, the line and the private item of the crate under test the test reaches. A unit test may reach the private items of the module it is written in, but the private items of the crate root are the internals of the whole crate and no test reaches them.
+8. `just private-lint` enforces rule 5: it scans every test function of the workspace and fails naming the file, the line and the private item of the crate under test the test reaches. The reach is a reach in every form: the call, the method call, the field access, the struct literal and the `use` declaration that imports the private item. A unit test may reach the private items of the module it is written in, but the private items of the crate root are the internals of the whole crate and no test reaches them.
 
 ### Error handling
 

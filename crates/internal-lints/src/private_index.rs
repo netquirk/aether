@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use syn::{Expr, Fields, ImplItem, Item as SynItem, Type, Visibility};
+use proc_macro2::Span;
+use syn::{Expr, Fields, ImplItem, Item as SynItem, Type, Visibility, spanned::Spanned};
 
 /// The visibility of an item, as the lint sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +85,14 @@ pub(crate) struct TypeItem {
 pub(crate) struct Import {
     /// The name the import binds, empty for a glob import.
     pub(crate) alias: String,
-    /// The path the import names, as its segments.
+    /// The path the import names, as its segments: the whole path of the item it imports.
+    ///
+    /// A glob import names the module it binds every item of, so its path ends there.
     pub(crate) path: Vec<String>,
     /// Whether the import binds every item of the path, as `use path::*` does.
     pub(crate) glob: bool,
+    /// The span of the `use` declaration the import belongs to.
+    pub(crate) span: Span,
 }
 
 /// One test function the index read.
@@ -228,10 +233,8 @@ impl CrateIndex {
                     self.modules[module].constants.push(Item { name: item.ident.to_string(), visibility });
                 }
                 SynItem::Use(item) => {
-                    let mut imports = Vec::new();
-                    collect_use(&item.tree, &mut Vec::new(), &mut imports);
-                    for (alias, path, glob) in imports {
-                        self.modules[module].imports.push(Import { alias, path, glob });
+                    for import in imports_of(item) {
+                        self.modules[module].imports.push(import);
                     }
                 }
                 SynItem::Struct(item) => {
@@ -363,6 +366,14 @@ fn type_name(ty: &Type) -> String {
 }
 
 /// The imports a `use` declaration binds, with the path each one names.
+pub(crate) fn imports_of(item: &syn::ItemUse) -> Vec<Import> {
+    let mut collected = Vec::new();
+    collect_use(&item.tree, &mut Vec::new(), &mut collected);
+    let span = item.span();
+    collected.into_iter().map(|(alias, path, glob)| Import { alias, path, glob, span }).collect()
+}
+
+/// The imports a `use` declaration binds, with the path each one names.
 fn collect_use(tree: &syn::UseTree, prefix: &mut Vec<String>, imports: &mut Vec<(String, Vec<String>, bool)>) {
     match tree {
         syn::UseTree::Path(use_path) => {
@@ -370,7 +381,11 @@ fn collect_use(tree: &syn::UseTree, prefix: &mut Vec<String>, imports: &mut Vec<
             collect_use(&use_path.tree, prefix, imports);
             prefix.pop();
         }
-        syn::UseTree::Name(name) => imports.push((name.ident.to_string(), prefix.clone(), false)),
+        syn::UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            path.push(name.ident.to_string());
+            imports.push((name.ident.to_string(), path, false));
+        }
         syn::UseTree::Rename(rename) => {
             let mut path = prefix.clone();
             path.push(rename.ident.to_string());

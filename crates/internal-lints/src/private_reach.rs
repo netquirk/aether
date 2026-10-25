@@ -12,7 +12,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Expr, ExprCall, ExprField, ExprMethodCall, ExprStruct, Macro, Pat, Path as SynPath, Stmt, Type};
 
-use crate::private_index::{CrateIndex, Import, Item, ItemVisibility};
+use crate::private_index::{CrateIndex, Import, Item, ItemVisibility, imports_of};
 use crate::private_macro;
 use crate::private_scan::{PrivateFinding, PrivateItemKind};
 /// Where an item a path names comes from.
@@ -383,6 +383,39 @@ impl ReachVisitor<'_> {
         }
     }
 
+    /// Record the reach of every import of the module the test lives in.
+    ///
+    /// An import is a reach of the item it names: a test that imports a private item of the crate
+    /// under test reaches it, whether the test calls it or not.
+    pub(crate) fn check_imports(&mut self) {
+        let imports = self.scope.imports.clone();
+        for import in &imports {
+            self.check_import(import);
+        }
+    }
+
+    /// Record the reach of one import, when it names an item the test may not reach.
+    fn check_import(&mut self, import: &Import) {
+        if import.glob {
+            return;
+        }
+        let Some(resolved) = self.resolve(&import.path) else {
+            return;
+        };
+        if self.visible(&resolved) {
+            return;
+        }
+        let finding = self.finding(&resolved, import.span);
+        self.push_finding(finding);
+    }
+
+    /// Record the reach of an import the test writes inside its own body.
+    fn check_local_import(&mut self, node: &syn::ItemUse) {
+        for import in imports_of(node) {
+            self.check_import(&import);
+        }
+    }
+
     /// The finding a reach stands for.
     fn finding(&self, resolved: &Resolved, span: Span) -> PrivateFinding {
         let start = span.start();
@@ -433,6 +466,11 @@ impl<'ast> Visit<'ast> for ReachVisitor<'_> {
     fn visit_macro(&mut self, node: &'ast Macro) {
         self.check_macro(node);
         syn::visit::visit_macro(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        self.check_local_import(node);
+        syn::visit::visit_item_use(self, node);
     }
 }
 

@@ -47,6 +47,10 @@ test that the test reaches:
 - a private type,
 - a private constant.
 
+A reach is a reach, whatever form it takes: the lint reports the call, the method call, the field
+access, the struct literal and the `use` declaration that imports the private item. A test that
+writes `use my_crate::private_helper;` reaches the private helper, even when it never calls it.
+
 A unit test may reach the private items of the module it is written in: those are the internals of
 the module under test. The private items of the crate root are the internals of the whole crate,
 and no test reaches them. An integration test lives outside the crate, so it may use the public API
