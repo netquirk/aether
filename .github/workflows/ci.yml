@@ -59,6 +59,8 @@ jobs:
         run: just wait-lint
       - name: README provider check
         run: just readme-check
+      - name: SDK version check
+        run: just sdk-version-check
 
   test:
     name: Test

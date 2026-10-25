@@ -91,8 +91,12 @@ wait-lint:
 readme-check:
     cargo run -q -p internal-readme-check
 
+# Check that the READMEs state the version the SDK package publishes
+sdk-version-check:
+    cargo run -q -p internal-sdk-version-check
+
 # Run all CI checks
-ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check
+ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check sdk-version-check
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test

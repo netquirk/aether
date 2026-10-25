@@ -1,0 +1,24 @@
+[package]
+name = "internal-sdk-version-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The CI check that keeps the README's SDK version in step with the version the SDK package publishes"
+license = "MIT"
+repository = "https://github.com/contextbridge/aether"
+
+[package.metadata.dist]
+dist = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sdk-version-check"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
