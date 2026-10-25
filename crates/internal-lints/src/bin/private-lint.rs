@@ -2,8 +2,9 @@
 //!
 //! `private-lint [PATH]` scans the test functions of the workspace at `PATH` (the repository root
 //! by default), prints every private item of the crate under test a test reached with the file,
-//! the test function and the offending expression, prints how many test functions it scanned and
-//! how many it flagged, and exits with a non-zero status when it found one.
+//! the test function, the module that declares the item and the offending expression, prints how
+//! many test functions it scanned and how many it flagged, and exits with a non-zero status when
+//! it found one.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -39,13 +40,14 @@ fn print_report(root: &Path, report: &PrivateReport) {
     println!("private-lint: flagged {} test functions", report.tests_flagged);
     for finding in &report.findings {
         eprintln!(
-            "private-lint: {}:{}:{}: {}: {}: {}: {}",
+            "private-lint: {}:{}:{}: {}: {}: {} in {}: {}",
             display_path(root, &finding.path),
             finding.line,
             finding.column,
             finding.test,
             finding.kind.label(),
             finding.item,
+            finding.module,
             finding.detail
         );
     }

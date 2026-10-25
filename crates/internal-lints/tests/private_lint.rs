@@ -6,20 +6,36 @@ use std::process::{Command, Output};
 
 use internal_lints::{PrivateItemKind, scan_workspace_private};
 
+/// The root of this crate: the directory that holds its `Cargo.toml`.
+///
+/// Cargo runs an integration test with the package root as the current
+/// directory. The current directory is preferred over the compile-time
+/// manifest directory, so that a checkout which is moved or removed after the
+/// test binary was built still finds the fixtures.
+fn crate_root() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let current = std::env::current_dir().unwrap_or_else(|_| manifest.clone());
+    if current.join("Cargo.toml").is_file() { current } else { manifest }
+}
+
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("the repository root")
+    crate_root().join("../..").canonicalize().expect("the repository root")
 }
 
 fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/private-crate")
+    crate_root().join("tests/fixtures/private-crate")
 }
 
 fn public_fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-crate")
+    crate_root().join("tests/fixtures/public-crate")
+}
+
+fn module_fixture_root() -> PathBuf {
+    crate_root().join("tests/fixtures/module-crate")
 }
 
 fn importing_fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/importing-crate")
+    crate_root().join("tests/fixtures/importing-crate")
 }
 
 fn lint() -> Command {
@@ -157,6 +173,30 @@ fn unit_test_importing_a_private_item_of_the_crate_root_is_reported() {
         "the finding must quote the import: {}",
         finding.detail
     );
+}
+
+#[test]
+fn the_private_items_of_the_module_a_test_is_written_in_are_not_reported() {
+    let report = scan_workspace_private(&module_fixture_root());
+    let reported: Vec<&str> = report.findings.iter().map(|finding| finding.test.as_str()).collect();
+    assert!(
+        !reported.contains(&"reaches_the_private_helper_of_the_module_it_is_written_in"),
+        "the private items of the module a test is written in are not reported: {reported:?}"
+    );
+    assert!(
+        !reported.contains(&"reaches_the_private_helper_of_the_module_it_is_nested_in"),
+        "the private items of the modules a test is nested in are not reported: {reported:?}"
+    );
+    assert!(
+        reported.contains(&"reaches_the_private_helper_of_the_crate_root"),
+        "the private items of the crate root are reported: {reported:?}"
+    );
+    assert!(
+        reported.contains(&"reaches_the_private_helper_of_a_sibling_module"),
+        "the private items of another module are reported: {reported:?}"
+    );
+    assert_eq!(report.tests_scanned, 4, "the fixture holds four test functions");
+    assert_eq!(report.tests_flagged, 2, "the lint reports two of the four");
 }
 
 #[test]

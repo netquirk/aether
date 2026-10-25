@@ -15,8 +15,9 @@
 //! The lint reads the crate under test as the compiler would:
 //!
 //! - a **unit test** lives inside the crate, so it may reach the private items of the module it
-//!   is written in: those are the internals of the module under test. The private items of the
-//!   crate root are the internals of the whole crate, and no test reaches them.
+//!   is written in and of the modules it is nested in: those are the internals of the module under
+//!   test. It may not reach the private items of the crate root, which are the internals of the
+//!   whole crate, nor the private items of another module, which are the internals of that module.
 //! - an **integration test** lives outside the crate, so it may use the public API of the crate
 //!   under test only, and may use everything it declares itself.
 use std::fs;
