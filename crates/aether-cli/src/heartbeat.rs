@@ -153,7 +153,79 @@ impl HeartbeatWatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
+
+    /// A `tracing` subscriber that keeps every callsite enabled and counts
+    /// the events it is handed.
+    ///
+    /// `tracing` caches one `Interest` per callsite, process-wide: the
+    /// interest is computed the first time the callsite is used, from the
+    /// subscriber that is current on *that* thread, and then cached for the
+    /// life of the process. With no subscriber installed, the current
+    /// dispatcher is tracing-core's `NoSubscriber`, whose
+    /// `register_callsite` answers `Interest::never()` — so a test that
+    /// emitted the heartbeat record without a subscriber registered the
+    /// heartbeat callsite as `never`, and every later heartbeat record in
+    /// the process was dropped before it reached any subscriber. That raced
+    /// with the capture test in `crate::headless::run`.
+    ///
+    /// This subscriber answers `Interest::always()` for every callsite, so
+    /// the heartbeat callsite can never be registered as `never`.
+    struct TestSubscriber {
+        /// Counts the events this subscriber is handed, for the tests that
+        /// assert a record was dispatched rather than dropped.
+        dispatched: Arc<AtomicUsize>,
+    }
+
+    impl TestSubscriber {
+        /// Install a subscriber that keeps every callsite enabled for as
+        /// long as the returned guard is alive.
+        fn install() -> tracing::subscriber::DefaultGuard {
+            Self::install_counting(Arc::new(AtomicUsize::new(0)))
+        }
+
+        /// Install a subscriber that keeps every callsite enabled and
+        /// counts the events it is handed into `dispatched`.
+        fn install_counting(dispatched: Arc<AtomicUsize>) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(TestSubscriber { dispatched })
+        }
+    }
+
+    impl tracing::Subscriber for TestSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(&self, _metadata: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            // The heartbeat record is an `info!`; hint that level so the
+            // process-wide level filter stays where the other tests put it
+            // instead of being widened by this subscriber.
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
 
     fn turn_started() -> AgentEvent {
         AgentEvent::Turn(TurnEvent::Started { content: vec![] })
@@ -163,10 +235,23 @@ mod tests {
         AgentEvent::Turn(TurnEvent::Ended { outcome: aether_core::events::TurnOutcome::Completed })
     }
 
+    /// Fire one heartbeat beat so the heartbeat record's callsite is used.
+    ///
+    /// The beat is the only place the heartbeat record is emitted, so
+    /// using it is what registers the callsite in `tracing`'s process-wide
+    /// interest cache.
+    fn fire_a_beat() {
+        let base = Instant::now();
+        let mut watch = HeartbeatWatch::new(Some(Duration::from_millis(1)));
+        watch.observe(&turn_started(), base);
+        assert!(watch.beat_if_due(base + Duration::from_millis(1)), "the beat must fire");
+    }
+
     #[test]
     fn heartbeat_message_is_grep_friendly() {
         // The exact line is grep-friendly in the run log (`heartbeat:` prefix)
         // and pinned so a regression in phrasing shows up immediately.
+        let _guard = TestSubscriber::install();
         assert!(HEARTBEAT_MESSAGE.starts_with("heartbeat:"), "heartbeat prefix missing: {HEARTBEAT_MESSAGE}");
         assert!(HEARTBEAT_MESSAGE.contains("turn"), "turn noun missing: {HEARTBEAT_MESSAGE}");
     }
@@ -175,6 +260,7 @@ mod tests {
     fn heartbeat_watch_disabled_without_interval() {
         // `None` interval (the `run.heartbeatSeconds = 0` path) must disable
         // the watch: no deadline, no beat, even with a turn in flight.
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let mut watch = HeartbeatWatch::new(None);
         assert_eq!(watch.next_deadline(), None);
@@ -187,6 +273,7 @@ mod tests {
 
     #[test]
     fn heartbeat_watch_does_not_beat_before_interval() {
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(50);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -208,6 +295,7 @@ mod tests {
         // three full intervals and assert (i) it fires once at each tick,
         // (ii) `next_deadline` advances by `interval` each time, and (iii)
         // `is_active` stays `true` because the turn never ended.
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(40);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -239,6 +327,7 @@ mod tests {
         // original `next_beat`. This pins "no silent catch-up" so a
         // regression that fired on every tick between the previous
         // deadline and `now` would surface as a test failure.
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(20);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -257,6 +346,7 @@ mod tests {
     fn heartbeat_watch_does_not_beat_before_turn_starts() {
         // No `TurnEvent::Started`: no deadline, no beat, even when the
         // interval has "passed" many times over.
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let mut watch = HeartbeatWatch::new(Some(Duration::from_millis(20)));
         assert_eq!(watch.next_deadline(), None);
@@ -265,6 +355,7 @@ mod tests {
 
     #[test]
     fn heartbeat_watch_stops_on_turn_ended() {
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(30);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -287,6 +378,7 @@ mod tests {
         // run continues to log heartbeats. The deadline re-anchors to the
         // new Started instant rather than the previous one, so a fresh
         // turn gets a fresh first beat.
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(20);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -320,6 +412,7 @@ mod tests {
 
     #[test]
     fn heartbeat_watch_ignores_unrelated_events() {
+        let _guard = TestSubscriber::install();
         let base = Instant::now();
         let interval = Duration::from_millis(50);
         let mut watch = HeartbeatWatch::new(Some(interval));
@@ -353,5 +446,48 @@ mod tests {
         );
         assert_eq!(watch.next_deadline(), Some(deadline), "unrelated events must not advance the deadline");
         assert!(!watch.is_active() || watch.next_deadline().is_some());
+    }
+
+    /// Regression test for the process-wide interest-cache poison.
+    ///
+    /// `tracing` caches one `Interest` per callsite, process-wide: the
+    /// interest is computed the first time the callsite is used, from the
+    /// subscriber that is current on that thread, and then cached for the
+    /// life of the process. A callsite first used with no subscriber
+    /// installed is registered as `Interest::never()`, and every later
+    /// record for that callsite is dropped before it reaches any
+    /// subscriber.
+    ///
+    /// The heartbeat record is emitted only by
+    /// [`HeartbeatWatch::beat_if_due`], so the unit tests in this module
+    /// used to register the heartbeat callsite as `never` — from then on
+    /// every heartbeat record in the process was dropped, which raced with
+    /// the capture test in `crate::headless::run`.
+    ///
+    /// This test pins the fix: a beat that registers the callsite on a
+    /// thread whose subscriber only keeps the callsites enabled must still
+    /// reach a subscriber that was installed earlier.
+    #[test]
+    fn heartbeat_record_reaches_a_subscriber_installed_before_the_callsite_is_used() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let _guard = TestSubscriber::install_counting(Arc::clone(&dispatched));
+
+        // Register the heartbeat callsite on a thread that only has the
+        // keep-enabled subscriber: the registration must not poison the
+        // callsite for the rest of the process.
+        std::thread::spawn(|| {
+            let _guard = TestSubscriber::install();
+            fire_a_beat();
+        })
+        .join()
+        .expect("the beat thread must not panic");
+
+        // The record must still reach the subscriber installed above.
+        fire_a_beat();
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            1,
+            "the heartbeat record must reach the subscriber that is current when the beat fires",
+        );
     }
 }

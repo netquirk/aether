@@ -2028,9 +2028,6 @@ mod tests {
         fn snapshot(&self) -> Vec<u8> {
             self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
         }
-        fn clear(&self) {
-            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        }
     }
     impl std::io::Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2263,26 +2260,12 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Pin `tracing`'s process-wide interest cache for the heartbeat
-        // record before the scenario runs.
-        //
-        // `tracing` caches one `Interest` per callsite, process-wide, the
-        // first time the callsite is used — computed from the subscriber
-        // current on *that* thread. The heartbeat record is emitted only
-        // by `HeartbeatWatch::beat_if_due`, so a test that drives the
-        // watch with no subscriber installed (the unit tests in
-        // `crate::heartbeat`) can register the callsite as `never`; from
-        // then on every heartbeat record is dropped before it reaches any
-        // subscriber and the capture below misses the line. Beat once
-        // here, with this test's subscriber current, so the callsite is
-        // registered as enabled; the rebuild that follows repairs the
-        // cache if another thread had already registered it as `never`.
-        let mut warmup = HeartbeatWatch::new(Some(Duration::from_millis(1)));
-        let warmup_now = tokio::time::Instant::now();
-        warmup.observe(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }), warmup_now);
-        warmup.beat_if_due(warmup_now + Duration::from_millis(1));
-        writer.clear(); // the warm-up beat is not part of the scenario
-        tracing::callsite::rebuild_interest_cache();
+        // `tracing` caches one `Interest` per callsite, process-wide, from
+        // the subscriber current on the thread that first uses it. The
+        // heartbeat unit tests in `crate::heartbeat` install a subscriber
+        // before touching the callsite, so the record can never be
+        // registered as `never` for the whole process and no warm-up beat
+        // or interest-cache rebuild is needed here.
 
         let (tx, rx) = mpsc::channel(8);
         // Sentinel so the buffer is non-vacuously non-empty: a buffer the
