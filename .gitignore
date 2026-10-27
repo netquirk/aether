@@ -10,6 +10,11 @@ packages/website/src/data/aether-settings.schema.json
 packages/website/src/data/aether-eval.schema.json
 .aether-tasks/
 .aether/notes/
+# The per-working-directory run lock (`aether headless` holds an OS advisory
+# lock on it while a run is in progress). It is runtime state, not source: the
+# file is left behind on disk after every run, so tracking it would make every
+# checkout carry a stale artefact.
+**/.aether/run.lock
 plans/
 sweep.timestamp
 .astro/

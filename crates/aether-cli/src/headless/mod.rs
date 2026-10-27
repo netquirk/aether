@@ -330,7 +330,7 @@ pub struct HeadlessArgs {
     #[arg(short, long)]
     pub model: Option<String>,
 
-    /// Working directory
+    /// Working directory. An `--options-json` payload's `cwd` wins when it carries one.
     #[arg(short = 'C', long = "cwd", default_value = ".")]
     pub cwd: PathBuf,
 
@@ -480,7 +480,7 @@ pub struct HeadlessArgs {
 impl RunConfig {
     fn from_args(args: HeadlessArgs) -> Result<Self, CliError> {
         if let Some(json) = args.options_json {
-            return Self::from_options(serde_json::from_str(&json).map_err(CliError::InvalidOptionsJson)?);
+            return Self::from_options(serde_json::from_str(&json).map_err(CliError::InvalidOptionsJson)?, args.cwd);
         }
 
         let prompt = resolve_prompt(&args)?;
@@ -549,9 +549,9 @@ impl RunConfig {
         })
     }
 
-    fn from_options(options: HeadlessOptions) -> Result<Self, CliError> {
+    fn from_options(options: HeadlessOptions, cwd_flag: PathBuf) -> Result<Self, CliError> {
         let prompt = options.prompt.ok_or(CliError::NoPrompt)?;
-        let cwd = options.cwd.unwrap_or_else(|| PathBuf::from(".")).canonicalize().map_err(CliError::IoError)?;
+        let cwd = crate::working_directory::resolve_run_cwd(options.cwd, cwd_flag)?;
         // Compute the resolved settings path before `options.settings` /
         // `options.settings_file` are moved into `from_json_options` below;
         // the run-start banner prints it (TASK-27-17 / TASK-26-858). An
@@ -771,7 +771,7 @@ fn initial_selection(agent: Option<String>, model: Option<String>) -> Result<Ini
 fn print_dry_run(args: &HeadlessArgs) -> Result<(), CliError> {
     let (cwd, settings, provider_connections, selection) = if let Some(json) = args.options_json.as_deref() {
         let options: HeadlessOptions = serde_json::from_str(json).map_err(CliError::InvalidOptionsJson)?;
-        let cwd = options.cwd.unwrap_or_else(|| PathBuf::from(".")).canonicalize().map_err(CliError::IoError)?;
+        let cwd = crate::working_directory::resolve_run_cwd(options.cwd, args.cwd.clone())?;
         let settings_source = SettingsSourceArgs::from_json_options(options.settings, options.settings_file)?;
         let settings = settings_source.load_settings(&cwd)?;
         let provider_connections = ProviderConnectionOverrides::new(options.providers.unwrap_or_default());

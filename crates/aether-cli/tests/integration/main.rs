@@ -28,6 +28,7 @@ mod mcp_command;
 mod resume;
 mod retry_reporting;
 mod run_init;
+mod run_lock;
 mod run_log_elapsed;
 mod run_model_log;
 mod session_lock;

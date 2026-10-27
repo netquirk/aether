@@ -18,13 +18,33 @@
 //! matching the surface area the existing TASK-26-21 lock targets. `--dry-run`
 //! never writes to the working directory, so probing it would only produce
 //! false refusals on read-only trees the operator deliberately set up.
+//!
+//! The module also owns [`resolve_run_cwd`], the rule that decides *which*
+//! directory a run uses: the `cwd` key of an `--options-json` payload when it
+//! carries one, otherwise the `-C/--cwd` flag.
 
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::CliError;
 use crate::run_lock::LOCK_DIR;
+
+/// Resolve the working directory a run starts in.
+///
+/// Two places can name it: the `cwd` key of the `--options-json` payload and
+/// the `-C/--cwd` flag. The payload wins when it carries one; otherwise the
+/// flag decides (its default is `.`, the process's directory). The ACP
+/// command resolves its session root the same way (`resolve_session_root` in
+/// `crate::acp`), so both commands agree on what a caller asked for.
+///
+/// The result is canonicalized so every later step — the run lock, the
+/// transcript, the workspace boundary — sees one absolute spelling of the
+/// directory. A path that does not exist fails the run with a
+/// [`CliError::IoError`] before any artefact is written.
+pub(crate) fn resolve_run_cwd(payload_cwd: Option<PathBuf>, flag_cwd: PathBuf) -> Result<PathBuf, CliError> {
+    payload_cwd.unwrap_or(flag_cwd).canonicalize().map_err(CliError::IoError)
+}
 
 /// Probe that the working directory is writable.
 ///
@@ -236,5 +256,40 @@ mod tests {
             cwd_file.display()
         );
         assert!(rendered.contains("not writable"), "rendered message must announce the condition; got {rendered}");
+    }
+
+    /// The payload's `cwd` wins over the `-C/--cwd` flag, and the flag is the
+    /// fallback when the payload carries none. This is the rule the headless
+    /// `--options-json` path and the ACP path share, so a caller that names a
+    /// working directory always gets that directory.
+    #[test]
+    fn the_payload_cwd_wins_and_the_flag_is_the_fallback() {
+        let payload_dir = tempfile::tempdir().expect("tempdir");
+        let flag_dir = tempfile::tempdir().expect("tempdir");
+
+        let from_payload = resolve_run_cwd(Some(payload_dir.path().to_path_buf()), flag_dir.path().to_path_buf())
+            .expect("payload cwd");
+        assert_eq!(
+            from_payload,
+            payload_dir.path().canonicalize().expect("canonical payload dir"),
+            "the payload's cwd must win over the flag"
+        );
+
+        let from_flag = resolve_run_cwd(None, flag_dir.path().to_path_buf()).expect("flag cwd");
+        assert_eq!(
+            from_flag,
+            flag_dir.path().canonicalize().expect("canonical flag dir"),
+            "the flag must be the fallback when the payload carries no cwd"
+        );
+    }
+
+    /// A working directory that does not exist fails the run before any
+    /// artefact is written, with the underlying IO error preserved.
+    #[test]
+    fn a_missing_working_directory_fails_the_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such-directory");
+        let err = resolve_run_cwd(None, missing).expect_err("a missing directory must fail");
+        assert!(matches!(err, CliError::IoError(_)), "the run must fail with an IO error; got {err:?}");
     }
 }
