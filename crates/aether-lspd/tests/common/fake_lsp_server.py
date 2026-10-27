@@ -1,5 +1,6 @@
 import json
 import argparse
+import os
 import sys
 
 docs = {}
@@ -194,7 +195,11 @@ while True:
                 "result": {
                     "contents": {
                         "kind": "plaintext",
-                        "value": f"open_count={state['open_count']}; text={state['text']}",
+                        "value": (
+                          f"open_count={state['open_count']}; text={state['text']}; "
+                          f"rustup_toolchain={os.environ.get('RUSTUP_TOOLCHAIN', '')}; "
+                          f"env_marker={os.environ.get('AETHER_LSPD_ENV_MARKER', '')}"
+                      ),
                     }
                 },
             }

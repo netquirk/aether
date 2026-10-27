@@ -82,6 +82,12 @@ impl ProcessTransport {
         let mut process = Command::new(&resolved_command)
             .current_dir(root_path)
             .args(args)
+            // The daemon serves one workspace per server and starts each server in that
+            // workspace, so the server has to resolve its toolchain from the workspace it
+            // analyses. A `RUSTUP_TOOLCHAIN` inherited from the daemon's own environment
+            // outranks that choice and would pin every server to the toolchain of whichever
+            // process started the daemon.
+            .env_remove("RUSTUP_TOOLCHAIN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
