@@ -1,0 +1,8 @@
+production = true
+target = "host-script"
+state = ".prairie/deploy-state.sh"
+rollback = ".prairie/rollback.sh"
+[build]
+command = "set -eu; cargo build --locked --release -p aether-agent-cli --bin aether -j 4; mkdir -p bin; install -m 755 \"${CARGO_TARGET_DIR:-target}/release/aether\" bin/aether"
+artifacts = ["bin/aether"]
+timeout = "45m"

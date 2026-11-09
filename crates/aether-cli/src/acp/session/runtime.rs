@@ -139,7 +139,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             builder = builder.oauth_handler_factory(mcp_oauth_handler_factory());
         }
 
-        let runtime = builder.build(None, Some(initial_messages)).await?;
+        let (runtime, _) = builder.build_ready(initial_messages).await?;
 
         let Runtime { agent_tx, agent_rx, agent_handle, event_rx, mcp_runtime } = runtime;
         Ok(AgentRuntime::new(agent_tx, agent_rx, Some(agent_handle), event_rx, mcp_runtime))
