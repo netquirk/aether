@@ -6,3 +6,10 @@ rollback = ".prairie/rollback.sh"
 command = "set -eu; cargo build --locked --release -p aether-agent-cli --bin aether -j 4; mkdir -p bin; install -m 755 \"${CARGO_TARGET_DIR:-target}/release/aether\" bin/aether"
 artifacts = ["bin/aether"]
 timeout = "45m"
+# CLI startup and installed digest are checked by deploy.sh. This probe keeps
+# the runtime host's control plane healthy while the executable is switched.
+[[health]]
+url = "http://127.0.0.1:3100/healthz"
+status = 200
+body = "\"status\":\"ok\""
+timeout = "30s"
