@@ -192,7 +192,7 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
 
 ## TypeScript packages
 
-The `@aether-agent/sdk` package is published at version `0.7.1`.
+The `@aether-agent/sdk` package is published at version `0.7.15`.
 
 | Package | Description |
 |---------|-------------|

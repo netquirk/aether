@@ -15,7 +15,7 @@
 
 # @aether-agent/sdk
 
-The `@aether-agent/sdk` package is published at version `0.7.1`.
+The `@aether-agent/sdk` package is published at version `0.7.15`.
 
 TypeScript SDK for the [Aether](https://aether-agent.io) agent. It spawns
 `aether acp` under the hood and exposes one explicit stateful API:
