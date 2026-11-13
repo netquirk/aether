@@ -62,7 +62,10 @@ fn parse<T: Parser>(args: Vec<String>) -> Result<T, clap::Error> {
 }
 
 fn bash_environment(services: &RuntimeServices) -> BashEnvironment {
-    let environment = BashEnvironment::new().with_current_exe_dir_on_path();
+    let mut environment = BashEnvironment::new().with_current_exe_dir_on_path();
+    if let Some(timeout) = services.shell_command_timeout {
+        environment = environment.with_command_timeout(timeout);
+    }
     match &services.deferred_tools_socket {
         Some(socket) => environment.with_var(AETHER_MCP_IPC_SOCKET, socket.to_string_lossy()),
         None => environment,

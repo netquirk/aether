@@ -11,6 +11,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::workspace_boundary::WorkspaceBoundaryPolicy;
+
 pub(crate) struct RuntimeBuilder {
     cwd: PathBuf,
     spec: AgentSpec,
@@ -104,7 +106,13 @@ impl RuntimeBuilder {
             Some(provider) => AgentBuilder::from_spec_with_llm(&self.spec, &self.agent_deps, provider),
             None => AgentBuilder::from_spec(&self.spec, &self.agent_deps).await?,
         };
-        let mut builder = builder.mcp(mcp.clone()).messages(messages);
+        // Every runtime the CLI spawns installs the path-confining policy, so a
+        // file-tool call that resolves outside the working directory is
+        // refused before it reaches the MCP server.
+        let mut builder = builder
+            .mcp(mcp.clone())
+            .messages(messages)
+            .tool_policy(Arc::new(WorkspaceBoundaryPolicy::new(self.cwd.clone())));
         if let Some(last) = &self.usage_seed {
             builder = builder.resume_usage(last);
         }

@@ -11,6 +11,7 @@ use crate::core::AgentDeps;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 pub fn mcp(root_dir: impl AsRef<Path>) -> McpBuilder {
@@ -22,6 +23,10 @@ pub struct RuntimeServices {
     pub root_dir: PathBuf,
     pub agent_deps: AgentDeps,
     pub deferred_tools_socket: Option<PathBuf>,
+    /// Wall-clock ceiling applied to every shell command a run starts (the
+    /// `bash` tool of the built-in `coding` MCP server). `None` means no
+    /// ceiling, which is the pre-existing behaviour.
+    pub shell_command_timeout: Option<Duration>,
 }
 
 pub struct McpBuilder {
@@ -32,6 +37,7 @@ pub struct McpBuilder {
     vars: Vars,
     tool_filter: ToolFilter,
     elicitation: Option<ElicitationSink>,
+    shell_command_timeout: Option<Duration>,
 }
 
 pub type ServerFactoryError = Box<dyn std::error::Error + Send + Sync>;
@@ -64,6 +70,7 @@ impl McpBuilder {
             vars,
             tool_filter: ToolFilter::default(),
             elicitation: None,
+            shell_command_timeout: None,
         }
     }
 
@@ -94,6 +101,14 @@ impl McpBuilder {
         self
     }
 
+    /// Bound every shell command a run starts (the `bash` tool of the
+    /// built-in `coding` MCP server) by `timeout`. `None` keeps the
+    /// pre-existing unbounded behaviour.
+    pub fn with_shell_command_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.shell_command_timeout = timeout;
+        self
+    }
+
     pub fn register_in_memory_server(
         mut self,
         name: impl Into<String>,
@@ -118,6 +133,7 @@ impl McpBuilder {
             root_dir: self.root_dir,
             agent_deps: self.agent_deps,
             deferred_tools_socket: socket.as_ref().map(|socket| socket.path().to_path_buf()),
+            shell_command_timeout: self.shell_command_timeout,
         };
         let servers = self
             .servers

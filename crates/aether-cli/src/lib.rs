@@ -20,3 +20,4 @@ pub mod show_prompt;
 pub(crate) mod slash_commands;
 pub(crate) mod telemetry;
 pub mod workspace;
+pub(crate) mod workspace_boundary;
