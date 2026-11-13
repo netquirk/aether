@@ -292,6 +292,16 @@ mod tests {
         assert!(error.contains("providers.bedrock.inferenceProfileArn"), "{error}");
     }
 
+    #[test]
+    fn opencode_go_is_a_registered_provider() {
+        let parser = ModelProviderParser::default();
+
+        assert!(
+            parser.registered_providers().contains(&"opencode-go"),
+            "opencode-go must be registered so `opencode-go:<model>` parses"
+        );
+    }
+
     #[tokio::test]
     async fn test_parse_rejects_repeated_request_model_provider() {
         let parser = ModelProviderParser::default();

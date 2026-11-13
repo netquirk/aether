@@ -333,6 +333,16 @@ const PROVIDERS: &[ProviderConfig] = &[
     },
     ProviderConfig::standard("openai", "Openai", "openai", "OpenAI", Some("OPENAI_API_KEY")),
     ProviderConfig::standard("openrouter", "OpenRouter", "openrouter", "OpenRouter", Some("OPENROUTER_API_KEY")),
+    ProviderConfig {
+        reasoning_off: ReasoningOff::Effort,
+        ..ProviderConfig::standard(
+            "opencode-go",
+            "OpencodeGo",
+            "opencode-go",
+            "OpenCode Go",
+            Some("OPENCODE_API_KEY"),
+        )
+    },
     ProviderConfig::standard("xiaomi", "Xiaomi", "xiaomi", "Xiaomi", Some("XIAOMI_API_KEY")),
     ProviderConfig {
         extra_source_ids: &["zai-coding-plan"],

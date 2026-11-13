@@ -6,6 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
+use crate::redact::SecretRedactor;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -14,8 +16,12 @@ pub enum OutputFormat {
     Json,
 }
 
-pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent) -> io::Result<()> {
-    write_message(format, message, &mut io::stdout(), &mut io::stderr())
+pub(crate) fn print_message(
+    format: OutputFormat,
+    message: &AgentEvent,
+    redactor: &SecretRedactor,
+) -> io::Result<()> {
+    write_message(format, message, &mut io::stdout(), &mut io::stderr(), redactor)
 }
 
 pub(crate) fn write_message(
@@ -23,10 +29,14 @@ pub(crate) fn write_message(
     message: &AgentEvent,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    redactor: &SecretRedactor,
 ) -> io::Result<()> {
+    // Every line the run writes is scrubbed before it reaches the log, so a
+    // credential the model echoed back never lands in the run log (TASK-26-22).
     match format {
         OutputFormat::Text => {
             if let Some(text) = format_text(message) {
+                let text = redactor.redact(&text);
                 if matches!(message, AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { .. } })) {
                     writeln!(stderr, "{text}")?;
                 } else {
@@ -34,8 +44,14 @@ pub(crate) fn write_message(
                 }
             }
         }
-        OutputFormat::Pretty => writeln!(stdout, "{}", serde_json::to_string_pretty(message)?)?,
-        OutputFormat::Json => writeln!(stdout, "{}", serde_json::to_string(message)?)?,
+        OutputFormat::Pretty => {
+            let line = serde_json::to_string_pretty(message)?;
+            writeln!(stdout, "{}", redactor.redact(&line))?
+        }
+        OutputFormat::Json => {
+            let line = serde_json::to_string(message)?;
+            writeln!(stdout, "{}", redactor.redact(&line))?
+        }
     }
     Ok(())
 }
@@ -222,6 +238,25 @@ mod tests {
     use super::test_events::{llm_call_started, retry_scheduled, tool_progress, usage_update};
     use super::*;
     use aether_core::events::StreamState;
+
+    #[test]
+    fn write_message_redacts_secrets_before_they_reach_the_log() {
+        let secret = "sk-super-secret-value";
+        let redactor = SecretRedactor::new().with_secret(secret);
+        let event = AgentEvent::Message(MessageEvent::Text {
+            message_id: llm::MessageId::new(),
+            chunk: format!("the key is {secret}"),
+            is_complete: true,
+        });
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_message(OutputFormat::Text, &event, &mut stdout, &mut stderr, &redactor).unwrap();
+
+        let written = String::from_utf8(stdout).unwrap();
+        assert!(!written.contains(secret), "the secret must not reach the run log: {written}");
+        assert!(written.contains(crate::redact::REDACTED), "the secret must be replaced by a marker: {written}");
+    }
 
     #[test]
     fn format_text_renders_or_skips_each_event() {

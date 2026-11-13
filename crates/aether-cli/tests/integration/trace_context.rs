@@ -50,7 +50,14 @@ fn headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled() -> TestRes
 fn aether(cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aether"));
     command.args(args);
-    command.arg("--cwd").arg(cwd);
+    if args.first() == Some(&"headless") {
+        // The headless command takes the working directory as a flag.
+        command.arg("--cwd").arg(cwd);
+    } else {
+        // The ACP server has no `--cwd` flag: it runs in the process's working
+        // directory, so the child is started there instead.
+        command.current_dir(cwd);
+    }
     command
 }
 

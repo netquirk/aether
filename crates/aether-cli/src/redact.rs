@@ -98,7 +98,7 @@ impl SecretRedactor {
 
     /// Build a redactor seeded with every credential the process environment
     /// could supply at this point: each name in
-    /// [`llm::LlmModel::ALL_REQUIRED_ENV_VARS`] that is set, plus the
+    /// the catalog's provider env vars that is set, plus the
     /// `CUSTOM_API_KEY` env var. Used before any resolved `AgentSpec` is
     /// available — typically for the early `setup_tracing` install in the
     /// dry-run code path, where inline `provider_connections` overrides
@@ -109,7 +109,7 @@ impl SecretRedactor {
     /// fires regardless of the seeded list.
     pub fn from_env() -> Self {
         let mut redactor = Self::new();
-        for name in LlmModel::ALL_REQUIRED_ENV_VARS {
+        for name in required_env_vars() {
             if let Ok(value) = std::env::var(name) {
                 redactor = redactor.with_secret(value);
             }
@@ -124,7 +124,7 @@ impl SecretRedactor {
     /// plausibly pass to a provider for `spec`:
     ///
     /// - The value of every name in
-    ///   [`llm::LlmModel::ALL_REQUIRED_ENV_VARS`] that is set in the process
+    ///   the catalog's provider env vars that is set in the process
     ///   environment (matches the env-var list `sandbox.rs` already
     ///   consults), plus the `custom` provider's `CUSTOM_API_KEY`.
     /// - Each `api_key` configured inline on `spec.provider_connections`
@@ -145,13 +145,13 @@ impl SecretRedactor {
         // Provider catalog env vars. Unset vars are skipped silently; running
         // the redaction logic on a missing var would be wasted work and would
         // confuse a reader of the seeded list.
-        for name in LlmModel::ALL_REQUIRED_ENV_VARS {
+        for name in required_env_vars() {
             if let Ok(value) = std::env::var(name) {
                 redactor = redactor.with_secret(value);
             }
         }
         // `custom` provider has no catalog entry so its env var isn't in
-        // `ALL_REQUIRED_ENV_VARS`, but it's a recognised bearer for the
+        // the catalog's provider env vars, but it's a recognised bearer for the
         // inline-key path (`ProviderConnectionOverride::api_key`).
         if let Ok(value) = std::env::var("CUSTOM_API_KEY") {
             redactor = redactor.with_secret(value);
@@ -258,11 +258,23 @@ impl SecretRedactor {
     }
 }
 
+/// The provider env vars the model catalog knows about.
+///
+/// The catalog is generated from `models.dev`, so the list is derived from the
+/// models themselves instead of being hand-maintained here.
+fn required_env_vars() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> =
+        LlmModel::all().iter().filter_map(|model| model.required_env_var()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Whether `name` is one of the env vars the redactor should scrape from the
-/// process environment. Mirrors the catalog-driven list in
-/// [`crate::sandbox`] plus the `custom` provider's `CUSTOM_API_KEY`.
+/// process environment: the catalog's provider env vars plus the `custom`
+/// provider's `CUSTOM_API_KEY`.
 fn is_required_env_var(name: &str) -> bool {
-    LlmModel::ALL_REQUIRED_ENV_VARS.contains(&name) || name == "CUSTOM_API_KEY"
+    required_env_vars().contains(&name) || name == "CUSTOM_API_KEY"
 }
 
 /// Whether `header_name` should be redacted when its value is picked up from a

@@ -194,7 +194,7 @@ impl AcpState {
             .and_then(|id| self.session_store.session_cwd(id.0.as_ref()))
             .unwrap_or_else(|| self.cwd.clone());
         let remote_meta = Some(RemoteServerInfo { cwd, session_id }.to_meta());
-        Ok(InitializeResponse::new(ProtocolVersion::V2, Implementation::new("Aether", "0.1.0"))
+        Ok(InitializeResponse::new(ProtocolVersion::V2, Implementation::new("Aether", env!("CARGO_PKG_VERSION")))
             .meta(remote_meta)
             .capabilities(AgentCapabilities::new().session(session_capabilities))
             .auth_methods(auth_methods))

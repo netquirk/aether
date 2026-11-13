@@ -14,6 +14,8 @@ use crate::telemetry::build_telemetry_runtime;
 use super::{CliEventKind, RunConfig};
 use crate::error::CliError;
 use crate::output::{OutputFormat, write_message};
+use crate::redact::SecretRedactor;
+use crate::run_lock::RunLock;
 use crate::runtime::RuntimeBuilder;
 use crate::slash_commands::expand_slash_command_text;
 
@@ -33,6 +35,11 @@ impl HeadlessRunner {
     }
 
     pub async fn run(self, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<ExitCode, CliError> {
+        // One run per working directory: the lock keeps two runs from racing
+        // on the artefacts they write. The lock file itself stays on disk (a
+        // zero-byte file after release); only the open handle holds the lock,
+        // so a stale file never turns the next run away.
+        let _lock = RunLock::acquire(&self.config.cwd)?;
         let telemetry = build_telemetry_runtime(self.config.telemetry.as_ref(), self.config.trace_context.clone())?;
         let result = run_agent(self.config, self.provider, telemetry.clone(), stdout, stderr).await;
         if let Some(telemetry) = telemetry {
@@ -59,6 +66,10 @@ async fn run_agent(
         spec.prompts.push(Prompt::text(&system_prompt));
     }
 
+    // Seed the redactor with every credential this run could hand to a
+    // provider, so a value the model echoes back never lands in the run log.
+    let redactor = SecretRedactor::from_env_and_spec(&spec);
+
     let registry = config.agent_catalog.registry().clone();
     let deps =
         AgentDeps::new(config.oauth_credential_store, telemetry.as_ref().map(|runtime| runtime.observer_factory()))
@@ -76,7 +87,7 @@ async fn run_agent(
     let prompt = expand_slash_command_text(&agent.mcp, config.prompt).await;
 
     let outcome = match agent.agent_tx.send(Command::text(&prompt)).await {
-        Ok(()) => Ok(stream_output(&mut agent.agent_rx, config.output, &config.events, stdout, stderr).await),
+        Ok(()) => Ok(stream_output(&mut agent.agent_rx, config.output, &config.events, stdout, stderr, &redactor).await),
         Err(_) => Err(CliError::AgentStopped),
     };
 
@@ -91,11 +102,12 @@ async fn stream_output(
     events: &[CliEventKind],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    redactor: &SecretRedactor,
 ) -> ExitCode {
     loop {
         let msg = recv_agent_event(rx).await;
         if should_emit(&msg, events)
-            && let Err(error) = write_message(format, &msg, stdout, stderr)
+            && let Err(error) = write_message(format, &msg, stdout, stderr, redactor)
         {
             let _ = writeln!(stderr, "Failed to write headless event: {error}");
             return ExitCode::FAILURE;

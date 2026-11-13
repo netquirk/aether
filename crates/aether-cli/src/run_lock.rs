@@ -172,11 +172,11 @@ mod tests {
     fn releases_the_lock_when_the_run_fails() {
         fn failing_run(cwd: &Path) -> Result<(), CliError> {
             let _lock = RunLock::acquire(cwd)?;
-            Err(CliError::AgentError("boom".into()))
+            Err(CliError::AgentStopped)
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let err = failing_run(dir.path()).expect_err("function must fail");
-        assert!(matches!(err, CliError::AgentError(_)), "the failure surfaces unchanged: {err:?}");
+        assert!(matches!(err, CliError::AgentStopped), "the failure surfaces unchanged: {err:?}");
         // The `Drop` on `_lock` ran on the early `Err` return; a follow-up
         // acquire must succeed.
         RunLock::acquire(dir.path()).expect("follow-up acquire after Err return must succeed");

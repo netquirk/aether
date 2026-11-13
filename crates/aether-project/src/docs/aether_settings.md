@@ -103,35 +103,20 @@ attribute mapping.
 
 For an OTLP backend with exact signal URLs, set `otlp.tracesEndpoint` and `otlp.metricsEndpoint`. Aether sends each configured signal to its matching URL unchanged; an unconfigured signal uses the `/v1/traces` or `/v1/metrics` URL derived from `otlp.endpoint`.
 
-## Run-time warnings
+## Run-time settings
 
-The top-level `run` block tunes the headless CLI's behaviour during a single
-run. Every field is optional; an unset field disables the corresponding
-behaviour so an absent `run` block leaves the existing run shape unchanged.
+The top-level `run` block tunes the behaviour of a single run. Every field is
+optional; an unset field disables the corresponding behaviour so an absent `run`
+block leaves the run shape unchanged.
 
-`providerStallWarnSeconds` sets how long a provider call may wait before the
-CLI prints a one-line warning naming the elapsed wait. The warning fires
-once per stalled call while the turn is still live so a hung turn is
-visible instead of silent; `0` or omitted disables the warning.
-
-`heartbeatSeconds` sets the interval (in seconds) between heartbeat log
-lines the CLI emits while an agent turn is in flight. Defaults to 30 s so
-a hung turn is visible in the run log out of the box; `0` disables the
-heartbeat. The line fires once per interval while a turn is active, so a
-turn that completes before the first tick logs nothing.
-
-`shellCommandTimeoutSeconds` bounds a tool-spawned shell command (the
-`bash` tool of the built-in `coding` MCP server). When a command runs past
-the configured number of seconds it is killed and the run continues. Omit
-the key (or set it to `0`) to disable the limit so an unbounded command
-is allowed. The limit is independent of the whole-run `--timeout` flag and
-of the `providerStallWarnSeconds` warning.
+`shellCommandTimeoutSeconds` bounds a tool-spawned shell command (the `bash`
+tool of the built-in `coding` MCP server). When a command runs past the
+configured number of seconds it is killed and the run continues. Omit the key
+(or set it to `0`) to disable the limit so an unbounded command is allowed.
 
 ```json
 {
   "run": {
-    "providerStallWarnSeconds": 30,
-    "heartbeatSeconds": 30,
     "shellCommandTimeoutSeconds": 30
   },
   "agents": [
@@ -144,85 +129,3 @@ of the `providerStallWarnSeconds` warning.
   ]
 }
 ```
-
-## Tool output cap
-
-Aether caps the byte length of every tool result before it reaches the model. The
-cap keeps the head and tail of the original text, writes the full output to a
-content-hashed file on disk, and embeds a marker in the model-visible text
-naming the file so the model can read it back in ranges. The on-disk filename
-is a hex content hash, so the same `(tool, cap)` pair produces byte-identical
-text on every call — including across runs — which keeps prompt caches warm.
-
-The cap is 16 KiB by default. Configure it with the top-level `toolOutput`
-block; agents can override it per-agent with their own `toolOutput` field.
-Two environment variables always win over the settings file:
-
-- `AETHER_TOOL_OUTPUT_MAX_BYTES` overrides `maxBytes`. `0` disables the cap.
-- `PRAIRIE_TOOL_OUTPUT_DIR` overrides `outputDir`.
-
-A project that caps tool results at 32 KiB and writes full outputs to
-`/var/log/aether`:
-
-```json
-{
-  "toolOutput": {
-    "maxBytes": 32768,
-    "outputDir": "/var/log/aether"
-  },
-  "agents": [
-    {
-      "name": "Build",
-      "description": "Builds features and fixes bugs",
-      "model": "anthropic:claude-sonnet-4-5-20250929",
-      "userInvocable": true
-    }
-  ]
-}
-```
-
-An agent that disables the cap while leaving the top-level default in place:
-
-```json
-{
-  "toolOutput": { "maxBytes": 32768 },
-  "agents": [
-    {
-      "name": "Audit",
-      "description": "Inspects verbose CI logs that must reach the model verbatim",
-      "model": "anthropic:claude-sonnet-4-5-20250929",
-      "userInvocable": true,
-      "toolOutput": { "maxBytes": 0 }
-    }
-  ]
-}
-```
-
-## Shell environment for run commands
-
-Every shell command a run starts (the `bash` tool of the built-in `coding`
-MCP server) inherits the variables from this list, merged over the process
-environment of the running Aether process. A configured key shadows whatever
-the OS process would otherwise have seen — useful for pinning `PATH`,
-injecting a project-local SDK directory, or tagging runs with a stable
-identifier. The internal `AETHER_MCP_IPC_SOCKET` gateway variable is always
-written by the MCP runtime after this map, so config-supplied values cannot
-spoof the gateway socket.
-
-```json
-{
-  "shellEnvironment": {
-    "PATH": "/opt/build-tools/bin:${PATH}",
-    "BUILD_TAG": "staging"
-  },
-  "agents": [
-    {
-      "name": "Build",
-      "description": "Builds features and fixes bugs",
-      "model": "anthropic:claude-sonnet-4-5-20250929",
-      "userInvocable": true
-    }
-  ]
-}
-```
-

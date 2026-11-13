@@ -105,7 +105,7 @@ pub struct HeadlessArgs {
     #[arg(short, long)]
     pub model: Option<String>,
 
-    /// Working directory
+    /// Working directory. An `--options-json` payload's `cwd` wins when it carries one.
     #[arg(short = 'C', long = "cwd", default_value = ".")]
     pub cwd: PathBuf,
 
@@ -154,7 +154,12 @@ struct HeadlessInputs {
 impl RunConfig {
     fn from_args(args: HeadlessArgs) -> Result<Self, CliError> {
         if let Some(json) = &args.options_json {
-            return Self::from_options(serde_json::from_str(json).map_err(CliError::InvalidOptionsJson)?);
+            // The `--cwd` flag still decides the working directory when the
+            // payload carries none of its own (TASK-2K-169).
+            return Self::from_options(
+                serde_json::from_str(json).map_err(CliError::InvalidOptionsJson)?,
+                args.cwd.clone(),
+            );
         }
 
         let prompt = resolve_prompt(&args)?;
@@ -177,9 +182,11 @@ impl RunConfig {
         .resolve()
     }
 
-    fn from_options(options: HeadlessOptions) -> Result<Self, CliError> {
+    fn from_options(options: HeadlessOptions, cwd_flag: PathBuf) -> Result<Self, CliError> {
         let prompt = options.prompt.ok_or(CliError::NoPrompt)?;
-        let cwd = options.cwd.unwrap_or_else(|| PathBuf::from(".")).canonicalize().map_err(CliError::IoError)?;
+        // The payload's `cwd` wins when it carries one; otherwise the flag
+        // decides (TASK-2K-169).
+        let cwd = crate::working_directory::resolve_run_cwd(options.cwd, cwd_flag)?;
         HeadlessInputs {
             prompt,
             cwd,

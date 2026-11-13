@@ -31,6 +31,9 @@ pub enum CliError {
     IoError(#[from] io::Error),
     #[error("Agent stopped before receiving the prompt")]
     AgentStopped,
+    /// Another run already holds the working directory's lock.
+    #[error("another aether run is already using this working directory (lock file: {path})")]
+    RunLocked { path: std::path::PathBuf },
     #[error("Credential store error: {0}")]
     CredentialStore(#[from] OAuthError),
 }

@@ -16,6 +16,7 @@ mod aether_home;
 mod headless;
 mod mcp_command;
 mod run_init;
+mod run_lock;
 mod trace_context;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

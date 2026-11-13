@@ -45,6 +45,7 @@ use crate::acp::protocol::events::{NotificationMode, project_agent_event, stop_r
 use crate::acp::protocol::replay::replay_to_client;
 use crate::acp::state::validate_prompt_support;
 use crate::output::print_message;
+use crate::redact::SecretRedactor;
 use crate::slash_commands::{expand_slash_command_in_content, prompt_commands};
 use aether_sessions::SessionStore;
 
@@ -632,10 +633,13 @@ impl SessionActor {
 
     fn record_agent_event(&mut self, message: &AgentEvent) {
         self.persist_event(SessionEvent::Agent(message.clone()));
-        if let Some(format) = self.hooks.echo
-            && let Err(error) = print_message(format, message)
-        {
-            error!(%error, "Failed to serialize server event");
+        if let Some(format) = self.hooks.echo {
+            // The echoed stream is a log of the run, so it is scrubbed of the
+            // credentials the process holds before anything is written.
+            let redactor = SecretRedactor::from_env();
+            if let Err(error) = print_message(format, message, &redactor) {
+                error!(%error, "Failed to serialize server event");
+            }
         }
         project_agent_event(message, NotificationMode::Live, &self.io);
     }

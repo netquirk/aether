@@ -147,7 +147,7 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
 
        // 2. Spawn MCP tool servers from an mcp.json file
        let config = McpConfig::from_json_file("mcp.json")?;
-       let mcp = mcp(".").with_config(config)?.spawn()?;
+       let mcp = mcp(".").with_config(config).spawn()?;
        mcp.ready().await;
 
        // 3. Build and spawn the agent

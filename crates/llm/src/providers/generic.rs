@@ -35,6 +35,13 @@ pub struct ProviderConfig {
     pub api_base_env: Option<&'static str>,
     pub default_model: &'static str,
     pub api: Api,
+    /// Headers this provider needs on every request in addition to the API key.
+    ///
+    /// A function rather than a constant because some values must be fresh per
+    /// provider instance - opencode-go rejects a request without
+    /// `x-opencode-session` (it uses the value for upstream routing), and a
+    /// value shared by every run would defeat that routing.
+    pub extra_headers: Option<fn() -> Vec<(&'static str, String)>>,
 }
 
 pub enum Api {
@@ -49,6 +56,7 @@ pub const ANTHROPIC: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "claude-sonnet-4-5-20250929",
     api: Api::Messages,
+    extra_headers: None,
 };
 
 pub const OPENAI: ProviderConfig = ProviderConfig {
@@ -57,6 +65,7 @@ pub const OPENAI: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "gpt-4.1",
     api: Api::Responses(ResponsesRequestPolicy::OPENAI),
+    extra_headers: None,
 };
 
 pub const XIAOMI: ProviderConfig = ProviderConfig {
@@ -65,6 +74,7 @@ pub const XIAOMI: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "mimo-v2.6-pro",
     api: Api::Responses(ResponsesRequestPolicy::XIAOMI),
+    extra_headers: None,
 };
 
 pub const DEEPSEEK: ProviderConfig = ProviderConfig {
@@ -73,6 +83,7 @@ pub const DEEPSEEK: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "deepseek-v4-flash",
     api: Api::ChatCompletions(ChatRequestPolicy::DEFAULT),
+    extra_headers: None,
 };
 
 pub const MOONSHOT: ProviderConfig = ProviderConfig {
@@ -84,6 +95,7 @@ pub const MOONSHOT: ProviderConfig = ProviderConfig {
         tool_schema_transform: Some(normalize_for_moonshot),
         ..ChatRequestPolicy::DEFAULT
     }),
+    extra_headers: None,
 };
 
 pub const ZAI: ProviderConfig = ProviderConfig {
@@ -92,6 +104,7 @@ pub const ZAI: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "GLM-4.6",
     api: Api::ChatCompletions(ChatRequestPolicy::DEFAULT),
+    extra_headers: None,
 };
 
 pub const AZURE_FOUNDRY: ProviderConfig = ProviderConfig {
@@ -103,6 +116,7 @@ pub const AZURE_FOUNDRY: ProviderConfig = ProviderConfig {
         prompt_cache_key: PromptCacheKeySource::Prefix,
         ..ChatRequestPolicy::DEFAULT
     }),
+    extra_headers: None,
 };
 
 pub const FIREWORKS: ProviderConfig = ProviderConfig {
@@ -114,6 +128,7 @@ pub const FIREWORKS: ProviderConfig = ProviderConfig {
         prompt_cache_key: PromptCacheKeySource::SessionAffinity,
         ..ChatRequestPolicy::DEFAULT
     }),
+    extra_headers: None,
 };
 
 pub const GEMINI: ProviderConfig = ProviderConfig {
@@ -122,6 +137,7 @@ pub const GEMINI: ProviderConfig = ProviderConfig {
     api_base_env: None,
     default_model: "",
     api: Api::ChatCompletions(ChatRequestPolicy::DEFAULT),
+    extra_headers: None,
 };
 
 pub const OPENROUTER: ProviderConfig = ProviderConfig {
@@ -134,6 +150,7 @@ pub const OPENROUTER: ProviderConfig = ProviderConfig {
         customize: Some(openrouter_request),
         ..ChatRequestPolicy::DEFAULT
     }),
+    extra_headers: None,
 };
 
 pub const OLLAMA: ProviderConfig = ProviderConfig {
@@ -142,6 +159,7 @@ pub const OLLAMA: ProviderConfig = ProviderConfig {
     api_base_env: Some("OLLAMA_HOST"),
     default_model: "",
     api: Api::ChatCompletions(LOCAL_CHAT),
+    extra_headers: None,
 };
 
 pub const LLAMACPP: ProviderConfig = ProviderConfig {
@@ -150,10 +168,26 @@ pub const LLAMACPP: ProviderConfig = ProviderConfig {
     api_base_env: Some("LLAMA_CPP_HOST"),
     default_model: "",
     api: Api::ChatCompletions(LOCAL_CHAT),
+    extra_headers: None,
 };
 
 const LOCAL_CHAT: ChatRequestPolicy =
     ChatRequestPolicy { tool_call_reasoning_placeholder: false, ..ChatRequestPolicy::DEFAULT };
+
+pub const OPENCODE_GO: ProviderConfig = ProviderConfig {
+    provider: Provider::OpencodeGo,
+    api_base: Some("https://api.opencode.ai/zen/go/v1"),
+    api_base_env: None,
+    default_model: "deepseek-v4.1-flash",
+    api: Api::ChatCompletions(ChatRequestPolicy::DEFAULT),
+    extra_headers: Some(opencode_go_headers),
+};
+
+/// The routing session id opencode-go requires. One per provider instance, so
+/// concurrent runs are not collapsed onto one upstream session.
+fn opencode_go_headers() -> Vec<(&'static str, String)> {
+    vec![("x-opencode-session", uuid::Uuid::new_v4().to_string())]
+}
 
 pub(crate) const BUILT_INS: &[&ProviderConfig] = &[
     &ANTHROPIC,
@@ -168,6 +202,7 @@ pub(crate) const BUILT_INS: &[&ProviderConfig] = &[
     &OPENROUTER,
     &OLLAMA,
     &LLAMACPP,
+    &OPENCODE_GO,
 ];
 
 /// A provider whose behavior is fully described by a [`ProviderConfig`].
@@ -228,11 +263,27 @@ impl GenericProvider {
         if config.provider.is_local() && !api_base.ends_with("/v1") {
             api_base.push_str("/v1");
         }
+        let mut headers = api_headers(&config.api, api_key, connection.auth_mode)?;
+        // Applied AFTER the credential so a provider can never shadow the
+        // Authorization header.
+        if let Some(extra_headers) = config.extra_headers {
+            for (name, value) in extra_headers() {
+                // A malformed name or value is skipped rather than panicking: it
+                // is provider configuration, and a bad one must not take down
+                // the whole run with an unrelated panic.
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(&value),
+                ) {
+                    headers.insert(name, value);
+                }
+            }
+        }
         Ok(Self {
             config,
             http: http_client(),
             api_base,
-            headers: api_headers(&config.api, api_key, connection.auth_mode)?,
+            headers,
             model: config.default_model.to_string(),
             request_model: connection.request_model,
             idle_timeout: connection.idle_timeout,
@@ -354,6 +405,34 @@ mod tests {
         AssistantReply, ChatMessage, ContentBlock, LlmResponse, MessageId, ModelSettings, ProviderErrorKind,
         ReasoningEffort, StopReason, ToolCallRequest, ToolCallResult, ToolDefinition,
     };
+
+    #[tokio::test]
+    async fn opencode_go_sends_a_routing_session_header() {
+        let mut fixture = ProviderFixture::builder(&OPENCODE_GO).model("deepseek-v4.1-flash").build().await;
+        let context = Context::new(vec![ChatMessage::user("Hello")], vec![]);
+
+        let (captured, responses) = fixture.run(&context).await;
+
+        assert_successful_stream(&responses);
+        let session = captured
+            .headers
+            .get("x-opencode-session")
+            .expect("opencode-go needs a routing session header on every request");
+        assert!(!session.is_empty(), "the routing session header must carry a value");
+    }
+
+    #[test]
+    fn opencode_go_routing_session_is_fresh_per_provider() {
+        let first = GenericProvider::new("key", &OPENCODE_GO).unwrap();
+        let second = GenericProvider::new("key", &OPENCODE_GO).unwrap();
+
+        let first_session = first.headers.get("x-opencode-session").map(|value| value.to_str().unwrap().to_string());
+        let second_session =
+            second.headers.get("x-opencode-session").map(|value| value.to_str().unwrap().to_string());
+
+        assert!(first_session.is_some(), "the provider must carry the routing session header");
+        assert_ne!(first_session, second_session, "each provider instance needs its own routing session");
+    }
 
     #[tokio::test]
     async fn gemini_disables_reasoning_with_none() {
