@@ -1,6 +1,7 @@
 use super::clamp_i64;
 use crate::{SessionControlEvent, SessionEvent, UserEvent};
 use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, ModelEvent, ToolEvent, TurnEvent, TurnOutcome};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EventRow {
@@ -11,6 +12,55 @@ pub(crate) struct EventRow {
     pub content: Option<String>,
     pub content_len: i64,
     pub raw_json: String,
+    pub projection: EventProjection,
+}
+
+pub(crate) fn event_row(
+    session_id: &str,
+    event_index: i64,
+    line_number: i64,
+    turn_index: Option<i64>,
+    event: &SessionEvent,
+    raw_json: String,
+) -> EventRow {
+    let content = event.content();
+    let content_len = content.as_ref().map_or(0, |content| clamp_i64(content.chars().count()));
+
+    EventRow {
+        session_id: session_id.to_string(),
+        event_index,
+        line_number,
+        turn_index,
+        content,
+        content_len,
+        raw_json,
+        projection: EventProjection::from(event),
+    }
+}
+
+/// Tool calls are logged before their arguments finish streaming, so fill empty
+/// call arguments from the matching result or error.
+pub(crate) fn backfill_tool_arguments(rows: &mut [EventRow]) {
+    let mut later_arguments = HashMap::new();
+    for row in rows.iter_mut().rev() {
+        let projection = &mut row.projection;
+        let Some(id) = projection.tool_call_id.clone() else { continue };
+        let is_call = projection.event_type == "tool_call";
+        match projection.tool_arguments.clone().filter(|args| !args.is_empty()) {
+            Some(args) if !is_call => {
+                later_arguments.insert(id, args);
+            }
+            Some(_) => {
+                later_arguments.remove(&id);
+            }
+            None if is_call => projection.tool_arguments = later_arguments.remove(&id),
+            None => projection.tool_arguments = later_arguments.get(&id).cloned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct EventProjection {
     pub kind: &'static str,
     pub event_type: &'static str,
     pub outcome: Option<&'static str>,
@@ -34,7 +84,7 @@ pub(crate) struct EventRow {
     pub usage_sequence: Option<i64>,
     pub agent_id: Option<String>,
     pub parent_agent_id: Option<String>,
-    pub task_id: Option<String>,
+    pub sub_agent_session_id: Option<String>,
     pub agent_name: Option<String>,
     pub call_purpose: Option<String>,
     pub provider: Option<String>,
@@ -43,100 +93,12 @@ pub(crate) struct EventRow {
     pub unpriced_calls: Option<i64>,
 }
 
-pub(crate) fn event_row(
-    session_id: &str,
-    event_index: i64,
-    line_number: i64,
-    turn_index: Option<i64>,
-    event: &SessionEvent,
-    raw_json: String,
-) -> EventRow {
-    let content = event.content();
-    let content_len = content.as_ref().map_or(0, |content| clamp_i64(content.chars().count()));
-    let projection = EventProjection::from(event);
-
-    EventRow {
-        session_id: session_id.to_string(),
-        event_index,
-        line_number,
-        turn_index,
-        content,
-        content_len,
-        raw_json,
-        kind: projection.kind,
-        event_type: projection.event_type,
-        outcome: projection.outcome,
-        tool_call_id: projection.tool_call_id,
-        tool_name: projection.tool_name,
-        tool_arguments: projection.tool_arguments,
-        model_name: projection.model_name,
-        message_id: projection.message_id,
-        usage_ratio: projection.usage_ratio,
-        context_limit: projection.context_limit,
-        input_tokens: projection.input_tokens,
-        output_tokens: projection.output_tokens,
-        cache_read_tokens: projection.cache_read_tokens,
-        cache_creation_tokens: projection.cache_creation_tokens,
-        reasoning_tokens: projection.reasoning_tokens,
-        total_input_tokens: projection.total_input_tokens,
-        total_output_tokens: projection.total_output_tokens,
-        total_cache_read_tokens: projection.total_cache_read_tokens,
-        total_cache_creation_tokens: projection.total_cache_creation_tokens,
-        total_reasoning_tokens: projection.total_reasoning_tokens,
-        usage_sequence: projection.usage_sequence,
-        agent_id: projection.agent_id,
-        parent_agent_id: projection.parent_agent_id,
-        task_id: projection.task_id,
-        agent_name: projection.agent_name,
-        call_purpose: projection.call_purpose,
-        provider: projection.provider,
-        estimated_cost_usd: projection.estimated_cost_usd,
-        total_estimated_cost_usd: projection.total_estimated_cost_usd,
-        unpriced_calls: projection.unpriced_calls,
-    }
-}
-
-#[derive(Default)]
-struct EventProjection {
-    kind: &'static str,
-    event_type: &'static str,
-    outcome: Option<&'static str>,
-    tool_call_id: Option<String>,
-    tool_name: Option<String>,
-    tool_arguments: Option<String>,
-    model_name: Option<String>,
-    message_id: Option<String>,
-    usage_ratio: Option<f64>,
-    context_limit: Option<i64>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    cache_read_tokens: Option<i64>,
-    cache_creation_tokens: Option<i64>,
-    reasoning_tokens: Option<i64>,
-    total_input_tokens: Option<i64>,
-    total_output_tokens: Option<i64>,
-    total_cache_read_tokens: Option<i64>,
-    total_cache_creation_tokens: Option<i64>,
-    total_reasoning_tokens: Option<i64>,
-    usage_sequence: Option<i64>,
-    agent_id: Option<String>,
-    parent_agent_id: Option<String>,
-    task_id: Option<String>,
-    agent_name: Option<String>,
-    call_purpose: Option<String>,
-    provider: Option<String>,
-    estimated_cost_usd: Option<f64>,
-    total_estimated_cost_usd: Option<f64>,
-    unpriced_calls: Option<i64>,
-}
-
 impl From<&SessionEvent> for EventProjection {
     fn from(event: &SessionEvent) -> Self {
         match event {
             SessionEvent::User(UserEvent::Message { message_id, .. }) => {
                 Self { message_id: Some(message_id.to_string()), ..Self::new("user", "user_message") }
             }
-            SessionEvent::User(UserEvent::ClearContext) => Self::new("user", "clear_context"),
             SessionEvent::Control(SessionControlEvent::AgentSwitched { .. }) => Self::new("control", "agent_switched"),
             SessionEvent::Agent(event) => Self::from(event),
         }
@@ -157,9 +119,6 @@ impl From<&AgentEvent> for EventProjection {
             AgentEvent::Context(event) => Self::from_context(event),
             AgentEvent::Model(ModelEvent::Switched { new, .. }) => {
                 Self { model_name: Some(new.clone()), ..Self::new("agent", "model_switched") }
-            }
-            AgentEvent::Model(ModelEvent::Fallback { to, .. }) => {
-                Self { model_name: Some(to.clone()), ..Self::new("agent", "model_fallback") }
             }
             AgentEvent::SessionUsage(usage) => Self::from_session_usage(usage),
         }
@@ -199,8 +158,8 @@ impl EventProjection {
             ToolEvent::TaskCancelled { request, .. } => {
                 Self::for_tool_request("tool_task_cancelled", request, Some("cancelled"))
             }
-            ToolEvent::CallUpdate { .. } => Self::new("agent", "tool_call_update"),
-            ToolEvent::ExecutionStarted { .. } => Self::new("agent", "tool_execution_started"),
+            ToolEvent::InputStarted { .. } => Self::new("agent", "tool_input_started"),
+            ToolEvent::InputDelta { .. } => Self::new("agent", "tool_input_delta"),
             ToolEvent::Progress { .. } => Self::new("agent", "tool_progress"),
             ToolEvent::SubAgentProgress { .. } => Self::new("agent", "sub_agent_progress"),
             ToolEvent::DisplayUpdate { .. } => Self::new("agent", "tool_display_update"),
@@ -211,6 +170,8 @@ impl EventProjection {
     fn from_turn(event: &TurnEvent) -> Self {
         match event {
             TurnEvent::Started { .. } => Self::new("agent", "turn_started"),
+            TurnEvent::UserMessageInserted { .. } => Self::new("agent", "user_message_inserted"),
+            TurnEvent::UserMessageDiscarded { .. } => Self::new("agent", "user_message_discarded"),
             TurnEvent::RetryScheduled { .. } => Self::new("agent", "retry_scheduled"),
             TurnEvent::LlmCallStarted { model, display_name, .. } => Self {
                 model_name: model.model_id.clone().or_else(|| Some(display_name.clone())),
@@ -230,7 +191,6 @@ impl EventProjection {
                     TurnOutcome::Completed => "completed",
                     TurnOutcome::Cancelled => "cancelled",
                     TurnOutcome::Failed { .. } => "failed",
-                    TurnOutcome::MaxTurnsReached { .. } => "max_turns_reached",
                 }),
                 ..Self::new("agent", "turn_ended")
             },
@@ -243,7 +203,7 @@ impl EventProjection {
             usage_sequence: Some(clamp_i64(usage.sequence)),
             agent_id: Some(usage.source.agent_id.clone()),
             parent_agent_id: usage.source.parent_agent_id.clone(),
-            task_id: usage.source.task_id.clone(),
+            sub_agent_session_id: usage.source.sub_agent_session_id.clone(),
             agent_name: Some(usage.source.agent_name.clone()),
             call_purpose: Some(usage.purpose.as_str().to_string()),
             provider: usage.model.provider.clone(),
@@ -286,6 +246,10 @@ impl EventProjection {
                 ..Self::new("agent", "context_usage")
             },
             ContextEvent::Cleared => Self::new("agent", "context_cleared"),
+            ContextEvent::ReplyRecorded { message } => Self {
+                message_id: message.message_id().map(|id| id.to_string()),
+                ..Self::new("agent", "context_reply_recorded")
+            },
         }
     }
 

@@ -35,14 +35,14 @@ aether-agent-core = "0.1"
 ```rust,no_run
 use aether_core::core::{Command, Prompt, agent};
 use aether_core::events::{AgentEvent, MessageEvent, ToolEvent, TurnEvent};
-use llm::providers::openrouter::OpenRouterProvider;
+use llm::providers::generic::{GenericProvider, OPENROUTER};
 use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Choose your LLM. Alternatively use AnthropicProvider, LlamaCppProvider..etc
+    // 1. Choose your LLM. Alternatively use another ProviderConfig (e.g. ANTHROPIC), CodexProvider..etc
     // For this example, OPENROUTER_API_KEY needs to be set in your environment
-    let llm = OpenRouterProvider::default("z-ai/glm-4.6")?;
+    let llm = GenericProvider::from_env(&OPENROUTER)?.with_model("z-ai/glm-4.6");
 
    // 2. Create an Agent
     let (tx, mut rx, _handle) = agent(llm) // <-- Give it an LLM
@@ -105,24 +105,24 @@ And bring Mr. `BotBot` to life!
 use aether_core::core::{Command, Prompt, agent};
 use aether_core::events::{AgentEvent, MessageEvent, ToolEvent, TurnEvent};
 use aether_core::mcp::mcp;
-use llm::providers::openrouter::OpenRouterProvider;
+use llm::providers::generic::{GenericProvider, OPENROUTER};
+use aether_core::mcp::McpConfig;
 use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let llm = OpenRouterProvider::default("z-ai/glm-4.6")?;
+    let llm = GenericProvider::from_env(&OPENROUTER)?.with_model("z-ai/glm-4.6");
 
     // 1. Connect to MCP servers
-    let mut mcp_runtime = mcp(".")
-        .from_json_files(&["mcp.json"])? // <-- Load MCP servers from one or more JSON files
-        .spawn() // <-- Spawn the MCP client into a tokio task (multiple agents can use it)
-        .await?;
-    let snapshot = mcp_runtime.block_until_ready().await.expect("MCP should initialize");
+    let mcp = mcp(".")
+        .with_config(McpConfig::from_json_file("mcp.json")?)? // <-- Load MCP servers from a JSON file
+        .spawn()?; // <-- Start the MCP gateway; servers connect in the background
+    mcp.ready().await; // <-- Wait for every server to connect
 
     // 2. Create Agent
     let (tx, mut rx, _handle) = agent(llm)
         .system_prompt(Prompt::file("AGENTS.md", ".")) // <-- Load system prompt from AGENTS.md
-        .tools(mcp_runtime.handle().clone(), snapshot.tool_definitions()) // <-- Give the agent MCP tools
+        .mcp(mcp) // <-- Give the agent MCP tools, kept in sync as they change
         .spawn()
         .await?;
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use aether_core::events::{AgentEvent, LlmCallOutcome, ToolEvent, TraceContext, TurnEvent, TurnOutcome};
+use aether_core::events::{AgentEvent, LlmCallOutcome, TraceContext, TurnEvent, TurnOutcome};
 use aether_telemetry::{
     AETHER_SYSTEM_INSTRUCTIONS_SHA256, AgentTraceContext, ContentCaptureSettings, GEN_AI_SYSTEM_INSTRUCTIONS,
     TelemetryConfig, TelemetryRuntime,
@@ -36,7 +36,7 @@ async fn runtime_exports_metrics_to_a_signal_specific_endpoint() {
     runtime.shutdown().expect("runtime flushes metrics");
     let exports = collector.exports();
 
-    assert!(exports.traces.is_empty());
+    assert_eq!(exports.traces.len(), 0);
     assert_eq!(exports.metrics.len(), 1);
 }
 
@@ -57,7 +57,7 @@ async fn runtime_exports_traces_to_a_signal_specific_endpoint() {
     let exports = collector.exports();
 
     assert_eq!(exports.traces.len(), 1);
-    assert!(exports.metrics.is_empty());
+    assert_eq!(exports.metrics.len(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -87,7 +87,7 @@ async fn runtime_parents_every_turn_to_the_supplied_trace_context() {
     let spans = trace_spans(&exports);
 
     assert_propagated_hierarchy(&spans, &expected_trace_id, &expected_parent_span_id);
-    assert!(!exports.metrics.is_empty());
+    assert_ne!(exports.metrics.len(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -152,10 +152,7 @@ async fn propagated_mcp_context_connects_parent_tool_server_and_child_agent_span
         let factory = runtime.observer_factory();
         let mut parent = factory.agent(Some("PatchWaveFix"), None);
         parent.on_event(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }));
-        parent.on_event(&AgentEvent::Tool(ToolEvent::ExecutionStarted {
-            tool_id: "call_1".to_string(),
-            tool_name: "subagents__spawn_subagent".to_string(),
-        }));
+        parent.on_event(&AgentEvent::tool_call("call_1", "subagents__spawn_subagent", "{}"));
         let outbound = parent.tool_trace_context("call_1").expect("outbound tool span provides propagation context");
 
         let server = factory.tool_call_request("spawn_subagent", Some(&outbound));
@@ -255,6 +252,7 @@ async fn runtime_exports_genai_spans_and_metrics_to_an_otlp_collector() {
         "$ai_cache_read_token_price",
         "$ai_cache_write_token_price",
         "$ai_reasoning_tokens",
+        "$ai_cache_reporting_exclusive",
     ] {
         assert!(attribute_keys.contains(&expected), "OTLP attribute {expected} missing from {attribute_keys:?}");
     }
@@ -264,7 +262,7 @@ async fn runtime_exports_genai_spans_and_metrics_to_an_otlp_collector() {
 
     assert_eq!(string_attribute(turn, "gen_ai.agent.name"), Some("PatchWaveFix"));
     assert_eq!(chat.parent_span_id, turn.span_id);
-    assert_eq!(string_attribute(chat, GEN_AI_SYSTEM_INSTRUCTIONS), Some(SYSTEM_INSTRUCTIONS_JSON));
+    assert_eq!(json_attribute(chat, GEN_AI_SYSTEM_INSTRUCTIONS), serde_json::from_str(SYSTEM_INSTRUCTIONS_JSON).ok());
     assert_eq!(string_attribute(chat, AETHER_SYSTEM_INSTRUCTIONS_SHA256), Some(SYSTEM_PROMPT_SHA256));
     assert_eq!(exports.trace_headers, vec!["collector-test"]);
     assert_eq!(exports.metric_headers, vec!["collector-test"]);
@@ -292,6 +290,10 @@ fn capturing_collector_config(collector: &FakeOtlpCollector) -> TelemetryConfig 
 
 fn test_headers(value: &str) -> HashMap<String, String> {
     HashMap::from([("x-telemetry-test".to_string(), value.to_string())])
+}
+
+fn json_attribute(span: &Span, key: &str) -> Option<serde_json::Value> {
+    string_attribute(span, key).map(|value| serde_json::from_str(value).expect("attribute holds JSON"))
 }
 
 fn string_attribute<'a>(span: &'a Span, key: &str) -> Option<&'a str> {

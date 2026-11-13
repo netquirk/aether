@@ -1,190 +1,79 @@
-#![cfg(feature = "stdio")]
+#![cfg(feature = "subagents")]
 
-use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
-use rmcp::transport::TokioChildProcess;
-use std::process::Stdio;
-use tokio::process::Command;
+use crate::common::{McpClientExt, TestResult};
+use mcp_utils::client::{ClientError, ClientOptions, McpClient, Transport};
+use serde_json::json;
+use std::collections::HashMap;
 
-fn stdio_binary() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-servers-stdio"));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-    cmd
-}
+#[tokio::test]
+async fn builtin_servers_list_their_tools_over_stdio() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = dir.path().to_str().unwrap();
+    let coding =
+        &["bash", "edit_file", "lsp_check_errors", "lsp_rename", "lsp_symbol", "read_file", "web_fetch", "write_file"];
+    let cases: [(&str, &[&str], &[&str]); 6] = [
+        ("tasks", &["--dir", dir], &["task_create", "task_get", "task_list", "task_update"]),
+        ("coding", &[], coding),
+        ("coding", &["--rules-dir", dir], coding),
+        ("skills", &["--dir", dir], &["get_skills", "list_skills"]),
+        ("subagents", &["--dir", dir], &["spawn_subagent"]),
+        ("review", &[], &["review_artifact"]),
+    ];
 
-fn tool_names(tools: &[rmcp::model::Tool]) -> Vec<&str> {
-    tools.iter().map(|t| t.name.as_ref()).collect()
-}
-
-fn extract_text(content: &rmcp::model::ContentBlock) -> &str {
-    content.as_text().expect("expected text content").text.as_str()
-}
-
-async fn connect_and_list_tools(server: &str, extra_args: &[&str]) -> Vec<rmcp::model::Tool> {
-    let aether_home = tempfile::tempdir().expect("create temp aether home");
-    let mut cmd = stdio_binary();
-    cmd.env("AETHER_HOME", aether_home.path().join(".aether"));
-    cmd.arg("--server").arg(server);
-    for arg in extra_args {
-        cmd.arg(arg);
+    for (server, args, expected) in cases {
+        assert_eq!(list_tools(server, args, "").await, expected, "{server} {args:?}");
     }
-    let transport = TokioChildProcess::new(cmd).expect("spawn stdio server");
-    let client = ().serve(transport).await.expect("connect to server");
-    client.peer().list_all_tools().await.expect("list tools")
 }
 
 #[tokio::test]
-async fn tasks_server_lists_tools_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+async fn coding_server_lists_web_search_only_with_an_api_key_and_lsp_tools_unless_disabled() {
+    let cases: [(&str, &[&str]); 2] = [
+        ("", &["bash", "edit_file", "read_file", "web_fetch", "write_file"]),
+        ("test-key", &["bash", "edit_file", "read_file", "web_fetch", "web_search", "write_file"]),
+    ];
 
-    let tools = connect_and_list_tools("tasks", &["--", "--dir", tmp.path().to_str().unwrap()]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"task_create"), "expected task_create, got: {names:?}");
-    assert!(names.contains(&"task_list"), "expected task_list, got: {names:?}");
-    assert!(names.contains(&"task_update"), "expected task_update, got: {names:?}");
-    assert!(names.contains(&"task_get"), "expected task_get, got: {names:?}");
+    for (search_key, expected) in cases {
+        assert_eq!(list_tools("coding", &["--disable-lsp"], search_key).await, expected, "key={search_key:?}");
+    }
 }
 
 #[tokio::test]
-async fn tasks_server_create_and_get_task_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+async fn tasks_server_create_and_get_task_over_stdio() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().to_str().unwrap();
+    let client = connect(&["--server", "tasks", "--", "--dir", dir], HashMap::new()).await?;
 
-    let mut cmd = stdio_binary();
-    cmd.arg("--server").arg("tasks");
-    cmd.arg("--").arg("--dir").arg(tmp.path());
+    let created =
+        client.call("task_create", json!({ "title": "Test task", "description": "Created over stdio" })).await?;
+    let fetched = client.call("task_get", json!({ "id": created["task"]["id"] })).await?;
 
-    let transport = TokioChildProcess::new(cmd).expect("spawn stdio server");
-    let client = ().serve(transport).await.expect("connect to server");
-
-    // This test exercises call_tool, so it doesn't use connect_and_list_tools.
-    // Create a task
-    let create_result = client
-        .peer()
-        .call_tool(
-            rmcp::model::CallToolRequestParams::new("task_create").with_arguments(
-                serde_json::json!({
-                    "title": "Test task",
-                    "description": "A test task created over stdio"
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            ),
-        )
-        .await
-        .expect("call task_create");
-
-    let text = extract_text(create_result.content.first().expect("response has content"));
-    let created: serde_json::Value = serde_json::from_str(text).expect("parse JSON response");
-    let task_id = created["task"]["id"].as_str().expect("task has id");
-
-    // Get the task back
-    let get_result = client
-        .peer()
-        .call_tool(
-            CallToolRequestParams::new("task_get")
-                .with_arguments(serde_json::json!({ "id": task_id }).as_object().unwrap().clone()),
-        )
-        .await
-        .expect("call task_get");
-
-    let get_text = extract_text(get_result.content.first().expect("response has content"));
-    let fetched: serde_json::Value = serde_json::from_str(get_text).expect("parse JSON response");
-    assert_eq!(fetched["task"]["title"].as_str(), Some("Test task"));
+    assert_eq!(fetched["task"]["title"], "Test task");
+    Ok(())
 }
 
 #[tokio::test]
-async fn coding_server_lists_tools_over_stdio() {
-    let tools = connect_and_list_tools("coding", &[]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"grep"), "expected grep tool, got: {names:?}");
-    assert!(names.contains(&"read_file"), "expected read_file tool, got: {names:?}");
-
-    // LSP tools should be in the coding server too
-    assert!(names.contains(&"lsp_symbol"), "expected lsp_symbol in coding server, got: {names:?}");
-    assert!(names.contains(&"lsp_document"), "expected lsp_document in coding server, got: {names:?}");
-    assert!(names.contains(&"lsp_check_errors"), "expected lsp_check_errors in coding server, got: {names:?}");
-    assert!(names.contains(&"lsp_workspace_search"), "expected lsp_workspace_search in coding server, got: {names:?}");
-    assert!(names.contains(&"lsp_rename"), "expected lsp_rename in coding server, got: {names:?}");
+async fn unknown_servers_exit_with_error() {
+    for server in ["lsp", "nonexistent"] {
+        assert!(connect(&["--server", server], HashMap::new()).await.is_err(), "{server} should be unavailable");
+    }
 }
 
-#[tokio::test]
-async fn coding_server_accepts_rules_dir_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-
-    let tools = connect_and_list_tools("coding", &["--", "--rules-dir", tmp.path().to_str().unwrap()]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"grep"), "expected grep tool, got: {names:?}");
-    assert!(names.contains(&"read_file"), "expected read_file tool, got: {names:?}");
+async fn connect(args: &[&str], env: HashMap<String, String>) -> Result<McpClient, ClientError> {
+    let command = env!("CARGO_BIN_EXE_mcp-servers-stdio").to_string();
+    let args = args.iter().map(ToString::to_string).collect();
+    McpClient::connect("stdio", Transport::Stdio { command, args, env, cwd: None }, &ClientOptions::default()).await
 }
 
-#[tokio::test]
-async fn lsp_server_is_not_available_over_stdio() {
-    let mut cmd = stdio_binary();
-    cmd.arg("--server").arg("lsp");
-
-    let transport = TokioChildProcess::new(cmd).expect("spawn stdio server");
-    let result = ().serve(transport).await;
-
-    assert!(result.is_err(), "expected lsp server to be unavailable");
-}
-
-#[tokio::test]
-async fn skills_server_lists_tools_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-
-    let tools = connect_and_list_tools("skills", &["--", "--dir", tmp.path().to_str().unwrap()]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"list_skills"), "expected list_skills, got: {names:?}");
-    assert!(names.contains(&"get_skills"), "expected get_skills, got: {names:?}");
-}
-
-#[tokio::test]
-async fn skills_server_accepts_deprecated_notes_dir_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-
-    let tools = connect_and_list_tools(
-        "skills",
-        &["--", "--dir", tmp.path().to_str().unwrap(), "--notes-dir", tmp.path().to_str().unwrap()],
-    )
-    .await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"list_skills"), "expected list_skills, got: {names:?}");
-    assert!(names.contains(&"get_skills"), "expected get_skills, got: {names:?}");
-}
-
-#[tokio::test]
-async fn subagents_server_lists_tools_over_stdio() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-
-    let tools = connect_and_list_tools("subagents", &["--", "--dir", tmp.path().to_str().unwrap()]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"spawn_subagent"), "expected spawn_subagent, got: {names:?}");
-    assert_eq!(names.len(), 1, "expected exactly 1 tool, got: {names:?}");
-}
-
-#[tokio::test]
-async fn review_server_lists_tools_over_stdio() {
-    let tools = connect_and_list_tools("review", &[]).await;
-    let names = tool_names(&tools);
-
-    assert!(names.contains(&"review_artifact"), "expected review_artifact, got: {names:?}");
-    assert_eq!(names.len(), 1, "expected exactly 1 tool, got: {names:?}");
-}
-
-#[tokio::test]
-async fn unknown_server_exits_with_error() {
-    let mut cmd = stdio_binary();
-    cmd.arg("--server").arg("nonexistent");
-
-    let transport = TokioChildProcess::new(cmd).expect("spawn process");
-    let result = ().serve(transport).await;
-
-    assert!(result.is_err(), "expected error for unknown server name");
+async fn list_tools(server: &str, server_args: &[&str], search_key: &str) -> Vec<String> {
+    let aether_home = tempfile::tempdir().expect("create temp aether home");
+    let env = HashMap::from([
+        ("AETHER_HOME".to_string(), aether_home.path().join(".aether").display().to_string()),
+        ("BRAVE_SEARCH_API_KEY".to_string(), search_key.to_string()),
+    ]);
+    let args = [&["--server", server, "--"], server_args].concat();
+    let client = connect(&args, env).await.expect("connect to server");
+    let mut names: Vec<_> =
+        client.list_tools().await.expect("list tools").into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    names
 }

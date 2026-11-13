@@ -3,9 +3,9 @@ use super::layout::FrameLayout;
 use crate::app::App;
 use crate::conversation::plan_view::PlanView;
 use crate::conversation::progress_indicator::{ProgressIndicator, ProgressIndicatorView};
-use crate::surfaces::composer::ComposerBodyView;
+use crate::surfaces::composer::{ComposerBodyView, QueuedPromptsView};
 use crate::theme::Theme;
-use crate::view::widgets::RowsView;
+use crate::view::widgets::render_rows;
 use crate::view::wrap::as_u16;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -20,11 +20,12 @@ pub(super) fn draw_frame(
     layout: &FrameLayout,
     live: &[Line<'static>],
 ) {
-    let [transcript_area, plan_area, composer_area, status_area] = layout.split(frame.area());
+    let [transcript_area, plan_area, queued_area, composer_area, status_area] = layout.split(frame.area());
     let theme = renderer.theme();
     let buf = frame.buffer_mut();
 
     PlanView::new(&layout.plan_entries, theme).render(layout.indent(plan_area), buf);
+    QueuedPromptsView::new(app.core().queued_prompts(), theme).render(layout.indent(queued_area), buf);
     draw_transcript(layout, live, transcript_area, buf, app.progress_indicator(), theme, app.spinner_tick());
 
     let cursor = render_composer(layout, app, composer_area, buf, theme);
@@ -65,7 +66,7 @@ fn draw_transcript(
     let [live_area, progress_area] =
         Layout::vertical([Constraint::Length(as_u16(live.len())), Constraint::Length(as_u16(progress_height))])
             .areas(area);
-    RowsView::new(live).render(live_area, buf);
+    render_rows(live, live_area, buf);
     ProgressIndicatorView::new(progress, theme, spinner_tick).render(layout.indent(progress_area), buf);
 }
 
@@ -85,10 +86,8 @@ fn render_composer(
     ])
     .areas(area);
 
-    if search_area.height > 0
-        && let Some(picker) = app.composer_mut().prompt_search_mut()
-    {
-        picker.render(search_area, buf, theme);
+    if search_area.height > 0 {
+        app.render_prompt_search(search_area, buf, theme);
     }
     if completion_area.height > 0
         && let Some(overlay) = app.composer_mut().completion_mut()

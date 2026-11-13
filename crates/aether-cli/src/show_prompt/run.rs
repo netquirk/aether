@@ -3,59 +3,44 @@ use std::collections::BTreeMap;
 use super::PromptArgs;
 use crate::error::CliError;
 use crate::resolve::resolve_agent_spec;
-use crate::runtime::RuntimeBuilder;
+use crate::runtime::{PromptPreview, RuntimeBuilder};
 use aether_core::core::{AgentDeps, Prompt};
 use llm::ToolDefinition;
 use serde_json::Value;
 
 pub async fn run_prompt(args: PromptArgs) -> Result<(), CliError> {
     let cwd = args.cwd.canonicalize().map_err(CliError::IoError)?;
-    let catalog = args.settings_source.load_agent_catalog(&cwd).map_err(|e| CliError::AgentError(e.to_string()))?;
-    let spec = resolve_agent_spec(&catalog, args.agent.as_deref())?;
-
-    let registry = catalog.registry().clone();
-    let info = RuntimeBuilder::from_spec(cwd.clone(), spec)
-        .agent_deps(AgentDeps::default().with_agent_registry(registry))
-        .mcp_sources(args.mcp_config.sources(&cwd))
-        .disable_tools(args.disable_tools.clone())
-        .build_prompt_info()
-        .await?;
-
-    if args.list_tools {
-        let names = tool_names(&info.tool_definitions);
-        if !names.is_empty() {
-            println!("{names}");
-        }
-        return Ok(());
+    let catalog = args.settings_source.load_agent_catalog(&cwd)?;
+    let mut spec = resolve_agent_spec(&catalog, args.agent.as_deref())?;
+    if let Some(custom) = args.system_prompt.as_deref() {
+        spec.prompts.push(Prompt::text(custom));
     }
 
-    let system_prompt = build_prompt(&info.spec.prompts, args.system_prompt.as_deref()).await?;
-    let tools_output = build_tools(&info.tool_definitions);
+    let registry = catalog.registry().clone();
+    let PromptPreview { system_prompt, tools: tool_definitions } = RuntimeBuilder::from_spec(cwd.clone(), spec)
+        .agent_deps(AgentDeps::default().with_agent_registry(registry))
+        .mcp_config(args.mcp_config.load(&cwd)?)
+        .preview()
+        .await?;
+
+    let tools_output = build_tools(&tool_definitions);
 
     println!("{system_prompt}");
 
     if !tools_output.is_empty() {
         println!();
-        println!("--- Tools ({} tools) ---", info.tool_definitions.len());
+        println!("--- Tools ({} tools) ---", tool_definitions.len());
         println!();
         println!("{tools_output}");
     }
 
     println!();
-    println!("{}", format_stats(system_prompt.len(), tools_output.len(), info.tool_definitions.len()));
+    println!("{}", format_stats(system_prompt.len(), tools_output.len(), tool_definitions.len()));
 
     Ok(())
 }
 
-pub async fn build_prompt(prompts: &[Prompt], custom: Option<&str>) -> Result<String, CliError> {
-    let mut prompts = prompts.to_vec();
-    if let Some(custom) = custom {
-        prompts.push(Prompt::text(custom));
-    }
-    Prompt::build_all(&prompts).await.map_err(|e| CliError::AgentError(e.to_string()))
-}
-
-pub fn build_tools(tools: &[ToolDefinition]) -> String {
+pub(super) fn build_tools(tools: &[ToolDefinition]) -> String {
     if tools.is_empty() {
         return String::new();
     }
@@ -80,16 +65,7 @@ pub fn build_tools(tools: &[ToolDefinition]) -> String {
     sections.join("\n\n")
 }
 
-/// Render a tool registry as one model-visible tool name per line.
-///
-/// Names are emitted verbatim (including any `<server>__<tool>` namespace the
-/// MCP layer attaches), so the printed set is exactly what `aether` exposes to
-/// the model during a run.
-pub fn tool_names(tools: &[ToolDefinition]) -> String {
-    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("\n")
-}
-
-pub fn format_stats(prompt_chars: usize, tool_schema_chars: usize, tool_count: usize) -> String {
+pub(super) fn format_stats(prompt_chars: usize, tool_schema_chars: usize, tool_count: usize) -> String {
     let est_tokens = (prompt_chars + tool_schema_chars) / 4;
     format!(
         "---\n\
@@ -111,42 +87,18 @@ mod tests {
     }
 
     #[test]
-    fn format_stats_computes_token_estimate() {
-        let output = format_stats(12000, 8500, 14);
+    fn format_stats_right_aligns_counts_and_floors_the_token_estimate() {
         assert_eq!(
-            output,
+            format_stats(12000, 8500, 14),
             "---\n\
              Prompt chars:        12000\n\
              Tool schema chars:    8500\n\
              Est. tokens:     ~    5125\n\
              MCP tools:              14"
         );
-    }
-
-    #[test]
-    fn format_stats_handles_zero() {
-        let output = format_stats(0, 0, 0);
-        assert_eq!(
-            output,
-            "---\n\
-             Prompt chars:            0\n\
-             Tool schema chars:       0\n\
-             Est. tokens:     ~       0\n\
-             MCP tools:               0"
-        );
-    }
-
-    #[test]
-    fn format_stats_handles_small_values() {
-        let output = format_stats(3, 0, 1);
-        assert_eq!(
-            output,
-            "---\n\
-             Prompt chars:            3\n\
-             Tool schema chars:       0\n\
-             Est. tokens:     ~       0\n\
-             MCP tools:               1"
-        );
+        for prompt_chars in [0, 3] {
+            assert!(format_stats(prompt_chars, 0, 1).contains("Est. tokens:     ~       0\n"));
+        }
     }
 
     #[test]
@@ -191,27 +143,5 @@ mod tests {
     #[test]
     fn build_tools_empty() {
         assert_eq!(build_tools(&[]), "");
-    }
-
-    #[test]
-    fn tool_names_one_tool_one_line() {
-        let tools = vec![tool("bash", "Run a command", r#"{"type":"object"}"#, Some("coding"))];
-        assert_eq!(tool_names(&tools), "bash");
-    }
-
-    #[test]
-    fn tool_names_multiple_tools_one_per_line_preserves_order() {
-        let tools = vec![
-            tool("bash", "Run a command", r#"{"type":"object"}"#, Some("coding")),
-            tool("read_file", "Read a file", r#"{"type":"object"}"#, Some("coding")),
-            tool("grep", "Search text", r#"{"type":"object"}"#, Some("coding")),
-        ];
-        assert_eq!(tool_names(&tools), "bash\nread_file\ngrep");
-    }
-
-    #[test]
-    fn tool_names_empty_returns_empty_string() {
-        let tools: Vec<ToolDefinition> = Vec::new();
-        assert_eq!(tool_names(&tools), "");
     }
 }

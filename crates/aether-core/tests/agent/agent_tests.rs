@@ -3,11 +3,12 @@ use std::error::Error;
 use std::time::Duration;
 
 use aether_core::{
-    events::{AgentEvent, Command, TurnOutcome, UserCommand},
+    events::{AgentEvent, Command, ContextEvent, TurnOutcome, UserCommand},
     testing::{agent_event, content_events, test_agent},
 };
-use llm::{ChatMessage, ContentBlock, StopReason};
-use llm::{MessageId, testing::llm_response};
+use llm::testing::{assistant_message, llm_response};
+use llm::{ChatMessage, ContentBlock, MessageId, StopReason};
+use mcp_utils::testing::{FakeMcpServer, FakeTool, FakeToolResponse};
 use serde_json::json;
 
 fn completed_message_ids(events: &[AgentEvent]) -> Vec<MessageId> {
@@ -104,6 +105,51 @@ async fn test_single_tool_call() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn every_reasoning_block_of_a_reply_is_replayed_in_order() -> Result<(), Box<dyn Error>> {
+    let llm_responses = [
+        llm_response()
+            .reasoning(&["Plan"])
+            .encrypted_reasoning("r_1", "first-blob")
+            .text(&["Adding"])
+            .reasoning(&["Check"])
+            .encrypted_reasoning("r_2", "second-blob")
+            .tool_call("call_1", "test__add_numbers", &[r#"{"a":3,"b":5}"#])
+            .build(),
+        llm_response().text(&["8"]).build(),
+    ];
+
+    let model = "anthropic:claude-opus-4-6";
+    let result = test_agent()
+        .model(model.parse()?)
+        .llm_responses(&llm_responses)
+        .user_text("3+5 = ?")
+        .run_with_context()
+        .await?;
+
+    let replayed =
+        result.contexts[1].messages().iter().find(|message| matches!(message, ChatMessage::Assistant { .. }));
+    let Some(ChatMessage::Assistant { model: author, content, .. }) = replayed else {
+        panic!("expected the reply in the next request: {:?}", result.contexts[1].messages());
+    };
+    let expected = assistant_message()
+        .reasoning("Plan")
+        .encrypted_reasoning("r_1", "first-blob")
+        .text("Adding")
+        .reasoning("Check")
+        .encrypted_reasoning("r_2", "second-blob")
+        .tool_call("call_1", "test__add_numbers", r#"{"a":3,"b":5}"#)
+        .build_reply();
+    assert_eq!(content, &expected);
+    assert_eq!(author.as_ref().map(ToString::to_string).as_deref(), Some(model));
+    let recorded = result.messages.iter().find_map(|event| match event {
+        AgentEvent::Context(ContextEvent::ReplyRecorded { message }) => Some(message),
+        _ => None,
+    });
+    assert_eq!(recorded, replayed, "the recorded reply is the one replayed");
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_mcp_command_submission_completes_the_tool_with_an_error() -> Result<(), Box<dyn Error>> {
     let tool_request = json!({ "a": 3, "b": 5 });
     let llm_responses = [
@@ -117,7 +163,7 @@ async fn failed_mcp_command_submission_completes_the_tool_with_an_error() -> Res
         matches!(
             event,
             AgentEvent::Tool(ToolEvent::Error { error })
-                if error.id == "call_1" && error.error.contains("Failed to resolve tool")
+                if error.id == "call_1" && error.error.contains("Tool not found: test__missing_tool")
         )
     }));
     assert!(matches!(messages.last(), Some(AgentEvent::Turn(TurnEvent::Ended { .. }))));
@@ -125,7 +171,30 @@ async fn failed_mcp_command_submission_completes_the_tool_with_an_error() -> Res
 }
 
 #[tokio::test]
-async fn test_tool_request_arg_emits_tool_call_update() -> Result<(), Box<dyn Error>> {
+async fn malformed_tool_arguments_fail_the_tool_without_reaching_the_server() -> Result<(), Box<dyn Error>> {
+    let server = FakeMcpServer::math();
+    let state = server.state();
+    let llm_responses = [
+        llm_response().tool_call("call_1", "test__add_numbers", &["{not json"]).build(),
+        llm_response().text(&["recovered"]).build(),
+    ];
+
+    let messages = test_agent().mcp_server("test", server).llm_responses(&llm_responses).user_text("add").run().await?;
+
+    assert!(messages.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Tool(ToolEvent::Error { error })
+                if error.id == "call_1" && error.error.starts_with("Invalid tool arguments")
+        )
+    }));
+    assert!(state.calls_for("add_numbers").is_empty());
+    assert!(matches!(messages.last(), Some(AgentEvent::Turn(TurnEvent::Ended { .. }))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_tool_input_is_followed_by_the_complete_call() -> Result<(), Box<dyn Error>> {
     let tool_request = json!({ "a": 3, "b": 5 });
     let request_json = tool_request.to_string();
     let (arg_chunk_1, arg_chunk_2) = split_json_in_half(&request_json);
@@ -136,31 +205,30 @@ async fn test_tool_request_arg_emits_tool_call_update() -> Result<(), Box<dyn Er
 
     let messages = test_agent().llm_responses(&llm_responses).user_text("3+5 = ?").run().await?;
 
-    let tool_call_count = messages
-        .iter()
-        .filter(|message| {
-            matches!(
-                message,
-                AgentEvent::Tool(ToolEvent::Call { request, .. })
-                    if request.id == "call_1" && request.name == "test__add_numbers"
-            )
-        })
-        .count();
-    assert_eq!(tool_call_count, 1, "only one start ToolCall should be emitted");
-
-    let update_chunks: Vec<String> = messages
+    let tool_input: Vec<&ToolEvent> = messages
         .iter()
         .filter_map(|message| match message {
-            AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id, chunk, .. }) if tool_call_id == "call_1" => {
-                Some(chunk.clone())
-            }
+            AgentEvent::Tool(
+                event @ (ToolEvent::InputStarted { .. } | ToolEvent::InputDelta { .. } | ToolEvent::Call { .. }),
+            ) => Some(event),
             _ => None,
         })
         .collect();
-
-    assert_eq!(update_chunks.len(), 2);
-    assert_eq!(update_chunks[0], arg_chunk_1);
-    assert_eq!(update_chunks[1], arg_chunk_2);
+    assert_eq!(
+        tool_input,
+        [
+            &ToolEvent::InputStarted { id: "call_1".into(), name: "test__add_numbers".into() },
+            &ToolEvent::InputDelta { id: "call_1".into(), chunk: arg_chunk_1.into() },
+            &ToolEvent::InputDelta { id: "call_1".into(), chunk: arg_chunk_2.into() },
+            &ToolEvent::Call {
+                request: llm::ToolCallRequest {
+                    id: "call_1".into(),
+                    name: "test__add_numbers".into(),
+                    arguments: request_json.clone(),
+                },
+            },
+        ]
+    );
 
     assert!(messages.iter().any(|message| {
         matches!(
@@ -247,21 +315,14 @@ async fn test_cancellation() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(start_paused = true)]
 async fn test_tool_timeout() -> Result<(), Box<dyn Error>> {
-    let tool_duration = 2000;
-    let tool_timeout = 500;
-
-    let tool_request = json!({ "sleep_ms": tool_duration });
-    let (t1_id, t1_name) = ("call_1", "test__slow_tool");
-
-    let llm_responses = [
-        llm_response().tool_call(t1_id, t1_name, &[&tool_request.to_string()]).build(),
-        llm_response().text(&["done"]).build(),
-    ];
+    let llm_responses =
+        [llm_response().tool_call("call_1", "test__slow", &["{}"]).build(), llm_response().text(&["done"]).build()];
 
     let messages = test_agent()
+        .mcp_server("test", FakeMcpServer::new().with_tool(FakeTool::new("slow").responds(FakeToolResponse::pending())))
         .llm_responses(&llm_responses)
         .user_text("run slow tool")
-        .tool_timeout(Duration::from_millis(tool_timeout))
+        .tool_timeout(Duration::from_millis(500))
         .run()
         .await?;
 
@@ -285,7 +346,7 @@ async fn test_simple_message_content() -> Result<(), Box<dyn Error>> {
     let result =
         test_agent().llm_responses(&llm_responses).user_text("Just a simple message").run_with_context().await?;
 
-    let contexts = result.captured_contexts.lock().unwrap();
+    let contexts = result.contexts;
     let first_context = &contexts[0];
     let messages = first_context.messages();
 
@@ -444,84 +505,6 @@ fn auto_continue_attempts(events: &[AgentEvent]) -> Vec<(u32, u32)> {
 }
 
 #[tokio::test]
-async fn test_require_tool_call_nudges_dead_turn_once_then_completes() -> Result<(), Box<dyn Error>> {
-    // First reply: text-only, no tool call → "dead turn" → nudge.
-    // Second reply: real tool call → agent recovers and runs the call.
-    // Third reply: trailing `EndTurn` → turn completes cleanly.
-    let tool_request = json!({ "a": 1, "b": 2 });
-    let llm_responses = [
-        llm_response().text(&["I think we're done."]).build(),
-        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().text(&["All done."]).build_with_stop_reason(StopReason::EndTurn),
-    ];
-
-    let messages = test_agent()
-        .llm_responses(&llm_responses)
-        .user_text("compute 1+2")
-        .require_tool_call(true)
-        .max_auto_continues(1)
-        .run()
-        .await?;
-
-    assert_eq!(
-        auto_continue_attempts(&messages),
-        vec![(1, 1)],
-        "Expected exactly one nudge on the first dead turn, got {messages:?}"
-    );
-
-    // The tool call from the second reply must have been honoured.
-    let tool_call_succeeded = messages.iter().any(|event| {
-        matches!(
-            event,
-            AgentEvent::Tool(ToolEvent::Result { result, .. })
-                if result.id == "call_1" && result.result.contains("sum")
-        )
-    });
-    assert!(tool_call_succeeded, "Expected the recovered tool call to execute, got {messages:?}");
-
-    let last_outcome = messages.last().and_then(AgentEvent::turn_outcome);
-    assert!(
-        matches!(last_outcome, Some(TurnOutcome::Completed)),
-        "Expected the turn to end Completed after the recovered tool call, got {last_outcome:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_require_tool_call_fails_after_one_nudge_when_model_persists() -> Result<(), Box<dyn Error>> {
-    // First reply: text-only, no tool call → dead turn → nudge.
-    // Second reply: text-only again, no tool call → budget exhausted → Failed.
-    let llm_responses =
-        [llm_response().text(&["I think we're done."]).build(), llm_response().text(&["Still just talking."]).build()];
-
-    let messages = test_agent()
-        .llm_responses(&llm_responses)
-        .user_text("compute 1+2")
-        .require_tool_call(true)
-        .max_auto_continues(1)
-        .run()
-        .await?;
-
-    assert_eq!(
-        auto_continue_attempts(&messages),
-        vec![(1, 1)],
-        "Expected exactly one nudge before failing, got {messages:?}"
-    );
-
-    let last_outcome = messages.last().and_then(AgentEvent::turn_outcome);
-    assert!(
-        matches!(
-            last_outcome,
-            Some(TurnOutcome::Failed { error }) if error == "turn ended without a tool call"
-        ),
-        "Expected Failed with the dead-turn error string, got {last_outcome:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_reasoning_content_is_saved_in_context_after_tool_call() -> Result<(), Box<dyn Error>> {
     let tool_request = json!({ "a": 2, "b": 3 });
 
@@ -535,21 +518,19 @@ async fn test_reasoning_content_is_saved_in_context_after_tool_call() -> Result<
 
     let result = test_agent().llm_responses(&llm_responses).user_text("do something").run_with_context().await?;
 
-    let contexts = result.captured_contexts.lock().unwrap();
+    let contexts = result.contexts;
     let second_context = contexts.get(1).expect("expected second LLM request context");
 
-    let assistant_with_tool_call = second_context.messages().iter().find(|message| {
-        matches!(
-            message,
-            ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
-        )
+    let assistant_with_tool_call = second_context.messages().iter().find_map(|message| match message {
+        ChatMessage::Assistant { content, .. } if content.tool_calls().next().is_some() => Some(content),
+        _ => None,
     });
 
-    let Some(ChatMessage::Assistant { reasoning, .. }) = assistant_with_tool_call else {
+    let Some(content) = assistant_with_tool_call else {
         panic!("expected assistant message with tool call");
     };
 
-    assert_eq!(reasoning.summary_text.as_deref(), Some("internal plan"));
+    assert_eq!(content.reasoning(), "internal plan");
 
     Ok(())
 }
@@ -572,96 +553,5 @@ async fn test_reasoning_chunks_emit_thought_messages() -> Result<(), Box<dyn Err
         "Expected the turn to end"
     );
 
-    Ok(())
-}
-
-fn count_chat_call_started(events: &[AgentEvent]) -> usize {
-    events
-        .iter()
-        .filter(|event| {
-            matches!(event, AgentEvent::Turn(TurnEvent::LlmCallStarted { purpose: llm::LlmCallPurpose::Chat, .. }))
-        })
-        .count()
-}
-
-#[tokio::test]
-async fn run_ends_cleanly_when_max_turns_is_reached() -> Result<(), Box<dyn Error>> {
-    // LLM always responds with a tool call, so the agent would otherwise loop
-    // forever. The cap should stop the run cleanly on the 2nd LLM call.
-    let tool_request = json!({ "a": 1, "b": 2 });
-    let llm_responses = [
-        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().tool_call("call_2", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().tool_call("call_3", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().tool_call("call_4", "test__add_numbers", &[&tool_request.to_string()]).build(),
-    ];
-
-    let messages = test_agent().llm_responses(&llm_responses).user_text("loop until cap").max_turns(2).run().await?;
-
-    // Exactly two chat LLM calls started (the third is short-circuited by the
-    // cap before the request goes out).
-    assert_eq!(
-        count_chat_call_started(&messages),
-        2,
-        "Expected exactly 2 chat LLM calls before the cap, got: {messages:?}"
-    );
-
-    // The terminal event reports the cap, not a failure.
-    let last = messages.last().expect("at least one event");
-    match last.turn_outcome() {
-        Some(TurnOutcome::MaxTurnsReached { max_turns }) => assert_eq!(*max_turns, 2),
-        other => panic!("Expected MaxTurnsReached, got {other:?}"),
-    }
-    assert!(
-        !messages.iter().any(|m| matches!(m.turn_outcome(), Some(TurnOutcome::Failed { .. }))),
-        "Run ended with a failure instead of MaxTurnsReached: {messages:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn max_turns_none_keeps_run_unbounded() -> Result<(), Box<dyn Error>> {
-    // No cap configured: the agent should reach a normal completion even if
-    // the LLM keeps calling tools, eventually answering with text.
-    let tool_request = json!({ "a": 1, "b": 2 });
-    let llm_responses = [
-        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().text(&["done"]).build(),
-    ];
-
-    let messages = test_agent().llm_responses(&llm_responses).user_text("do something").run().await?;
-
-    assert!(matches!(messages.last().and_then(AgentEvent::turn_outcome), Some(TurnOutcome::Completed)));
-    Ok(())
-}
-
-#[test]
-fn max_turns_outcome_serializes_with_snake_case_tag() {
-    let outcome = TurnOutcome::MaxTurnsReached { max_turns: 17 };
-    let json = serde_json::to_value(&outcome).expect("serializes");
-    assert_eq!(json, serde_json::json!({ "status": "max_turns_reached", "max_turns": 17 }));
-}
-
-#[tokio::test]
-async fn max_turns_one_caps_at_the_first_llm_call() -> Result<(), Box<dyn Error>> {
-    // cap=1 means the very first chat call counts as the cap; the run ends
-    // after the LLM has answered once, without a follow-up turn.
-    let tool_request = json!({ "a": 1, "b": 2 });
-    let llm_responses = [
-        llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
-        llm_response().text(&["would have been a second turn"]).build(),
-    ];
-
-    let messages = test_agent().llm_responses(&llm_responses).user_text("single turn").max_turns(1).run().await?;
-
-    // First turn completes (one chat LLM call started); the follow-up chat
-    // turn requested by the tool call is suppressed by the cap.
-    assert_eq!(count_chat_call_started(&messages), 1);
-    let last = messages.last().expect("at least one event");
-    match last.turn_outcome() {
-        Some(TurnOutcome::MaxTurnsReached { max_turns }) => assert_eq!(*max_turns, 1),
-        other => panic!("Expected MaxTurnsReached, got {other:?}"),
-    }
     Ok(())
 }

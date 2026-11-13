@@ -5,7 +5,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Splits a styled line across `width` columns, expanding tabs, honouring
 /// embedded newlines, and preferring word boundaries. Long words still wrap at
 /// the available width.
-pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let max_width = usize::from(width.max(1));
     let characters = line_characters(line.spans, max_width);
 
@@ -35,7 +35,7 @@ pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
 ///
 /// Truncation and cursor placement are both built on this walk so that they can
 /// never disagree about where a column falls.
-pub fn fit_prefix(text: &str, max_width: usize) -> (usize, usize) {
+pub(crate) fn fit_prefix(text: &str, max_width: usize) -> (usize, usize) {
     let mut width = 0;
     let mut bytes = 0;
     for (index, character) in text.char_indices() {
@@ -51,7 +51,7 @@ pub fn fit_prefix(text: &str, max_width: usize) -> (usize, usize) {
 
 /// Byte offset where the longest suffix of `text` that fits within `max_width`
 /// columns begins.
-pub fn fit_suffix(text: &str, max_width: usize) -> usize {
+pub(crate) fn fit_suffix(text: &str, max_width: usize) -> usize {
     let mut width = 0;
     let mut start = text.len();
     for (index, character) in text.char_indices().rev() {
@@ -68,7 +68,7 @@ pub fn fit_suffix(text: &str, max_width: usize) -> usize {
 /// Truncates `spans` to `max_width` columns, appending an ellipsis in
 /// `ellipsis_style` when content was dropped. Returns the spans unchanged when
 /// they already fit.
-pub fn truncate_spans(spans: &[Span<'static>], max_width: usize, ellipsis_style: Style) -> Vec<Span<'static>> {
+pub(crate) fn truncate_spans(spans: &[Span<'static>], max_width: usize, ellipsis_style: Style) -> Vec<Span<'static>> {
     let display_width: usize = spans.iter().map(Span::width).sum();
     if display_width <= max_width {
         return spans.to_vec();
@@ -96,7 +96,7 @@ pub fn truncate_spans(spans: &[Span<'static>], max_width: usize, ellipsis_style:
 /// Keeps the *last* `max_width` columns of `text`, prefixing an ellipsis when
 /// content was dropped. The mirror of [`truncate_to_width`], for tickers that
 /// scroll leftwards as new text arrives.
-pub fn tail_to_width(text: &str, max_width: usize) -> String {
+pub(crate) fn tail_to_width(text: &str, max_width: usize) -> String {
     if text.width() <= max_width {
         return text.to_string();
     }
@@ -111,7 +111,7 @@ pub fn tail_to_width(text: &str, max_width: usize) -> String {
 
 /// Truncates `text` to `max_width` columns, appending an ellipsis when content
 /// was dropped.
-pub fn truncate_to_width(text: &str, max_width: usize) -> String {
+pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     if text.width() <= max_width {
         return text.to_string();
     }
@@ -127,7 +127,7 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// Word-wraps `text` to `max_width` columns, breaking words that cannot fit. The
 /// plain-text view of [`wrap_line`], so styled and unstyled content can never
 /// wrap differently.
-pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     wrap_line(Line::from(Span::raw(text.to_string())), as_u16(max_width))
         .iter()
         .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
@@ -136,7 +136,7 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 
 /// Hard-wraps `text` at `max_width` columns, ignoring word boundaries. Always
 /// returns at least one (possibly empty) line.
-pub fn wrap_text_char(text: &str, max_width: usize) -> Vec<String> {
+pub(crate) fn wrap_text_char(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 || text.is_empty() {
         return vec![String::new()];
     }
@@ -154,7 +154,7 @@ pub fn wrap_text_char(text: &str, max_width: usize) -> Vec<String> {
 
 /// Forces `line` to occupy exactly `width` columns, truncating with an ellipsis
 /// or padding with `fill_style`.
-pub fn fit_line(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
+pub(crate) fn fit_line(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
@@ -169,7 +169,7 @@ pub fn fit_line(mut line: Line<'static>, width: usize, fill_style: Style) -> Lin
 
 /// `count` as a terminal row or column count, saturating rather than wrapping
 /// on the terminals nobody has.
-pub fn as_u16(count: usize) -> u16 {
+pub(crate) fn as_u16(count: usize) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
@@ -314,13 +314,13 @@ mod tests {
     fn truncate_spans_narrow_width_returns_empty() {
         let spans = vec![Span::raw("abc")];
         let result = truncate_spans(&spans, 0, Style::new());
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
     fn truncate_spans_styles_the_ellipsis_for_the_caller() {
         let spans = vec![Span::raw("hello world")];
-        let result = truncate_spans(&spans, 7, Style::new().fg(Color::Red));
+        let result = truncate_spans(&spans, 7, Style::from(Color::Red));
         let ellipsis = result.last().expect("truncation appends an ellipsis");
         assert_eq!(ellipsis.content, "…");
         assert_eq!(ellipsis.style.fg, Some(Color::Red));
@@ -413,11 +413,8 @@ mod tests {
 
     #[test]
     fn wrap_line_breaks_at_whitespace_across_span_boundaries() {
-        let line = Line::from(vec![
-            Span::styled("@aaaaa", Style::new().fg(Color::Red)),
-            Span::raw(" "),
-            Span::styled("@bbbbbb", Style::new().fg(Color::Blue)),
-        ]);
+        let line =
+            Line::from(vec![Span::styled("@aaaaa", Color::Red), Span::raw(" "), Span::styled("@bbbbbb", Color::Blue)]);
 
         let rows = wrap_line(line, 10);
 
@@ -428,10 +425,7 @@ mod tests {
 
     #[test]
     fn wrap_line_drops_whitespace_when_a_new_span_starts_at_the_wrap_boundary() {
-        let line = Line::from(vec![
-            Span::styled("abcdefghij", Style::new().fg(Color::Red)),
-            Span::styled(" klm", Style::new().fg(Color::Blue)),
-        ]);
+        let line = Line::from(vec![Span::styled("abcdefghij", Color::Red), Span::styled(" klm", Color::Blue)]);
 
         let rows = wrap_line(line, 10);
 
@@ -441,7 +435,7 @@ mod tests {
 
     #[test]
     fn wrap_line_hard_wraps_a_long_styled_token_without_whitespace() {
-        let line = Line::from(Span::styled("@abcdefghijk", Style::new().fg(Color::Green)));
+        let line = Line::from(Span::styled("@abcdefghijk", Color::Green));
 
         let rows = wrap_line(line, 5);
 
@@ -478,7 +472,7 @@ mod tests {
 
     #[test]
     fn wrap_line_merges_adjacent_spans_that_share_a_style() {
-        let style = Style::new().fg(Color::Red);
+        let style = Style::from(Color::Red);
         let line = Line::from(vec![Span::styled("hello ", style), Span::styled("world", style)]);
 
         let rows = wrap_line(line, 20);
@@ -492,7 +486,7 @@ mod tests {
     fn wrap_line_carries_line_style_and_alignment_onto_every_row() {
         let line = Line {
             spans: vec![Span::raw("hello world")],
-            style: Style::new().fg(Color::Red),
+            style: Style::from(Color::Red),
             alignment: Some(Alignment::Center),
         };
 
@@ -529,7 +523,7 @@ mod tests {
 
     #[test]
     fn fit_line_styles_the_ellipsis_with_the_fill() {
-        let fill = Style::new().fg(Color::Red);
+        let fill = Style::from(Color::Red);
         let result = fit_line(Line::from("hello world"), 8, fill);
         assert_eq!(result.spans.last().map(|span| span.style.fg), Some(Some(Color::Red)));
     }

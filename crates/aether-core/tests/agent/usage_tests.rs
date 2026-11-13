@@ -1,9 +1,10 @@
 use aether_core::context::CompactionConfig;
 use aether_core::events::{AgentEvent, LlmCallOutcome, SubAgentProgressPayload, ToolEvent, TurnEvent, TurnOutcome};
-use aether_core::testing::{FakeMcpServer, FakeTool, FakeToolResponse, TestScenario, fast_retry, test_agent};
+use aether_core::testing::{TestScenario, fast_retry, test_agent};
 use llm::alloyed::AlloyedModelProvider;
 use llm::testing::{FakeLlmProvider, llm_response, priced_model, session_usage_event};
 use llm::{ChatMessage, LlmCallPurpose, LlmModel, ProviderError, SessionUsageEvent, TokenUsage, UsageSource, Usd};
+use mcp_utils::testing::{FakeMcpServer, FakeTool, FakeToolResponse};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -170,7 +171,7 @@ async fn sub_agent_usage_is_folded_into_the_parent_totals_before_the_tool_result
     let mut child_usage = session_usage_event(9, TokenUsage::new(8, 4));
     child_usage.source = UsageSource::new("explorer");
     let payload = SubAgentProgressPayload {
-        task_id: "task_0".to_string(),
+        session_id: "child".to_string(),
         agent_name: "explorer".to_string(),
         event: AgentEvent::SessionUsage(child_usage.clone()),
     };
@@ -181,7 +182,7 @@ async fn sub_agent_usage_is_folded_into_the_parent_totals_before_the_tool_result
     let arguments = serde_json::json!({}).to_string();
 
     let events = test_agent()
-        .fake_mcp_server("agents", server)
+        .mcp_server("agents", server)
         .llm_responses(&[
             llm_response().tool_call("spawn-call", "agents__spawn", &[&arguments]).build(),
             llm_response().usage(1, 1).text(&["all done"]).build(),
@@ -198,7 +199,7 @@ async fn sub_agent_usage_is_folded_into_the_parent_totals_before_the_tool_result
     assert_eq!(folded.source.agent_id, child_usage.source.agent_id);
     assert_eq!(folded.source.agent_name, "explorer");
     assert_eq!(folded.source.parent_agent_id.as_deref(), Some(own.source.agent_id.as_str()));
-    assert_eq!(folded.source.task_id.as_deref(), Some("task_0"));
+    assert_eq!(folded.source.sub_agent_session_id.as_deref(), Some("child"));
     assert_eq!(folded.tokens, child_usage.tokens);
     assert_eq!(folded.totals.tokens, child_usage.tokens);
     assert_eq!(own.sequence, 2);
@@ -207,15 +208,15 @@ async fn sub_agent_usage_is_folded_into_the_parent_totals_before_the_tool_result
     assert_eq!(own.totals.unpriced_calls, 2);
 
     let folded_index = position(&events, |event| matches!(event, AgentEvent::SessionUsage(_)));
-    let typed_progress_index = position(
-        &events,
-        |event| matches!(event, AgentEvent::Tool(ToolEvent::SubAgentProgress { request, payload: seen }) if request.id == "spawn-call" && **seen == payload),
-    );
     let result_index = position(
         &events,
         |event| matches!(event, AgentEvent::Tool(ToolEvent::Result { result, .. }) if result.id == "spawn-call"),
     );
-    assert!(folded_index < typed_progress_index && typed_progress_index < result_index);
+    assert!(folded_index < result_index);
+    assert!(
+        !events.iter().any(|event| matches!(event, AgentEvent::Tool(ToolEvent::SubAgentProgress { .. }))),
+        "the folded sample replaces the child's own"
+    );
     assert!(
         !events.iter().any(
             |event| matches!(event, AgentEvent::Tool(ToolEvent::Progress { request, .. }) if request.id == "spawn-call")

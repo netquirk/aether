@@ -1,11 +1,10 @@
-import type * as acp from "@agentclientprotocol/sdk/experimental/v2";
+import type * as acp from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   CallToolResult,
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
-import type { ReasoningEffort } from "./generated/aether-settings.js";
-import type { SessionUsageEvent } from "./generated/eval-types.js";
+import type { ReasoningEffort, SessionUsageEvent } from "./generated/types.js";
 
 export type AgentSelection =
   | { agent: string; model?: never; reasoningEffort?: never }
@@ -20,6 +19,8 @@ export interface SdkMcpToolDefinition<Schema extends z.ZodRawShape> {
   annotations?: ToolAnnotations;
 }
 
+export type StopReason = NonNullable<acp.IdleStateUpdate["stopReason"]>;
+
 export type AetherMessage =
   | {
       type: "session_update";
@@ -29,5 +30,5 @@ export type AetherMessage =
     }
   | { type: "usage"; usage: SessionUsageEvent }
   | { type: "elicitation_complete"; elicitationId: string }
-  | { type: "result"; sessionId: string; stopReason: acp.StopReason }
+  | { type: "result"; sessionId: string; stopReason: StopReason }
   | { type: "error"; error: unknown };

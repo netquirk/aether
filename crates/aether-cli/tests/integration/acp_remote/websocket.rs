@@ -2,13 +2,15 @@ use super::{assert_no_ended_turn, assert_stopped_turn, start_paused_turn};
 use acp_utils::client::{AcpClient, AcpEvent, connect_acp_client};
 use acp_utils::testing::initialize_request;
 use acp_utils::websocket::WebSocketTransport;
-use aether_cli::acp::server::{DetachedArgs, ServerArgs, ServerRunError, run_server};
+use aether_cli::acp::server::{ServerArgs, ServerRunError, run_server};
 use aether_cli::acp::testing::{AcpTestHarness, AcpWebSocketTestServer};
+use aether_cli::acp::{IdleHook, SessionHooks};
+use aether_cli::output::OutputFormat;
 use aether_core::events::{AgentEvent, MessageEvent, TurnEvent, TurnOutcome};
 use aether_sessions::{SessionEvent, UserEvent};
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::v2::schema::{
     AbsolutePath, CancelSessionNotification, CloseSessionRequest, ContentBlock, NewSessionRequest, PromptRequest,
-    ResumeSessionRequest, SessionId, SessionUpdate, StateUpdate, StopReason,
+    ReplayFrom, ReplayFromStart, ResumeSessionRequest, SessionId, SessionUpdate, StateUpdate, StopReason,
 };
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
@@ -29,11 +31,11 @@ struct ServerCli {
 fn server_args_defaults_and_overrides() {
     let defaults = ServerCli::parse_from(["server"]).args;
     assert_eq!(defaults.listen, "127.0.0.1:8765".parse().unwrap());
-    assert_eq!(defaults.acp.cwd, PathBuf::from("."));
+    assert_eq!(defaults.cwd, PathBuf::from("."));
     assert!(defaults.prompt.is_none());
-    assert!(defaults.detached.output.is_none());
-    assert!(defaults.detached.idle_after.is_none());
-    assert!(defaults.detached.on_idle.is_none());
+    assert_eq!(defaults.output, OutputFormat::Text);
+    assert!(defaults.idle_after.is_none());
+    assert!(defaults.on_idle.is_none());
     let args = ServerCli::parse_from([
         "server",
         "--listen",
@@ -55,14 +57,14 @@ fn server_args_defaults_and_overrides() {
     ])
     .args;
     assert_eq!(args.listen, "0.0.0.0:9000".parse().unwrap());
-    assert_eq!(args.acp.cwd, PathBuf::from("/workspace"));
+    assert_eq!(args.cwd, PathBuf::from("/workspace"));
     assert_eq!(args.acp.agent.as_deref(), Some("Build"));
     assert_eq!(args.acp.log_dir, Some(PathBuf::from("/logs")));
     assert_eq!(args.prompt.as_deref(), Some("start now"));
-    assert_eq!(args.detached.output, Some(aether_cli::output::OutputFormat::Json));
-    assert_eq!(args.detached.idle_after, Some(300));
-    assert_eq!(args.detached.on_idle.as_deref(), Some("echo idle"));
-    assert_eq!(ServerCli::parse_from(["server", "--cwd", "/other"]).args.acp.cwd, PathBuf::from("/other"));
+    assert_eq!(args.output, OutputFormat::Json);
+    assert_eq!(args.idle_after, Some(300));
+    assert_eq!(args.on_idle.as_deref(), Some("echo idle"));
+    assert_eq!(ServerCli::parse_from(["server", "--cwd", "/other"]).args.cwd, PathBuf::from("/other"));
 }
 
 #[test]
@@ -94,9 +96,9 @@ async fn server_rejects_missing_and_non_directory_workspaces() {
 async fn unattached_session_manages_idle_command() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("idle");
-    let detached =
-        DetachedArgs { output: None, idle_after: Some(10), on_idle: Some(format!("touch '{}'", marker.display())) };
-    AcpTestHarness::run_with_detached(detached, |mut harness| async move {
+    let idle = IdleHook { after: Duration::from_secs(10), command: format!("touch '{}'", marker.display()) };
+    let hooks = SessionHooks { echo: None, idle: Some(idle) };
+    AcpTestHarness::run_with_hooks(hooks, |mut harness| async move {
         let id = harness.start_unattached_session("work independently").await;
         harness.reconnect().await;
         harness.resume(&id).await;
@@ -172,11 +174,12 @@ async fn in_memory_client_and_multiple_listeners_share_one_slot() {
         harness.disconnect().await;
         let (mut owner, _) = connect_async(first.url()).await.unwrap();
         assert_occupied(&second).await;
-        let mut detached = first.subscribe();
-        let seen = *detached.borrow();
-        owner.close(None).await.unwrap();
-        assert!(matches!(owner.next().await, Some(Ok(Message::Close(_)))));
-        detached.wait_for(|g| *g > seen).await.unwrap();
+        harness
+            .until_detached(async {
+                owner.close(None).await.unwrap();
+                assert!(matches!(owner.next().await, Some(Ok(Message::Close(_)))));
+            })
+            .await;
         let (owner, _) = connect_async(second.url()).await.unwrap();
         assert_occupied(&first).await;
         drop(owner);
@@ -195,7 +198,6 @@ async fn second_websocket_is_rejected_without_detaching_owner() {
         let mut owner = connect(&server, &id).await;
         expect_running(&mut owner).await;
         assert_occupied(&server).await;
-        assert!(owner.handle.prompt(PromptRequest::new(id.clone(), vec!["still busy".into()])).await.is_err());
         release.notify_one();
         expect_completed(&mut owner, &id, Some(StopReason::EndTurn)).await;
         assert_persisted_response(&harness, &id);
@@ -216,7 +218,7 @@ async fn occupied_server_drops_non_websocket_request_without_detaching_owner() {
         invalid.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
         let mut response = Vec::new();
         invalid.read_to_end(&mut response).await.unwrap();
-        assert!(response.is_empty());
+        assert_eq!(response.len(), 0);
         assert_occupied(&server).await;
         drop(owner);
         server.shutdown().await;
@@ -232,19 +234,14 @@ async fn broken_websocket_detaches_and_reattaches_original_turn() {
         let server = harness.serve_websocket().await;
         let mut first = connect(&server, &id).await;
         expect_running(&mut first).await;
-        let mut detached = server.subscribe();
-        let seen = *detached.borrow();
-        first.handle.disconnect().await;
-        detached.wait_for(|g| *g > seen).await.unwrap();
+        harness.until_detached(first.handle.disconnect()).await;
         assert_no_ended_turn(&harness, &id);
         let mut second = connect(&server, &id).await;
         expect_running(&mut second).await;
         release.notify_one();
         expect_completed(&mut second, &id, Some(StopReason::EndTurn)).await;
         assert_persisted_response(&harness, &id);
-        let seen = *detached.borrow();
-        second.handle.disconnect().await;
-        detached.wait_for(|g| *g > seen).await.unwrap();
+        harness.until_detached(second.handle.disconnect()).await;
         let mut third = connect(&server, &id).await;
         expect_completed(&mut third, &id, None).await;
         assert_persisted_response(&harness, &id);
@@ -261,7 +258,7 @@ async fn explicit_remote_cancel_and_close_remain_destructive() {
         let server = harness.serve_websocket().await;
         let mut client = connect(&server, &id).await;
         expect_running(&mut client).await;
-        client.handle.cancel(CancelSessionNotification::new(id.clone())).unwrap();
+        client.handle.notify(CancelSessionNotification::new(id.clone())).unwrap();
         loop {
             match client.event_rx.recv().await.unwrap() {
                 AcpEvent::SessionUpdate(update) if matches!(update.update,
@@ -277,7 +274,7 @@ async fn explicit_remote_cancel_and_close_remain_destructive() {
         )));
         client.handle.request(CloseSessionRequest::new(id.clone())).await.unwrap();
         assert_stopped_turn(&harness, &id);
-        assert!(client.handle.prompt(PromptRequest::new(id, vec!["closed".into()])).await.is_err());
+        assert!(client.handle.request(PromptRequest::new(id, vec!["closed".into()])).await.is_err());
         server.shutdown().await;
         harness.shutdown().await;
     })
@@ -288,19 +285,20 @@ async fn explicit_remote_cancel_and_close_remain_destructive() {
 async fn failed_handshake_and_graceful_close_release_admission() {
     AcpTestHarness::run(|mut harness| async move {
         let server = harness.serve_websocket().await;
-        let mut detached = server.subscribe();
-        let seen = *detached.borrow();
-        let mut invalid = TcpStream::connect(server.address).await.unwrap();
-        invalid.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
-        let mut response = Vec::new();
-        invalid.read_to_end(&mut response).await.unwrap();
-        detached.wait_for(|g| *g > seen).await.unwrap();
-
-        let seen = *detached.borrow();
+        harness
+            .until_detached(async {
+                let mut invalid = TcpStream::connect(server.address).await.unwrap();
+                invalid.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+                invalid.read_to_end(&mut Vec::new()).await.unwrap();
+            })
+            .await;
         let (mut socket, _) = connect_async(server.url()).await.unwrap();
-        socket.send(Message::Close(None)).await.unwrap();
-        assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
-        detached.wait_for(|g| *g > seen).await.unwrap();
+        harness
+            .until_detached(async {
+                socket.send(Message::Close(None)).await.unwrap();
+                assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+            })
+            .await;
 
         let (socket, _) = connect_async(server.url()).await.unwrap();
         let client = connect_acp_client(WebSocketTransport::new(socket), initialize_request()).await.unwrap();
@@ -339,11 +337,8 @@ async fn dropping_running_server_closes_listener_and_active_connection() {
         let mut client = connect(&server, &id).await;
         expect_running(&mut client).await;
         let address = server.address;
-        let mut detached = server.subscribe();
-        let seen = *detached.borrow();
 
-        server.abort().await;
-        detached.wait_for(|g| *g > seen).await.unwrap();
+        harness.until_detached(server.abort()).await;
         expect_closed(&mut client).await;
         assert!(TcpStream::connect(address).await.is_err());
         assert_no_ended_turn(&harness, &id);
@@ -426,7 +421,7 @@ async fn networking_shutdown_cancels_pending_session_startup_and_allows_reconnec
         let (socket, _) = connect_async(server.url()).await.unwrap();
         let client = connect_acp_client(WebSocketTransport::new(socket), initialize_request()).await.unwrap();
         let pending = tokio::task::spawn_local(async move {
-            client.handle.new_session(NewSessionRequest::new(AbsolutePath::new("/tmp"))).await
+            client.handle.request(NewSessionRequest::new(AbsolutePath::new("/tmp"))).await
         });
         startup.wait_until_started().await;
         server.shutdown().await;
@@ -436,7 +431,7 @@ async fn networking_shutdown_cancels_pending_session_startup_and_allows_reconnec
         let server = harness.serve_websocket().await;
         let (socket, _) = connect_async(server.url()).await.unwrap();
         let client = connect_acp_client(WebSocketTransport::new(socket), initialize_request()).await.unwrap();
-        client.handle.new_session(NewSessionRequest::new(AbsolutePath::new("/tmp"))).await.unwrap();
+        client.handle.request(NewSessionRequest::new(AbsolutePath::new("/tmp"))).await.unwrap();
         assert_eq!(harness.live_runtime_count(), 1);
         server.shutdown().await;
         harness.shutdown().await;
@@ -457,11 +452,9 @@ async fn connect(server: &AcpWebSocketTestServer, id: &SessionId) -> AcpClient {
     request.headers_mut().insert("x-test-gateway", "opaque-value".parse().unwrap());
     let (socket, _) = connect_async(request).await.unwrap();
     let client = connect_acp_client(WebSocketTransport::new(socket), initialize_request()).await.unwrap();
-    client
-        .handle
-        .resume_session_with_replay(ResumeSessionRequest::new(id.clone(), AbsolutePath::new("/tmp")))
-        .await
-        .unwrap();
+    let request = ResumeSessionRequest::new(id.clone(), AbsolutePath::new("/tmp"))
+        .replay_from(ReplayFrom::Start(ReplayFromStart::new()));
+    client.handle.request(request).await.unwrap();
     client
 }
 

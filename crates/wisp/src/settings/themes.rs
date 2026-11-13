@@ -1,15 +1,10 @@
-use clankerdiff_ratatui::theme::{ReviewTheme, ThemeChoice};
+use clankerdiff_ratatui::theme::ThemeChoice;
 
 use crate::theme::{Theme, ThemeLoadError};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn builtin_review_theme_choices() -> Vec<ThemeChoice> {
-    clankerdiff_ratatui::theme::ReviewTheme::catalog()
-        .into_iter()
-        .map(|descriptor| {
-            ThemeChoice::new(descriptor.name, ReviewTheme::builtin(&descriptor.id).expect("catalog theme"))
-        })
-        .collect()
+    ThemeChoice::catalog().to_vec()
 }
 
 pub(crate) fn review_theme_choices() -> Vec<ThemeChoice> {
@@ -72,5 +67,5 @@ fn resolve_theme_file_path_from_name(file: &str) -> Result<PathBuf, ThemeLoadErr
 }
 
 fn themes_dir_path() -> Option<PathBuf> {
-    Some(super::store()?.home().join("themes"))
+    super::wisp_home().map(|home| home.join("themes"))
 }

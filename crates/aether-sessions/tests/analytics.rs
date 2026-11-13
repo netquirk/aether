@@ -122,12 +122,63 @@ async fn typed_projection_exposes_event_fields() {
 }
 
 #[tokio::test]
+async fn tool_call_arguments_are_backfilled_from_the_matching_result_or_error() {
+    let fixture = Fixture::new();
+    fixture.write_session(
+        "s1.jsonl",
+        &[
+            user_message("hello"),
+            tool_call("call-edit", "edit_file", ""),
+            SessionEvent::Agent(AgentEvent::tool_result("call-edit", "edit_file", r#"{"path":"a.rs"}"#, "ok")),
+            tool_call("call-bash", "bash", ""),
+            SessionEvent::Agent(AgentEvent::tool_error("call-bash", "bash", r#"{"command":"ls"}"#, "failed")),
+            tool_call("call-read", "read", r#"{"path":"b.rs"}"#),
+        ],
+    );
+    fixture.ingest().await;
+
+    let tools = fixture
+        .query("select event_type, tool_call_id, tool_arguments from events where tool_call_id is not null order by event_index")
+        .await;
+    assert_eq!(
+        tools.rows,
+        vec![
+            vec![json!("tool_call"), json!("call-edit"), json!(r#"{"path":"a.rs"}"#)],
+            vec![json!("tool_result"), json!("call-edit"), json!(r#"{"path":"a.rs"}"#)],
+            vec![json!("tool_call"), json!("call-bash"), json!(r#"{"command":"ls"}"#)],
+            vec![json!("tool_error"), json!("call-bash"), json!(r#"{"command":"ls"}"#)],
+            vec![json!("tool_call"), json!("call-read"), json!(r#"{"path":"b.rs"}"#)],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn backfilled_arguments_come_from_the_same_call_when_ids_repeat() {
+    let fixture = Fixture::new();
+    fixture.write_session(
+        "s1.jsonl",
+        &[
+            user_message("first"),
+            tool_call("tool_call_0", "bash", ""),
+            SessionEvent::Agent(AgentEvent::tool_result("tool_call_0", "bash", r#"{"command":"ls"}"#, "ok")),
+            user_message("second"),
+            tool_call("tool_call_0", "bash", ""),
+            SessionEvent::Agent(AgentEvent::tool_error("tool_call_0", "bash", r#"{"command":"pwd"}"#, "failed")),
+        ],
+    );
+    fixture.ingest().await;
+
+    let calls = fixture.query("select tool_arguments from tool_calls order by event_index").await;
+    assert_eq!(calls.rows, vec![vec![json!(r#"{"command":"ls"}"#)], vec![json!(r#"{"command":"pwd"}"#)]]);
+}
+
+#[tokio::test]
 async fn session_usage_columns_are_projected_for_root_and_sub_agent_samples() {
     let fixture = Fixture::new();
     let root = UsageSource::new("root");
     let mut child = UsageSource::new("explorer");
     child.parent_agent_id = Some(root.agent_id.clone());
-    child.task_id = Some("task_0".to_string());
+    child.sub_agent_session_id = Some("child".to_string());
     let child_usage = SessionUsageEvent {
         source: child,
         purpose: LlmCallPurpose::Compaction,
@@ -150,7 +201,7 @@ async fn session_usage_columns_are_projected_for_root_and_sub_agent_samples() {
 
     let rows = fixture
         .query(
-            "select usage_sequence, agent_name, parent_agent_id, task_id, call_purpose, provider, model_name, input_tokens, cache_read_tokens, total_input_tokens, estimated_cost_usd, total_estimated_cost_usd, unpriced_calls from session_usage order by usage_sequence",
+            "select usage_sequence, agent_name, parent_agent_id, sub_agent_session_id, call_purpose, provider, model_name, input_tokens, cache_read_tokens, total_input_tokens, estimated_cost_usd, total_estimated_cost_usd, unpriced_calls from session_usage order by usage_sequence",
         )
         .await;
     assert_eq!(
@@ -175,7 +226,7 @@ async fn session_usage_columns_are_projected_for_root_and_sub_agent_samples() {
                 json!(2),
                 json!("explorer"),
                 json!(root.agent_id),
-                json!("task_0"),
+                json!("child"),
                 json!("compaction"),
                 serde_json::Value::Null,
                 serde_json::Value::Null,
@@ -342,14 +393,7 @@ async fn read_only_query_safety_keeps_rows() {
     fixture.write_session("s1.jsonl", &[user_message("hello")]);
     fixture.ingest().await;
 
-    let result = run_query(&QueryOptions {
-        db_path: fixture.db_path.clone(),
-        sql: "delete from events".to_string(),
-        max_rows: 100,
-        max_cell_chars: 1000,
-        timeout_ms: 2000,
-    })
-    .await;
+    let result = run_query(&QueryOptions::new(&fixture.db_path, "delete from events")).await;
 
     assert!(matches!(result, Err(SessionIndexError::Sqlx(_))));
     let output = fixture.query("select count(*) from events").await;
@@ -391,7 +435,7 @@ impl Fixture {
     }
 
     async fn query(&self, sql: &str) -> aether_sessions::analytics::QueryOutput {
-        run_query(&self.query_options(sql)).await.unwrap()
+        run_query(&QueryOptions::new(&self.db_path, sql)).await.unwrap()
     }
 
     fn ingest_options(&self) -> IngestOptions {
@@ -400,16 +444,6 @@ impl Fixture {
             db_path: self.db_path.clone(),
             prune: true,
             parse_concurrency: 2,
-        }
-    }
-
-    fn query_options(&self, sql: &str) -> QueryOptions {
-        QueryOptions {
-            db_path: self.db_path.clone(),
-            sql: sql.to_string(),
-            max_rows: 100,
-            max_cell_chars: 1000,
-            timeout_ms: 2000,
         }
     }
 }

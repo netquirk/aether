@@ -4,12 +4,13 @@ use acp_utils::client::{AcpEvent, connect_acp_client};
 use acp_utils::testing::{idle_notification, initialize_request, initialize_response, running_notification};
 use acp_utils::websocket::WebSocketTransport;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::v2::schema::{
     ContentBlock, ContentChunk, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, InitializeRequest, PromptRequest, PromptResponse,
-    SessionUpdate, StateUpdate, StopReason, TextContent, UpdateSessionNotification,
+    ReplayFrom, ReplayFromStart, ResumeSessionRequest, SessionUpdate, StateUpdate, StopReason, TextContent,
+    UpdateSessionNotification,
 };
-use agent_client_protocol::{self as acp, Agent, Client, HandleDispatchFrom, NullRun, V2Builder};
+use agent_client_protocol::{self as acp, Agent, Client, HandleDispatchFrom, NullRun, v2};
 use futures::{FutureExt, SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::io::{DuplexStream, duplex};
@@ -39,7 +40,7 @@ async fn acp_over_websocket_with_elicitation() -> Result<(), TestError> {
 
             let handle = client.handle.clone();
             let prompt = spawn_local(async move {
-                handle.prompt(PromptRequest::new("session", vec![ContentBlock::Text(TextContent::new("hi"))])).await
+                handle.request(PromptRequest::new("session", vec![ContentBlock::Text(TextContent::new("hi"))])).await
             });
 
             let Some(AcpEvent::SessionUpdate(notification)) = client.event_rx.recv().await else {
@@ -159,7 +160,6 @@ async fn final_response_is_not_lost_when_close_is_already_buffered() -> Result<(
 
 #[tokio::test]
 async fn final_turn_and_replay_events_are_delivered_before_buffered_close() -> Result<(), TestError> {
-    use acp::schema::v2::ResumeSessionRequest;
     use acp_utils::client::AcpEvent;
 
     LocalSet::new()
@@ -171,11 +171,11 @@ async fn final_turn_and_replay_events_are_delivered_before_buffered_close() -> R
                     .build_closing_agent()
                     .await?;
                 if replay {
-                    client.handle.resume_session_with_replay(ResumeSessionRequest::new("session", "/tmp")).await?;
+                    client.handle.request(replaying("session")).await?;
                     assert!(matches!(client.event_rx.recv().await, Some(AcpEvent::SessionUpdate(notification))
                     if *notification == idle_notification("session", Some(StopReason::EndTurn))));
                 } else {
-                    client.handle.prompt(PromptRequest::new("session", vec![])).await?;
+                    client.handle.request(PromptRequest::new("session", vec![])).await?;
                     assert!(matches!(client.event_rx.recv().await, Some(AcpEvent::SessionUpdate(notification))
                     if notification.update == idle_notification("session", Some(StopReason::EndTurn)).update));
                 }
@@ -192,8 +192,6 @@ async fn final_turn_and_replay_events_are_delivered_before_buffered_close() -> R
 
 #[tokio::test]
 async fn burst_and_replay_updates_survive_backpressure_and_buffered_close() -> Result<(), TestError> {
-    use acp::schema::v2::ResumeSessionRequest;
-
     LocalSet::new()
         .run_until(async {
             for replay in [false, true] {
@@ -217,9 +215,9 @@ async fn burst_and_replay_updates_survive_backpressure_and_buffered_close() -> R
                 }
                 let (mut client, peer) = builder.build_closing_agent().await?;
                 if replay {
-                    client.handle.resume_session_with_replay(ResumeSessionRequest::new("session", "/tmp")).await?;
+                    client.handle.request(replaying("session")).await?;
                 } else {
-                    client.handle.prompt(PromptRequest::new("session", vec![])).await?;
+                    client.handle.request(PromptRequest::new("session", vec![])).await?;
                 }
                 for expected in updates {
                     let Some(AcpEvent::SessionUpdate(notification)) = client.event_rx.recv().await else {
@@ -342,7 +340,9 @@ impl SocketPairBuilder {
             server.send(Message::Text(response.to_string().into())).await?;
             let request = receive_json(&mut server).await?;
             let notification = |update| json!({"jsonrpc": "2.0", "method": "session/update", "params": update});
-            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": {}});
+            let result =
+                if request["method"] == "session/prompt" { json!({"messageId": "user-message"}) } else { json!({}) };
+            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
             for message in
                 before.into_iter().map(notification).chain([response]).chain(after.into_iter().map(notification))
             {
@@ -399,7 +399,11 @@ async fn receive_json(socket: &mut WebSocketStream<DuplexStream>) -> Result<serd
     Ok(serde_json::from_str(&text)?)
 }
 
-fn test_agent() -> V2Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
+fn replaying(session_id: &str) -> ResumeSessionRequest {
+    ResumeSessionRequest::new(session_id, "/tmp").replay_from(ReplayFrom::Start(ReplayFromStart::new()))
+}
+
+fn test_agent() -> v2::Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
     Agent.v2().on_receive_request(
         async |_: InitializeRequest, responder, _cx| responder.respond(initialize_response()),
         acp::on_receive_request!(),
@@ -408,10 +412,10 @@ fn test_agent() -> V2Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
 
 fn streaming_elicitation_agent(
     chunks: &'static [&'static str],
-) -> V2Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
+) -> v2::Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
     test_agent().on_receive_request(
         async move |request: PromptRequest, responder, cx| {
-            responder.respond(PromptResponse::new())?;
+            responder.respond(PromptResponse::new("user-message"))?;
             cx.send_notification(running_notification(request.session_id.clone()))?;
             for &text in chunks {
                 cx.send_notification(UpdateSessionNotification::new(

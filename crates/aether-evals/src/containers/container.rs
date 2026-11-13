@@ -7,6 +7,8 @@ use testcontainers::core::{ExecCommand, ExecResult, Mount};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::io::AsyncBufRead;
+use tokio::runtime::Handle;
+use tokio::task::spawn_blocking;
 
 use super::{ContainerError, Image};
 
@@ -27,6 +29,7 @@ pub struct ContainerBuilder {
     env_vars: BTreeMap<String, String>,
     mounts: Vec<Mount>,
     ephemeral_mounts: Vec<String>,
+    privileged: bool,
 }
 
 pub struct ExecOutput {
@@ -41,7 +44,13 @@ pub(crate) struct ExecHandle {
 
 impl Container {
     pub fn builder(image: Image) -> ContainerBuilder {
-        ContainerBuilder { image, env_vars: BTreeMap::new(), mounts: Vec::new(), ephemeral_mounts: Vec::new() }
+        ContainerBuilder {
+            image,
+            env_vars: BTreeMap::new(),
+            mounts: Vec::new(),
+            ephemeral_mounts: Vec::new(),
+            privileged: false,
+        }
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -72,6 +81,12 @@ impl Container {
 }
 
 impl ContainerBuilder {
+    /// Enables Docker privileged mode.
+    pub fn with_privileged(mut self, privileged: bool) -> Self {
+        self.privileged = privileged;
+        self
+    }
+
     pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_vars.insert(key.into(), value.into());
         self
@@ -97,6 +112,7 @@ impl ContainerBuilder {
         let container_cwd = container_cwd(&container_workspace_root, workspace.relative_cwd());
         let mut image = GenericImage::new(&self.image.name, &self.image.tag)
             .with_entrypoint("/bin/sh")
+            .with_privileged(self.privileged)
             .with_cmd(["-c", "sleep infinity"])
             .with_mount(Mount::bind_mount(workspace.root_path().display().to_string(), "/workspace"))
             .with_working_dir(container_cwd.display().to_string());
@@ -129,19 +145,27 @@ impl ContainerBuilder {
 }
 
 impl ExecHandle {
-    pub fn stdout(&mut self) -> impl AsyncBufRead + Send + '_ {
+    pub(crate) fn stdout(&mut self) -> impl AsyncBufRead + Send + '_ {
         self.exec.stdout()
     }
 
-    pub async fn stderr_to_string(&mut self) -> Result<String, ContainerError> {
+    pub(crate) async fn stderr_to_string(&mut self) -> Result<String, ContainerError> {
         let stderr = self.exec.stderr_to_vec().await?;
         Ok(String::from_utf8_lossy(&stderr).into_owned())
     }
 
-    pub async fn collect(mut self) -> Result<ExecOutput, ContainerError> {
+    pub(crate) async fn exit_code(self) -> Result<i64, ContainerError> {
+        let runtime = Handle::current();
+        spawn_blocking(move || runtime.block_on(self.exec.exit_code()))
+            .await
+            .map_err(|source| ContainerError::ExecInspection { source })??
+            .ok_or(ContainerError::MissingExecExitCode)
+    }
+
+    pub(crate) async fn collect(mut self) -> Result<ExecOutput, ContainerError> {
         let stdout = String::from_utf8_lossy(&self.exec.stdout_to_vec().await?).into_owned();
         let stderr = String::from_utf8_lossy(&self.exec.stderr_to_vec().await?).into_owned();
-        let exit_code = self.exec.exit_code().await?.ok_or(ContainerError::MissingExecExitCode)?;
+        let exit_code = self.exit_code().await?;
         Ok(ExecOutput { exit_code, stdout, stderr })
     }
 }

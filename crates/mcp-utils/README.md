@@ -1,30 +1,25 @@
 # aether-mcp-utils
 
-Utilities for the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), providing transport, status tracking, and client management for MCP servers.
+[Model Context Protocol](https://modelcontextprotocol.io/) (MCP) building blocks on top of
+[rmcp](https://docs.rs/rmcp): connect to a server, host a server, or aggregate many servers
+behind one gateway.
 
 ## Table of Contents
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
-- [Key Types](#key-types)
 - [Feature Flags](#feature-flags)
 - [License](#license)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
-## Key Types
-
-- **`McpServerStatus`** -- Tracks server connection state (`Connected`, `Failed`, `NeedsOAuth`)
-- **`ToolCatalog`** -- The per-agent, I/O-free view of MCP servers, tools, exposure, filtering, instructions, and route authorization
-- **`ToolDisplayMeta` / `ToolResultMeta`** -- Metadata for rendering tool calls and results in UIs
-
-
 ## Feature Flags
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| `client` | MCP client with OAuth, server management, and deferred tool routing | yes |
+| `client` | `client` and `gateway`, including OAuth. Without it, only server hosting remains. | yes |
+| `testing` | `testing`: an in-memory `FakeMcpServer`, an OAuth-protected `FakeAuthServer`, and a scripted elicitation host | no |
 
 ## License
 

@@ -4,7 +4,7 @@ Pre-built [MCP](https://modelcontextprotocol.io/) tool servers for Aether agents
 
 | Feature | Server | What it provides |
 |---------|--------|-----------------|
-| `coding` | [`CodingMcp`](src/coding/README.md) | File read/write/edit, bash, grep, `ast_grep` structural search, find, LSP integration, web fetch/search |
+| `coding` | [`CodingMcp`](src/coding/README.md) | File read/write/edit, bash, LSP integration, web fetch/search |
 | `skills` | [`SkillsMcp`](src/skills/README.md) | Slash commands and reusable skill prompts |
 | `tasks` | [`TasksMcp`](src/tasks/README.md) | Hierarchical task management with dependencies |
 | `subagents` | [`SubAgentsMcp`](src/subagents/README.md) | Spawn concurrent sub-agents in the foreground or as an MCP Task |
@@ -29,7 +29,6 @@ Full API documentation is available on [docs.rs](https://docs.rs/aether-mcp-serv
 
 Key entry points:
 - [`CodingMcp`] -- file I/O, shell, search, and LSP tools
-- [`CodingTools`](coding::CodingTools) -- trait for custom tool backends
 - [`LspRegistry`](lsp::LspRegistry) -- manages LSP daemon connections
 - [`TasksMcp`](tasks::TasksMcp) -- hierarchical task management
 - [`SkillsMcp`](skills::SkillsMcp) -- skill prompts and slash commands
@@ -66,16 +65,17 @@ These servers use Aether's `in-memory` transport type -- they run inside your ag
 }
 ```
 
-Each server key must match a factory registered with `McpBuilder::register_in_memory_server()`. Config loading only records a cloneable in-memory server specification and expands its variables. The factory is invoked exactly once during `McpBuilder::spawn`, after the runtime MCP handle exists. It receives the specification plus `RuntimeServices` containing the live `McpHandle`, root directory, and `AgentDeps`. The `args` array is parsed as CLI flags by each server:
+Each server key must match a factory registered with `McpBuilder::register_in_memory_server()`. Loading the config only expands the server's variables. The factory is invoked exactly once during `McpBuilder::spawn`, after the deferred-tools endpoint is bound. It receives the server's `args`, with variables expanded, plus `RuntimeServices` containing the root directory, `AgentDeps`, and the deferred-tools socket path (when any server defers its tools). The `args` array is parsed as CLI flags by each server, with relative paths resolved against the root directory. Invalid `args` fail `spawn` with `McpSpawnError::ServerFactory` rather than falling back to defaults:
 
 | Server | Flag | Default | Description |
 |--------|------|---------|-------------|
-| `coding` | `--root-dir <path>` | cwd | Workspace root for LSP and file operations |
+| `coding` | `--root-dir <path>` | workspace root | Workspace root for LSP and file operations |
 | `coding` | `--rules-dir <path>` (repeatable) | none | Explicit prompt directories for automatic read-triggered rules |
-| `coding` | `--disable-lsp` | enabled | Disable LSP-backed tools and `aether-lspd` daemon connections |
+| `coding` | `--permission-mode <mode>` | `always-allow` | `always-allow`, `auto`, or `always-ask` |
+| `coding` | `--disable-lsp` | enabled | Disable LSP-backed tools and `clankerdiff-lspd` daemon connections |
 | `skills` | `--dir <path>` (repeatable) | required | Prompt directories to scan |
-| `tasks` | `--dir <path>` | `.` | Base directory for task storage (creates `.aether-tasks/` inside) |
-| `subagents` | `--project-root <path>` (alias: `--dir`) | `.` | Project root containing optional `.aether/settings.json` authored agents |
+| `tasks` | `--dir <path>` | session-scoped temp dir | Base directory for persistent task storage (creates `.aether-tasks/` inside) |
+| `subagents` | `--project-root <path>` (alias: `--dir`) | workspace root | Project root containing optional `.aether/settings.json` authored agents |
 | `review` | `--root-dir <path>` | workspace root | Base for relative artifact paths |
 
 To register factories and load the config:
@@ -83,25 +83,23 @@ To register factories and load the config:
 ```rust,ignore
 use aether_core::mcp::mcp;
 use mcp_servers::McpBuilderExt;
+use aether_core::mcp::McpConfig;
 
 let builder = mcp("/my/project")
     .with_agent_deps(deps)
     .with_builtin_servers()
-    .from_json_files(&["mcp.json"])?;
+    .with_config(McpConfig::from_json_file("mcp.json")?)?;
 
 // Built-in factories have not run yet. They receive RuntimeServices here.
-let runtime = builder.spawn().await?;
+let runtime = builder.spawn()?;
 ```
 
-Custom factories use the same lazy signature:
+Custom factories use the same lazy signature and return an error for invalid `args`:
 
 ```rust,ignore
-builder.register_in_memory_server("custom", Box::new(|spec, services| {
-    async move {
-        CustomMcp::new(spec.args, services.root_dir, services.mcp).into_dyn()
-    }
-    .boxed()
-}));
+builder.register_in_memory_server("custom", |args, services| {
+    Ok(McpServer::new(CustomMcp::from_args(args, &services.root_dir)?))
+});
 ```
 
 ## Programmatic Usage
@@ -120,18 +118,15 @@ Create and start servers directly:
 
 ```rust,ignore
 use mcp_servers::{CodingMcp, SkillsMcp, TasksMcp};
-use rmcp::ServiceExt;
+use mcp_utils::server::McpServer;
 
 // Create a coding server
-let server = CodingMcp::new()
-    .with_root_dir("/my/project".into())
-    .into_dyn();
+let server = McpServer::new(CodingMcp::new("/my/project"));
 
 // Or with LSP support
-let server = CodingMcp::new()
-    .with_root_dir("/my/project".into())
-    .with_lsp("/my/project".into())
-    .into_dyn();
+let server = McpServer::new(CodingMcp::new("/my/project").with_lsp());
+
+server.serve_stdio().await?;
 ```
 
 ## Server Documentation

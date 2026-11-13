@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use crate::app::App;
-use crate::conversation::item_view::{ContentKind, content_kind, item_lines};
-use crate::conversation::{ConversationContent, ConversationItem};
+use crate::conversation::item_view::{ContentKind, content_kind, item_lines, kind_before};
 use crate::view::wrap::as_u16;
+use acp_utils::conversation::{ConversationContent, ConversationItem};
 use clankerdiff_ratatui::MarkdownStreamError;
 use ratatui::text::Line;
 
@@ -35,34 +35,24 @@ impl Renderer {
         let mut previous = previous_kind;
         for item in items {
             lines.extend(self.item_suffix(item, previous, width, padding, spinner_tick, 0)?);
-            previous = Some(content_kind(item));
+            previous = content_kind(item).or(previous);
         }
         Ok(lines)
     }
 
     fn live_lines_inner(&mut self, app: &App, width: u16) -> Result<Vec<Line<'static>>, MarkdownStreamError> {
-        let items = app.conversation_items();
+        let items = app.core().conversation().items();
         let commit = self.native_history.commit;
         let Some(item) = items.get(commit.item_index) else {
             return Ok(Vec::new());
         };
-        let previous_kind = items.get(commit.item_index.wrapping_sub(1)).map(content_kind);
-        if commit.rows == 0 {
-            return self.lines(
-                &items[commit.item_index..],
-                previous_kind,
-                width,
-                app.content_padding(),
-                app.spinner_tick(),
-            );
-        }
-
+        let previous_kind = kind_before(items, commit.item_index);
         let (item_width, item_padding) = commit.dimensions(width, app.content_padding());
         let mut lines =
             self.item_suffix(item, previous_kind, item_width, item_padding, app.spinner_tick(), commit.rows)?;
         lines.extend(self.lines(
             &items[commit.item_index + 1..],
-            Some(content_kind(item)),
+            content_kind(item).or(previous_kind),
             width,
             app.content_padding(),
             app.spinner_tick(),
@@ -79,7 +69,10 @@ impl Renderer {
         spinner: usize,
         skip: usize,
     ) -> Result<Vec<Line<'static>>, MarkdownStreamError> {
-        let separator = usize::from(previous.is_some_and(|kind| kind != content_kind(item)));
+        let Some(kind) = content_kind(item) else {
+            return Ok(Vec::new());
+        };
+        let separator = usize::from(previous.is_some_and(|previous| previous != kind));
         let mut lines = Vec::new();
         if separator > skip {
             lines.push(Line::default());
@@ -106,7 +99,7 @@ impl Renderer {
         spinner_tick: usize,
     ) -> Rc<[Line<'static>]> {
         let shape = RenderShape { width, padding: as_u16(padding), theme: self.generation() };
-        let Self { theme, highlighter, render_cache, stats, .. } = self;
+        let Self { theme, render_cache, stats, .. } = self;
         let animated = matches!(item.content(), ConversationContent::Tool(_)) && item.is_open();
         let key = RenderKey {
             item_id: item.id(),
@@ -115,15 +108,15 @@ impl Renderer {
             spinner: animated.then_some(spinner_tick),
         };
         let lap = Lap::start();
-        let (lines, built) = render_cache
-            .get_or_insert_with(key, || Rc::from(item_lines(item, width, padding, spinner_tick, theme, highlighter)));
+        let (lines, built) =
+            render_cache.get_or_insert_with(key, || Rc::from(item_lines(item, width, padding, spinner_tick, theme)));
         if !built {
             return lines;
         }
         stats.item_rebuilds += 1;
         stats.ns_item_rebuild += lap.ns();
-        if let ConversationContent::Assistant(text) = item.content() {
-            stats.markdown_bytes_parsed += text.text.len() as u64;
+        if let (ConversationContent::Assistant(_), Some(text)) = (item.content(), item.text()) {
+            stats.markdown_bytes_parsed += text.len() as u64;
         }
         lines
     }

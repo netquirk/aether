@@ -1,8 +1,8 @@
 [package]
 name = "aether-auth"
-version = "0.1.16"
+version = "0.1.21"
 edition = "2024"
-description = "OAuth credential storage and authorization flows for the Aether AI agent framework"
+description = "OAuth credential storage, authorization flows and AWS SigV4 signing for the Aether AI agent framework"
 license = "MIT"
 repository = "https://github.com/contextbridge/aether"
 readme = "README.md"
@@ -21,27 +21,28 @@ keyring = [
     "dep:windows-native-keyring-store",
     "dep:dbus-secret-service-keyring-store",
 ]
-mcp = ["dep:rmcp"]
+sigv4 = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4"]
 
 [dependencies]
 age = { workspace = true }
 async-trait = { workspace = true }
-dirs = { workspace = true }
-futures = { workspace = true }
+oauth2 = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "io-util", "net", "time"] }
 tracing = { workspace = true }
+url = { workspace = true }
+utils = { package = "aether-utils", path = "../utils", version = "0.3.1" }
 
 # keyring feature
 keyring-core = { workspace = true, optional = true }
 
-# mcp feature
-rmcp = { workspace = true, optional = true, features = ["auth", "client"] }
-oauth2 = { workspace = true }
-reqwest = { workspace = true }
-url = { workspace = true }
+# sigv4 feature
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, optional = true }

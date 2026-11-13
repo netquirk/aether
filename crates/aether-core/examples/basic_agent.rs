@@ -3,7 +3,7 @@ use aether_core::events::{
     AgentEvent, Command, ContextEvent, MessageEvent, ModelEvent, ToolEvent, TurnEvent, TurnOutcome, UserCommand,
 };
 use llm::ContentBlock;
-use llm::providers::openrouter::OpenRouterProvider;
+use llm::providers::generic::{GenericProvider, OPENROUTER};
 use std::io::{self, Write};
 
 #[allow(clippy::too_many_lines)]
@@ -11,7 +11,7 @@ use std::io::{self, Write};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let llm = OpenRouterProvider::default("z-ai/glm-4.5-air")?;
+    let llm = GenericProvider::from_env(&OPENROUTER)?.with_model("z-ai/glm-4.5-air");
     let (tx, mut rx, _handle) = agent(llm).system_prompt(Prompt::text("You are a helpful assistant.")).spawn().await?;
 
     tx.send(Command::UserCommand(UserCommand::Text {
@@ -64,11 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(AgentEvent::Turn(TurnEvent::Ended { outcome })) => {
                 match outcome {
                     TurnOutcome::Completed => println!("Agent finished processing"),
-                    TurnOutcome::Failed { error } => eprintln!("Error: {error}"),
+                    TurnOutcome::Failed { error, .. } => eprintln!("Error: {error}"),
                     TurnOutcome::Cancelled => println!("Processing cancelled"),
-                    TurnOutcome::MaxTurnsReached { max_turns } => {
-                        println!("Agent stopped after reaching maxTurns={max_turns}");
-                    }
                 }
                 break;
             }
@@ -105,23 +102,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(
                 AgentEvent::Tool(
-                    ToolEvent::CallUpdate { .. }
-                    | ToolEvent::ExecutionStarted { .. }
+                    ToolEvent::InputStarted { .. }
+                    | ToolEvent::InputDelta { .. }
                     | ToolEvent::DefinitionsUpdated { .. }
                     | ToolEvent::SubAgentProgress { .. }
                     | ToolEvent::DisplayUpdate { .. }
                     | ToolEvent::TaskCreated { .. },
                 )
                 | AgentEvent::Turn(
-                    TurnEvent::Started { .. } | TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. },
+                    TurnEvent::Started { .. }
+                    | TurnEvent::UserMessageInserted { .. }
+                    | TurnEvent::UserMessageDiscarded { .. }
+                    | TurnEvent::LlmCallStarted { .. }
+                    | TurnEvent::LlmCallEnded { .. },
                 )
+                | AgentEvent::Context(ContextEvent::ReplyRecorded { .. })
                 | AgentEvent::SessionUsage(_),
             ) => {}
             Some(AgentEvent::Model(ModelEvent::Switched { previous, new })) => {
                 println!("Model switched: {previous} -> {new}");
-            }
-            Some(AgentEvent::Model(ModelEvent::Fallback { from, to, reason })) => {
-                println!("Provider fallback: {from} -> {to} ({reason})");
             }
             Some(AgentEvent::Context(ContextEvent::Cleared)) => {
                 println!("Context cleared");

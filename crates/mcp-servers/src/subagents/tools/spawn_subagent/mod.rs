@@ -1,73 +1,25 @@
-use crate::setup::McpBuilderExt;
+use crate::Displayed;
+use crate::setup::agent_mcp;
 use crate::subagents::SubAgentProgressSink;
 use aether_core::{
-    agent_spec::McpConfigSource,
-    core::{AgentBuilder, AgentDeps, AgentHandle},
+    agent_spec::AgentSpec,
+    core::{AgentBuilder, AgentDeps, AgentError, AgentHandle, AgentRegistryError, SubAgentSession, recv_agent_event},
     events::{AgentEvent, Command, MessageEvent, SubAgentProgressPayload, TurnEvent, TurnOutcome, UserCommand},
-    mcp::{McpRuntime, McpSession, mcp},
+    mcp::McpSpawnError,
 };
 use futures::FutureExt;
 use llm::{ContentBlock, MessageId};
-use mcp_utils::display_meta::{ToolDisplayMeta, ToolResultMeta};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-
-/// Reference to a file artifact discovered or modified by a sub-agent
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ArtifactReference {
-    /// Absolute file path
-    pub path: String,
-    /// How this file relates to the task: read, modified, discovered, relevant
-    pub relation: String,
-    /// Brief note on why this file matters
-    pub note: Option<String>,
-}
-
-/// Structured output from a sub-agent, designed to prevent information loss
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct StructuredAgentOutput {
-    /// Brief summary of what the agent accomplished
-    pub summary: String,
-    /// Files read, modified, or discovered as relevant
-    pub artifacts: Vec<ArtifactReference>,
-    /// Key decisions, findings, or conclusions
-    pub decisions: Vec<String>,
-    /// Recommended follow-up tasks
-    pub next_steps: Vec<String>,
-    /// Full detailed output (optional, for deep dives)
-    pub details: Option<String>,
-}
-
-impl StructuredAgentOutput {
-    /// Parse agent output into structured format with fallback for non-JSON responses
-    pub fn parse(raw_output: &str) -> Result<Self, String> {
-        // Try to parse as JSON directly
-        if let Ok(parsed) = serde_json::from_str::<Self>(raw_output) {
-            return Ok(parsed);
-        }
-
-        if let Some(json_str) = extract_json_from_markdown(raw_output)
-            && let Ok(parsed) = serde_json::from_str::<Self>(&json_str)
-        {
-            return Ok(parsed);
-        }
-
-        // Fallback: wrap raw output in structured format
-        Ok(Self {
-            summary: "Agent did not return structured output".to_string(),
-            artifacts: vec![],
-            decisions: vec![],
-            next_steps: vec![],
-            details: Some(raw_output.to_string()),
-        })
-    }
-}
+use tokio::time::timeout;
+use utils::display_meta::ToolDisplayMeta;
+use utils::panic::panic_message;
 
 /// Input for a single agent task within a batch
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -103,8 +55,8 @@ pub enum SubAgentStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubAgentResult {
-    /// Unique identifier for this task
-    pub task_id: String,
+    /// Session the sub-agent ran in
+    pub session_id: String,
     /// Name of the agent that executed
     pub agent_name: String,
     /// Status of execution
@@ -113,6 +65,16 @@ pub struct SubAgentResult {
     pub output: Option<String>,
     /// Error message if status is Error
     pub error: Option<String>,
+}
+
+impl SubAgentResult {
+    fn new(session_id: String, agent_name: String, result: Result<String, String>) -> Self {
+        let (status, output, error) = match result {
+            Ok(output) => (SubAgentStatus::Success, Some(output), None),
+            Err(error) => (SubAgentStatus::Error, None, Some(error)),
+        };
+        Self { session_id, agent_name, status, output, error }
+    }
 }
 
 /// Output from spawning sub-agents
@@ -125,32 +87,10 @@ pub struct SpawnSubAgentsOutput {
     pub success_count: usize,
     /// Number of failures
     pub error_count: usize,
-    /// Display metadata for human-friendly rendering
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)]
-    pub meta: Option<ToolResultMeta>,
 }
 
 /// Prompt instructions appended to sub-agent prompts to ensure structured output
 pub const STRUCTURED_OUTPUT_INSTRUCTIONS: &str = include_str!("structured_output_instructions.md");
-
-/// Extract JSON from markdown code blocks (```json ... ``` or ``` ... ```)
-pub fn extract_json_from_markdown(text: &str) -> Option<String> {
-    // Look for ```json ... ``` pattern
-    let json_block_start = text.find("```json")?;
-    let content_start = json_block_start + 7;
-    let remaining = &text[content_start..];
-
-    // Find the closing ```
-    let content_end = remaining.find("```")?;
-    let json_content = remaining[..content_end].trim();
-
-    if json_content.is_empty() {
-        return None;
-    }
-
-    Some(json_content.to_string())
-}
 
 /// Executor for spawning and running sub-agents
 #[derive(Clone)]
@@ -174,9 +114,10 @@ impl AgentExecutor {
     }
 
     /// Execute multiple agent tasks in parallel and return results
-    pub async fn execute_tasks(&self, tasks: Vec<SubAgentTask>) -> SpawnSubAgentsOutput {
+    pub async fn execute_tasks(&self, tasks: Vec<SubAgentTask>) -> Displayed<SpawnSubAgentsOutput> {
         if tasks.is_empty() {
-            return SpawnSubAgentsOutput { results: vec![], success_count: 0, error_count: 0, meta: None };
+            let output = SpawnSubAgentsOutput { results: vec![], success_count: 0, error_count: 0 };
+            return Displayed { output, meta: None };
         }
 
         let task_count = tasks.len();
@@ -185,21 +126,7 @@ impl AgentExecutor {
         let mut children = JoinSet::new();
         for (index, task) in tasks.into_iter().enumerate() {
             let executor = self.clone();
-            let task_id = format!("task_{index}");
-            let agent_name = task.agent_name.clone();
-            children.spawn(async move {
-                let result = AssertUnwindSafe(executor.execute_single(task_id.clone(), task))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|panic| SubAgentResult {
-                        task_id,
-                        agent_name,
-                        status: SubAgentStatus::Error,
-                        output: None,
-                        error: Some(format!("Sub-agent task panicked: {}", panic_message(&panic))),
-                    });
-                (index, result)
-            });
+            children.spawn(async move { (index, executor.execute_single(task).await) });
         }
 
         let mut indexed_results = Vec::with_capacity(task_count);
@@ -210,251 +137,144 @@ impl AgentExecutor {
         let results: Vec<SubAgentResult> = indexed_results.into_iter().map(|(_, result)| result).collect();
 
         let success_count = results.iter().filter(|r| matches!(r.status, SubAgentStatus::Success)).count();
+        let error_count = results.len() - success_count;
 
-        let error_count = results.iter().filter(|r| matches!(r.status, SubAgentStatus::Error)).count();
-
-        // Create display metadata using the first task
         let display_meta = ToolDisplayMeta::new("Spawn agent", format!("{first_agent_name} (1/{task_count})"));
-
-        SpawnSubAgentsOutput { results, success_count, error_count, meta: Some(display_meta.into()) }
+        Displayed::new(SpawnSubAgentsOutput { results, success_count, error_count }, display_meta)
     }
 
     /// Execute a single sub-agent and return its result
-    async fn execute_single(&self, task_id: String, task: SubAgentTask) -> SubAgentResult {
+    async fn execute_single(&self, task: SubAgentTask) -> SubAgentResult {
         let agent_name = task.agent_name.clone();
+        let session = self.deps.sub_agents.open();
+        let started = AgentEvent::Turn(TurnEvent::Started { content: vec![ContentBlock::text(&task.prompt)] });
+        self.report(&session, &agent_name, &started).await;
 
-        let result: Result<String, String> = async {
-            let spec = self
-                .deps
-                .agent_registry
-                .resolve_agent_invocable(&task.agent_name)
-                .map_err(|error| error.to_string())?;
+        let result = AssertUnwindSafe(self.run(&session, &task))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| Err(SubAgentError::Panicked(panic_message(&*panic).to_string())));
+        let outcome = result.as_ref().map_or_else(SubAgentError::outcome, |_| TurnOutcome::Completed);
+        self.report(&session, &agent_name, &AgentEvent::turn_ended(outcome)).await;
 
-            let mut spawn = self.spawn_mcps(&spec.mcp_config_sources, spec.tools.clone()).await?;
-            spawn.block_until_ready().await.ok_or_else(|| "MCP bootstrap aborted before completion".to_string())?;
-            let mcp = spawn.handle().clone();
+        SubAgentResult::new(session.id().to_string(), agent_name, result.map_err(|error| error.to_string()))
+    }
 
-            let (user_tx, mut agent_rx, agent_handle) = self.spawn_agent(spec, mcp).await?;
-            let (mcp_runtime, _) = spawn.connect_agent(user_tx.clone()).await.split();
-            let running_agent = RunningAgent { user_tx, agent_handle, _mcp_runtime: mcp_runtime };
+    async fn run(&self, session: &SubAgentSession, task: &SubAgentTask) -> Result<String, SubAgentError> {
+        let spec = self.deps.agent_registry.resolve_agent_invocable(&task.agent_name)?;
+        let (user_tx, mut agent_rx, _agent) = tokio::select! {
+            started = self.start(&spec) => started?,
+            () = session.cancelled() => return Err(SubAgentError::Cancelled),
+        };
 
-            let prompt_with_instructions = format!("{}\n\n{}", task.prompt, STRUCTURED_OUTPUT_INSTRUCTIONS);
-            running_agent
-                .user_tx
-                .send(Command::UserCommand(UserCommand::Text {
-                    message_id: MessageId::new(),
-                    content: vec![ContentBlock::text(&prompt_with_instructions)],
-                }))
-                .await
-                .map_err(|e| format!("Failed to send message to agent: {e}"))?;
+        let prompt_with_instructions = format!("{}\n\n{}", task.prompt, STRUCTURED_OUTPUT_INSTRUCTIONS);
+        user_tx
+            .send(Command::UserCommand(UserCommand::Text {
+                message_id: MessageId::new(),
+                content: vec![ContentBlock::text(&prompt_with_instructions)],
+            }))
+            .await
+            .map_err(|_| SubAgentError::Stopped)?;
 
-            self.report(&task_id, &agent_name, AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await;
+        let mut final_output = String::new();
+        let mut cancelling = false;
 
-            let mut final_output = String::new();
-
-            while let Some(message) = agent_rx.recv().await {
-                self.report(&task_id, &agent_name, message.clone()).await;
-
-                match &message {
-                    AgentEvent::Message(MessageEvent::Text { chunk, is_complete, .. }) if *is_complete => {
-                        final_output.clone_from(chunk);
-                    }
-
-                    AgentEvent::Turn(TurnEvent::Ended { outcome }) => match outcome {
-                        TurnOutcome::Completed => return Ok(final_output),
-                        TurnOutcome::Failed { error } => return Err(format!("Agent error: {error}")),
-                        TurnOutcome::Cancelled => return Err("Agent cancelled".to_string()),
-                        TurnOutcome::MaxTurnsReached { max_turns } => {
-                            return Err(format!("Agent stopped: reached maxTurns={max_turns}"));
-                        }
-                    },
-
-                    _ => {}
+        loop {
+            let message = tokio::select! {
+                message = recv_agent_event(&mut agent_rx) => message,
+                () = session.cancelled(), if !cancelling => {
+                    cancelling = true;
+                    user_tx.send(Command::cancel()).await.map_err(|_| SubAgentError::Stopped)?;
+                    continue;
                 }
-            }
+            };
 
-            Ok(final_output)
-        }
-        .await;
+            match &message {
+                AgentEvent::Message(MessageEvent::Text { chunk, is_complete, .. }) if *is_complete => {
+                    final_output.clone_from(chunk);
+                }
 
-        match result {
-            Ok(output) => SubAgentResult {
-                task_id,
-                agent_name,
-                status: SubAgentStatus::Success,
-                output: Some(output),
-                error: None,
-            },
-            Err(error) => {
-                SubAgentResult { task_id, agent_name, status: SubAgentStatus::Error, output: None, error: Some(error) }
+                AgentEvent::Turn(TurnEvent::Started { .. }) => continue,
+                AgentEvent::Turn(TurnEvent::Ended { outcome }) => match outcome {
+                    TurnOutcome::Completed => return Ok(final_output),
+                    TurnOutcome::Failed { message_id, error } => {
+                        return Err(SubAgentError::Failed { message_id: message_id.clone(), error: error.clone() });
+                    }
+                    TurnOutcome::Cancelled => return Err(SubAgentError::Cancelled),
+                },
+
+                _ => {}
             }
+            self.report(session, &task.agent_name, &message).await;
         }
     }
 
-    async fn report(&self, task_id: &str, agent_name: &str, event: AgentEvent) {
+    async fn report(&self, session: &SubAgentSession, agent_name: &str, event: &AgentEvent) {
+        if event.is_stream_delta() {
+            return;
+        }
         if let Some(sink) = &self.progress {
-            let payload =
-                SubAgentProgressPayload { task_id: task_id.to_string(), agent_name: agent_name.to_string(), event };
+            let payload = SubAgentProgressPayload {
+                session_id: session.id().to_string(),
+                agent_name: agent_name.to_string(),
+                event: event.clone(),
+            };
             sink.send(payload).await;
         }
     }
 
-    async fn spawn_mcps(
+    async fn start(
         &self,
-        effective_mcp_config_sources: &[McpConfigSource],
-        tool_filter: mcp_utils::client::ToolFilter,
-    ) -> Result<McpSession, String> {
-        let mut builder = mcp(&self.project_root)
-            .with_tool_filter(tool_filter)
-            .with_agent_deps(self.deps.clone())
-            .with_builtin_servers();
-
-        if !effective_mcp_config_sources.is_empty() {
-            builder = builder
-                .from_mcp_config_sources(effective_mcp_config_sources)
-                .map_err(|e| format!("Failed to load mcp configs: {e}"))?;
+        spec: &AgentSpec,
+    ) -> Result<(mpsc::Sender<Command>, mpsc::Receiver<AgentEvent>, AgentHandle), SubAgentError> {
+        let mcp = agent_mcp(&self.project_root, self.deps.clone(), spec.tools.clone())
+            .with_config(spec.mcp.clone())
+            .spawn()?;
+        if timeout(MCP_READY_TIMEOUT, mcp.ready()).await.is_err() {
+            tracing::warn!(agent = %spec.name, "Starting sub-agent before every MCP server connected");
         }
-
-        builder.spawn().await.map_err(|e| format!("Failed to spawn MCP manager: {e}"))
-    }
-
-    async fn spawn_agent(
-        &self,
-        spec: aether_core::agent_spec::AgentSpec,
-        mcp: aether_core::mcp::McpHandle,
-    ) -> Result<(mpsc::Sender<Command>, mpsc::Receiver<AgentEvent>, AgentHandle), String> {
-        AgentBuilder::from_spec(&spec, vec![], &self.deps)
-            .await
-            .map_err(|e| format!("Failed to build agent from spec: {e}"))?
-            .tools(mcp, Vec::new())
-            .spawn()
-            .await
-            .map_err(|e| format!("Failed to spawn agent: {e}"))
+        let builder = AgentBuilder::from_spec(spec, &self.deps).await.map_err(SubAgentError::Build)?;
+        builder.mcp(mcp).spawn().await.map_err(SubAgentError::Spawn)
     }
 }
 
-struct RunningAgent {
-    user_tx: mpsc::Sender<Command>,
-    agent_handle: AgentHandle,
-    _mcp_runtime: McpRuntime,
+#[derive(Debug, Error)]
+enum SubAgentError {
+    #[error(transparent)]
+    Resolve(#[from] AgentRegistryError),
+    #[error("Failed to spawn MCP servers: {0}")]
+    McpSpawn(#[from] McpSpawnError),
+    #[error("Failed to build agent from spec: {0}")]
+    Build(#[source] AgentError),
+    #[error("Failed to spawn agent: {0}")]
+    Spawn(#[source] AgentError),
+    #[error("Agent stopped before it received its task")]
+    Stopped,
+    #[error("Agent error: {error}")]
+    Failed { message_id: MessageId, error: String },
+    #[error("Agent cancelled")]
+    Cancelled,
+    #[error("Sub-agent task panicked: {0}")]
+    Panicked(String),
 }
 
-impl Drop for RunningAgent {
-    fn drop(&mut self) {
-        self.agent_handle.abort();
+impl SubAgentError {
+    fn outcome(&self) -> TurnOutcome {
+        match self {
+            Self::Cancelled => TurnOutcome::Cancelled,
+            Self::Failed { message_id, error } => {
+                TurnOutcome::Failed { message_id: message_id.clone(), error: error.clone() }
+            }
+            error => TurnOutcome::failed(error.to_string()),
+        }
     }
 }
 
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("unknown panic")
-}
+const MCP_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_valid_json() {
-        let json = r#"{
-            "summary": "Found the main entry point",
-            "artifacts": [{"path": "/src/main.rs", "relation": "read", "note": "entry point"}],
-            "decisions": ["Use async runtime"],
-            "nextSteps": ["Implement feature"],
-            "details": null
-        }"#;
-
-        let result = StructuredAgentOutput::parse(json).expect("Should parse valid JSON");
-
-        assert_eq!(result.summary, "Found the main entry point");
-        assert_eq!(result.artifacts.len(), 1);
-        assert_eq!(result.artifacts[0].path, "/src/main.rs");
-        assert_eq!(result.artifacts[0].relation, "read");
-        assert_eq!(result.decisions.len(), 1);
-        assert_eq!(result.next_steps.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_json_in_markdown() {
-        let markdown = r#"Here's what I found:
-
-```json
-{
-    "summary": "Analyzed the codebase",
-    "artifacts": [],
-    "decisions": ["Use Rust"],
-    "nextSteps": [],
-    "details": null
-}
-```
-
-Hope this helps!"#;
-
-        let result = StructuredAgentOutput::parse(markdown).expect("Should parse JSON from markdown");
-
-        assert_eq!(result.summary, "Analyzed the codebase");
-        assert_eq!(result.decisions.len(), 1);
-        assert_eq!(result.decisions[0], "Use Rust");
-    }
-
-    #[test]
-    fn test_parse_fallback() {
-        let plain_text = "I analyzed the code and found several issues.";
-
-        let result = StructuredAgentOutput::parse(plain_text).expect("Should fallback gracefully");
-
-        assert_eq!(result.summary, "Agent did not return structured output");
-        assert!(result.artifacts.is_empty());
-        assert!(result.decisions.is_empty());
-        assert!(result.next_steps.is_empty());
-        assert_eq!(result.details, Some(plain_text.to_string()));
-    }
-
-    #[test]
-    fn test_extract_json_from_markdown_valid() {
-        let markdown = r#"Some text
-```json
-{"key": "value"}
-```
-More text"#;
-
-        let result = extract_json_from_markdown(markdown);
-
-        assert_eq!(result, Some(r#"{"key": "value"}"#.to_string()));
-    }
-
-    #[test]
-    fn test_extract_json_from_markdown_no_block() {
-        let text = "Just plain text without code blocks";
-
-        let result = extract_json_from_markdown(text);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_json_from_markdown_empty_block() {
-        let markdown = r"```json
-```";
-
-        let result = extract_json_from_markdown(markdown);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_json_from_markdown_unclosed() {
-        let markdown = r#"```json
-{"unclosed": true}
-"#;
-
-        let result = extract_json_from_markdown(markdown);
-
-        assert!(result.is_none());
-    }
 
     #[test]
     fn test_sub_agent_task_accepts_snake_case_agent_name() {

@@ -105,6 +105,14 @@ Fireworks uses `https://api.fireworks.ai/inference/v1` by default. Serverless ca
 
 `requestModel` only changes the request target; model capabilities, context window, display name, and telemetry continue to use `model`. See the [Fireworks querying guide](https://docs.fireworks.ai/guides/querying-text-models).
 
+### Xiaomi
+
+|                  |                          |
+| ---------------- | ------------------------ |
+| **Credentials**  | `XIAOMI_API_KEY`         |
+| **Model syntax** | `xiaomi:<model-id>`      |
+| **Common model** | `xiaomi:mimo-v2.6-pro`   |
+
 ### Gemini
 
 |                  |                     |
@@ -143,9 +151,9 @@ If you route traffic through an inference profile, configure the profile ARN as 
 
 Do not use `bedrock:arn:aws:bedrock:...` as the model. The ARN only identifies the request target; it does not tell Aether which model capabilities or context window to use.
 
-#### Models served by the Responses API (Bedrock Mantle)
+#### Models served by the Responses API
 
-Some Bedrock models are not available through the Converse API. Aether routes these to Bedrock's OpenAI-compatible Responses endpoint (`bedrock-mantle.${AWS_REGION}.api.aws`) instead. The model catalog decides the transport automatically based on the model ID, so you configure them exactly like any other Bedrock model:
+Some Bedrock models are not available through the Converse API. Aether routes these to OpenAI-compatible Responses endpoints instead. The model catalog decides the transport and endpoint automatically based on the model ID, so you configure them exactly like any other Bedrock model:
 
 ```json title=".aether/settings.json"
 {
@@ -160,7 +168,12 @@ Some Bedrock models are not available through the Converse API. Aether routes th
 }
 ```
 
-Catalog IDs that use the Responses transport include the `openai.gpt-5.6-*`, `openai.gpt-5.5`, `openai.gpt-5.4`, `xai.grok-4.3`, and `openai.gpt-oss-*` families (for example, `bedrock:openai.gpt-5.5` or `bedrock:openai.gpt-oss-120b`). All other Bedrock models use the Converse API described above.
+Catalog IDs that use the Responses transport include the `openai.gpt-5.6-*`, `openai.gpt-6-*`, `openai.gpt-5.5`, `openai.gpt-5.4`, `xai.grok-4.3`, and `openai.gpt-oss-*` families (for example, `bedrock:openai.gpt-5.5` or `bedrock:openai.gpt-oss-120b`). All other Bedrock models use the Converse API described above.
+
+Requests go to one of two endpoints depending on the model ID:
+
+- Global catalog IDs (for example `openai.gpt-5.5` or `openai.gpt-6-astra`) route to Bedrock Mantle at `bedrock-mantle.${AWS_REGION}.api.aws`.
+- Cross-region inference profile IDs of the form `us.openai.gpt-6-*` (for example `us.openai.gpt-6-luna`) route through Bedrock Runtime's OpenAI-compatible Responses endpoint at `bedrock-runtime.${AWS_REGION}.amazonaws.com/openai/v1`.
 
 Responses-transport requests authenticate with the first available scheme:
 
@@ -177,9 +190,9 @@ Inference profiles are a Converse-API feature and do not apply to Responses-tran
 | ----------------- | ------------------- |
 | **Credentials**   | None                |
 | **Model syntax**  | `ollama:<model-id>` |
-| **Discovery host** | `OLLAMA_HOST`      |
+| **Host**          | `OLLAMA_HOST`       |
 
-Aether discovers models you have pulled into Ollama by querying `$OLLAMA_HOST/api/tags` (`http://localhost:11434` by default). To route inference requests to a different host, override the provider URL:
+Aether discovers models you have pulled into Ollama by querying `$OLLAMA_HOST/api/tags` and sends inference requests to `$OLLAMA_HOST/v1` (`http://localhost:11434` by default). A provider URL takes precedence over `OLLAMA_HOST` for inference requests:
 
 ```json title=".aether/settings.json"
 {
@@ -195,9 +208,9 @@ Aether discovers models you have pulled into Ollama by querying `$OLLAMA_HOST/ap
 | ----------------- | --------------------- |
 | **Credentials**   | None                  |
 | **Model syntax**  | `llamacpp:<model-id>` |
-| **Discovery host** | `LLAMA_CPP_HOST`     |
+| **Host**          | `LLAMA_CPP_HOST`      |
 
-Aether queries `$LLAMA_CPP_HOST/v1/models` (`http://localhost:8080` by default) for the currently loaded model. To route inference requests to a different host, override the provider URL:
+Aether queries `$LLAMA_CPP_HOST/v1/models` for the currently loaded model and sends inference requests to `$LLAMA_CPP_HOST/v1` (`http://localhost:8080` by default). A provider URL takes precedence over `LLAMA_CPP_HOST` for inference requests:
 
 ```json title=".aether/settings.json"
 {
@@ -243,6 +256,7 @@ The top-level `providers` object (or per-agent `providers`) overrides how Aether
 | `auth`                | Authentication mode: `default` (provider default) or `none` (skip auth). Use `none` only behind a trusted proxy that injects credentials. |
 | `requestModel`        | Overrides the model id sent in requests without changing the catalog identity used for capabilities, context window, and display. |
 | `inferenceProfileArn` | Bedrock application inference profile ARN to route requests through.       |
+| `idleTimeoutSecs`     | Seconds the provider may stay silent, before responding or between stream events, before the request fails with a retryable timeout. Defaults to 300; raise it for slow local models. |
 
 ```json title=".aether/settings.json"
 {
@@ -258,7 +272,7 @@ The top-level `providers` object (or per-agent `providers`) overrides how Aether
 }
 ```
 
-The CLI equivalents are `--provider PROVIDER.url=...`, `--provider PROVIDER.auth=...`, `--provider PROVIDER.request-model=...`, and `--provider bedrock.inference-profile-arn=...`.
+The CLI equivalents are `--provider PROVIDER.url=...`, `--provider PROVIDER.auth=...`, `--provider PROVIDER.request-model=...`, `--provider PROVIDER.idle-timeout-secs=...`, and `--provider bedrock.inference-profile-arn=...`.
 
 ## Reasoning effort
 

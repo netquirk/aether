@@ -7,12 +7,11 @@ fn html_page(title: &str, body: &str) -> String {
 }
 
 #[tokio::test]
-async fn test_fetch_truncates_unicode_without_panicking() {
-    let result = WebFetchTest::new(html_page("Unicode", &format!("<p>{}</p>", "界".repeat(20_000)))).fetch().await;
+async fn test_fetch_returns_long_pages_whole() {
+    let body = "界".repeat(20_000);
+    let result = WebFetchTest::new(body.clone()).content_type(Some("text/plain")).fetch().await;
 
-    assert!(result.truncated);
-    assert!(result.content.ends_with("[Content truncated...]"));
-    assert!(result.content.starts_with('界'));
+    assert_eq!(result.content, body);
 }
 
 #[tokio::test]
@@ -26,7 +25,6 @@ async fn test_fetch_preserves_plain_text_documentation() {
 
     assert_eq!(result.content, body);
     assert_eq!(result.title, None);
-    assert!(!result.truncated);
 }
 
 #[tokio::test]
@@ -45,7 +43,7 @@ async fn test_fetch_html_content_types() {
 
 #[tokio::test]
 async fn test_fetch_real_page() {
-    let fetcher = WebFetcher::with_client(FakeHttpClient::new().with_html(
+    let fetcher = WebFetcher::with_client(FakeHttpClient::default().with_html(
         "https://example.com/html",
         &html_page("Herman Melville", "<h1>Moby-Dick</h1><p>By Herman Melville</p>"),
     ));
@@ -55,14 +53,13 @@ async fn test_fetch_real_page() {
         .unwrap();
 
     assert_eq!(result.status_code, 200);
-    assert!(!result.content.is_empty());
-    assert!(!result.truncated);
+    assert_ne!(result.content, "");
     assert!(result.content.contains("Melville") || result.content.contains("Moby"));
 }
 
 #[tokio::test]
 async fn test_fetch_with_redirect() {
-    let fetcher = WebFetcher::with_client(FakeHttpClient::new().with_response(
+    let fetcher = WebFetcher::with_client(FakeHttpClient::default().with_response(
         "https://example.com/redirect",
         HttpResponse {
             final_url: "https://example.com/html".to_string(),
@@ -83,7 +80,7 @@ async fn test_fetch_with_redirect() {
 #[tokio::test]
 async fn test_fetch_http_upgrades_to_https() {
     let fetcher = WebFetcher::with_client(
-        FakeHttpClient::new().with_html("https://example.com/html", &html_page("Upgraded", "<h1>HTTPS</h1>")),
+        FakeHttpClient::default().with_html("https://example.com/html", &html_page("Upgraded", "<h1>HTTPS</h1>")),
     );
     let result = fetcher
         .fetch(WebFetchInput { url: "http://example.com/html".to_string(), prompt: None, timeout: Some(10_000) })
@@ -95,7 +92,7 @@ async fn test_fetch_http_upgrades_to_https() {
 
 #[tokio::test]
 async fn test_fetch_timeout() {
-    let fetcher = WebFetcher::with_client(FakeHttpClient::new().with_timeout("https://example.com/delay", 1000));
+    let fetcher = WebFetcher::with_client(FakeHttpClient::default().with_timeout("https://example.com/delay", 1000));
     let result = fetcher
         .fetch(WebFetchInput { url: "https://example.com/delay".to_string(), prompt: None, timeout: Some(1000) })
         .await;
@@ -118,7 +115,7 @@ async fn test_fetch_invalid_url() {
 #[tokio::test]
 async fn test_fetch_with_prompt() {
     let fetcher = WebFetcher::with_client(
-        FakeHttpClient::new().with_html("https://example.com/html", &html_page("Prompt", "<h1>Main heading</h1>")),
+        FakeHttpClient::default().with_html("https://example.com/html", &html_page("Prompt", "<h1>Main heading</h1>")),
     );
     // The prompt is currently just for documentation, but we should handle it gracefully
     let result = fetcher
@@ -131,13 +128,13 @@ async fn test_fetch_with_prompt() {
         .unwrap();
 
     assert_eq!(result.status_code, 200);
-    assert!(!result.content.is_empty());
+    assert_ne!(result.content, "");
 }
 
 #[tokio::test]
 async fn test_fetch_non_existent_host() {
     let fetcher = WebFetcher::with_client(
-        FakeHttpClient::new()
+        FakeHttpClient::default()
             .with_request_failed("https://this-domain-definitely-does-not-exist-12345.com/", "dns error"),
     );
     let result = fetcher
@@ -155,7 +152,7 @@ async fn test_fetch_non_existent_host() {
 #[tokio::test]
 async fn test_fetcher_reusable() {
     // Test that a single WebFetcher can be reused for multiple requests without relying on an external service.
-    let client = FakeHttpClient::new()
+    let client = FakeHttpClient::default()
         .with_html("https://example.com/page1", "<html><body><h1>Page 1</h1></body></html>")
         .with_html("https://example.com/page2", "<html><body><h1>Page 2</h1></body></html>");
     let fetcher = WebFetcher::with_client(client);
@@ -204,7 +201,7 @@ impl WebFetchTest {
 
     async fn fetch(self) -> WebFetchOutput {
         let url = self.response.final_url.clone();
-        let client = FakeHttpClient::new().with_response(&url, self.response);
+        let client = FakeHttpClient::default().with_response(&url, self.response);
         WebFetcher::with_client(client).fetch(WebFetchInput { url, prompt: None, timeout: None }).await.unwrap()
     }
 }

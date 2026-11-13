@@ -2,21 +2,34 @@
 //! notifications.
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::v2::{AuthMethod, Meta, SessionId};
+use agent_client_protocol::v2::schema::{self as acp, AuthMethod, Meta, SessionId, ToolCallId};
 use agent_client_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use clankerdiff_protocol::client::ClientCommand;
 use clankerdiff_protocol::shared::{DocumentUpdate, Event};
-pub use mcp_utils::display_meta::{ToolDisplayMeta, ToolResultMeta};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+pub use utils::display_meta::{ToolDisplayMeta, ToolResultMeta};
+pub use utils::mcp_status::{McpServerAuthCapability, McpServerStatus, McpServerStatusEntry};
 
-pub use mcp_utils::status::{McpServerAuthCapability, McpServerStatus, McpServerStatusEntry};
-
-use crate::meta::{from_meta, to_meta};
+use utils::meta::{from_meta, to_meta};
 
 pub const AETHER_META_NAMESPACE: &str = "contextbridge/aether";
 
+pub trait AetherMeta: Serialize + DeserializeOwned + Default {
+    #[must_use]
+    fn to_meta(&self) -> Meta {
+        to_meta(self, Some(AETHER_META_NAMESPACE)).unwrap_or_default()
+    }
+
+    #[must_use]
+    fn from_meta(meta: Option<&Meta>) -> Self {
+        from_meta(meta, Some(AETHER_META_NAMESPACE))
+    }
+}
+
 /// Remote host discovery, advertised on the initialize response only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteServerInfo {
     pub cwd: PathBuf,
@@ -37,6 +50,7 @@ impl RemoteServerInfo {
 }
 
 /// Parameters for `_aether/session_usage` notifications.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonRpcNotification)]
 #[notification(method = "_aether/session_usage")]
 pub struct SessionUsageParams {
@@ -44,13 +58,17 @@ pub struct SessionUsageParams {
 }
 
 /// Parameters for `_aether/context_cleared` notifications.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, JsonRpcNotification)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, JsonRpcNotification)]
 #[notification(method = "_aether/context_cleared")]
-pub struct ContextClearedParams {}
+#[serde(rename_all = "camelCase")]
+pub struct ContextClearedParams {
+    pub session_id: SessionId,
+}
 
 /// Parameters for `_aether/auth_methods_updated` notifications.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonRpcNotification)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, JsonRpcNotification)]
 #[notification(method = "_aether/auth_methods_updated")]
+#[serde(rename_all = "camelCase")]
 pub struct AuthMethodsUpdatedParams {
     pub auth_methods: Vec<AuthMethod>,
 }
@@ -183,20 +201,13 @@ impl SessionDisplayMeta {
     pub fn new(model: impl Into<String>, selected_mode: Option<String>) -> Self {
         Self { model: Some(model.into()), selected_mode }
     }
-
-    #[must_use]
-    pub fn to_meta(&self) -> Meta {
-        to_meta(self, Some(AETHER_META_NAMESPACE)).unwrap_or_default()
-    }
-
-    #[must_use]
-    pub fn from_meta(meta: Option<&Meta>) -> Self {
-        from_meta(meta, Some(AETHER_META_NAMESPACE))
-    }
 }
+
+impl AetherMeta for SessionDisplayMeta {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_excessive_bools, reason = "each flag is an independent capability on the wire")]
 pub struct AetherCapabilities {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prompt_search: bool,
@@ -204,17 +215,15 @@ pub struct AetherCapabilities {
     pub session_preview: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workspace_move: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_diff: bool,
 }
 
-impl AetherCapabilities {
-    #[must_use]
-    pub fn to_meta(self) -> Meta {
-        to_meta(&self, Some(AETHER_META_NAMESPACE)).unwrap_or_default()
-    }
+impl AetherMeta for AetherCapabilities {}
 
-    #[must_use]
-    pub fn from_meta(meta: Option<&Meta>) -> Self {
-        from_meta(meta, Some(AETHER_META_NAMESPACE))
+impl AetherCapabilities {
+    pub fn of(capabilities: &acp::AgentCapabilities) -> Self {
+        Self::from_meta(capabilities.session.as_ref().and_then(|session| session.meta.as_ref()))
     }
 }
 
@@ -231,7 +240,7 @@ pub struct GitDiffCommandPayload {
 #[notification(method = "_aether/git_diff_event")]
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffEventPayload {
-    pub session_id: String,
+    pub session_id: SessionId,
     #[serde(flatten)]
     pub event: Event<DocumentUpdate>,
 }
@@ -259,8 +268,9 @@ pub struct WorkspaceStatusResponse {
 }
 
 /// Server→client MCP extension notifications (relay → wisp).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonRpcNotification)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, JsonRpcNotification)]
 #[notification(method = "_aether/mcp_event")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpNotification {
     ServerStatus { servers: Vec<McpServerStatusEntry> },
 }
@@ -268,244 +278,28 @@ pub enum McpNotification {
 /// Client→server MCP extension requests (wisp → relay).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonRpcNotification)]
 #[notification(method = "_aether/mcp_request")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum McpRequest {
     Authenticate { session_id: String, server_name: String },
 }
 
-/// Parameters for `_aether/sub_agent_progress` notifications.
-///
-/// This is the wire format sent from the ACP server (`aether-cli`) to clients like `wisp`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
-#[notification(method = "_aether/sub_agent_progress")]
-pub struct SubAgentProgressParams {
-    pub parent_tool_id: String,
-    pub task_id: String,
-    pub agent_name: String,
-    pub event: SubAgentEvent,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubAgentMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
 }
 
-/// Subset of agent message variants relevant for sub-agent status display.
-///
-/// The ACP server (`aether-cli`) converts `AgentEvent` to this type before
-/// serializing, so the wire format only contains these known variants.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SubAgentEvent {
-    ToolCall { request: SubAgentToolRequest },
-    ToolCallUpdate { update: SubAgentToolCallUpdate },
-    ToolResult { result: SubAgentToolResult },
-    ToolError { error: SubAgentToolError },
-    Done,
-    Other,
+impl SubAgentMeta {
+    #[must_use]
+    pub fn new(tool_call_id: impl Into<ToolCallId>) -> Self {
+        Self { tool_call_id: Some(tool_call_id.into()) }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentToolRequest {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentToolCallUpdate {
-    pub id: String,
-    pub chunk: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentToolResult {
-    pub id: String,
-    pub name: String,
-    pub result_meta: Option<ToolResultMeta>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentToolError {
-    pub id: String,
-    pub name: String,
-}
+impl AetherMeta for SubAgentMeta {}
 
 #[derive(Default, Serialize, Deserialize)]
 struct RemoteInitializationMeta {
     remote: Option<RemoteServerInfo>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use agent_client_protocol::JsonRpcMessage;
-    use agent_client_protocol::schema::v2::AuthMethodAgent;
-
-    #[test]
-    fn wire_method_names_are_prefixed() {
-        assert_eq!(
-            GitDiffCommandPayload { session_id: String::new(), command: ClientCommand::Cancel }.method(),
-            "_aether/git_diff"
-        );
-        assert_eq!(GitDiffClosePayload { session_id: String::new() }.method(), "_aether/git_diff_close");
-        assert_eq!(
-            GitDiffEventPayload { session_id: String::new(), event: Event::RequestResult(Ok(())) }.method(),
-            "_aether/git_diff_event"
-        );
-        assert_eq!(WorkspaceStatusPayload { session_id: String::new() }.method(), "_aether/workspace_status");
-        assert_eq!(ContextClearedParams::default().method(), "_aether/context_cleared");
-        assert_eq!(AuthMethodsUpdatedParams { auth_methods: vec![] }.method(), "_aether/auth_methods_updated");
-        assert_eq!(McpNotification::ServerStatus { servers: vec![] }.method(), "_aether/mcp_event");
-        assert_eq!(
-            McpRequest::Authenticate { session_id: String::new(), server_name: String::new() }.method(),
-            "_aether/mcp_request"
-        );
-        assert_eq!(PromptSearchParams { query: String::new(), limit: None }.method(), "_aether/prompt_search");
-        assert_eq!(SessionPreviewParams { session_id: String::new() }.method(), "_aether/session_preview");
-        assert_eq!(WorkspaceListParams { session_id: String::new() }.method(), "_aether/workspace_list");
-        let move_params =
-            WorkspaceMoveParams { session_id: String::new(), target: WorkspaceMoveTarget::New { name: String::new() } };
-        assert_eq!(move_params.method(), "_aether/workspace_move");
-    }
-
-    #[test]
-    fn context_cleared_params_roundtrip() {
-        let params = ContextClearedParams::default();
-        let untyped = params.to_untyped_message().expect("serializable");
-        assert_eq!(untyped.method(), "_aether/context_cleared");
-        let parsed = ContextClearedParams::parse_message(untyped.method(), untyped.params()).expect("roundtrip");
-        assert_eq!(parsed, params);
-    }
-
-    #[test]
-    fn auth_methods_updated_roundtrip() {
-        let params = AuthMethodsUpdatedParams {
-            auth_methods: vec![
-                AuthMethod::Agent(AuthMethodAgent::new("anthropic", "Anthropic").description("authenticated")),
-                AuthMethod::Agent(AuthMethodAgent::new("openrouter", "OpenRouter")),
-            ],
-        };
-
-        let untyped = params.to_untyped_message().expect("serializable");
-        assert_eq!(untyped.method(), "_aether/auth_methods_updated");
-        let parsed = AuthMethodsUpdatedParams::parse_message(untyped.method(), untyped.params()).expect("roundtrip");
-        assert_eq!(parsed, params);
-    }
-
-    #[test]
-    fn mcp_request_authenticate_roundtrip() {
-        let msg = McpRequest::Authenticate {
-            session_id: "session-0".to_string(),
-            server_name: "my oauth server".to_string(),
-        };
-
-        let untyped = msg.to_untyped_message().expect("serializable");
-        assert_eq!(untyped.method(), "_aether/mcp_request");
-        let parsed = McpRequest::parse_message(untyped.method(), untyped.params()).expect("roundtrip");
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn mcp_notification_server_status_roundtrip() {
-        let msg = McpNotification::ServerStatus {
-            servers: vec![
-                McpServerStatusEntry::new("github", McpServerStatus::Connected { tool_count: 5 }),
-                McpServerStatusEntry::new("linear", McpServerStatus::NeedsOAuth)
-                    .with_auth_capability(McpServerAuthCapability::OAuth),
-                McpServerStatusEntry::new("slack", McpServerStatus::Failed { error: "connection timeout".to_string() }),
-            ],
-        };
-
-        let untyped = msg.to_untyped_message().expect("serializable");
-        assert_eq!(untyped.method(), "_aether/mcp_event");
-        let parsed = McpNotification::parse_message(untyped.method(), untyped.params()).expect("roundtrip");
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn sub_agent_progress_params_roundtrip() {
-        let params = SubAgentProgressParams {
-            parent_tool_id: "call_123".to_string(),
-            task_id: "task_abc".to_string(),
-            agent_name: "explorer".to_string(),
-            event: SubAgentEvent::Done,
-        };
-
-        let untyped = params.to_untyped_message().expect("serializable");
-        assert_eq!(untyped.method(), "_aether/sub_agent_progress");
-    }
-
-    #[test]
-    fn mcp_server_status_entry_serde_roundtrip() {
-        let entry = McpServerStatusEntry::new("test-server", McpServerStatus::Connected { tool_count: 3 })
-            .with_auth_capability(McpServerAuthCapability::OAuth);
-
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"auth_capability\":\"OAuth\""));
-        assert!(json.contains("\"deferTools\":false"));
-        let parsed: McpServerStatusEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, entry);
-        assert!(!parsed.deferred_tools);
-        assert!(parsed.can_authenticate());
-    }
-
-    #[test]
-    fn mcp_server_status_entry_deferred_tools_serde_roundtrip() {
-        let entry = McpServerStatusEntry::new("math", McpServerStatus::NeedsOAuth)
-            .with_auth_capability(McpServerAuthCapability::OAuth)
-            .with_deferred_tools(true);
-
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"deferTools\":true"));
-        let parsed: McpServerStatusEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, entry);
-    }
-
-    #[test]
-    fn deserialize_tool_call_event() {
-        let json = r#"{"ToolCall":{"request":{"id":"c1","name":"grep","arguments":"{\"pattern\":\"test\"}"},"model_name":"m"}}"#;
-        let event: SubAgentEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, SubAgentEvent::ToolCall { .. }));
-    }
-
-    #[test]
-    fn deserialize_tool_call_update_event() {
-        let json = r#"{"ToolCallUpdate":{"update":{"id":"c1","chunk":"{\"pattern\":\"test\"}"},"model_name":"m"}}"#;
-        let event: SubAgentEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, SubAgentEvent::ToolCallUpdate { .. }));
-    }
-
-    #[test]
-    fn deserialize_tool_result_event() {
-        let json = r#"{"ToolResult":{"result":{"id":"c1","name":"grep","result_meta":{"display":{"title":"Grep","value":"'test' in src (3 matches)"}}}}}"#;
-        let event: SubAgentEvent = serde_json::from_str(json).unwrap();
-        match event {
-            SubAgentEvent::ToolResult { result } => {
-                let result_meta = result.result_meta.expect("expected result_meta");
-                assert_eq!(result_meta.display.title, "Grep");
-            }
-            other => panic!("Expected ToolResult, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn deserialize_tool_error_event() {
-        let json = r#"{"ToolError":{"error":{"id":"c1","name":"grep"}}}"#;
-        let event: SubAgentEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, SubAgentEvent::ToolError { .. }));
-    }
-
-    #[test]
-    fn deserialize_done_event() {
-        let event: SubAgentEvent = serde_json::from_str(r#""Done""#).unwrap();
-        assert!(matches!(event, SubAgentEvent::Done));
-    }
-
-    #[test]
-    fn deserialize_other_variant() {
-        let event: SubAgentEvent = serde_json::from_str(r#""Other""#).unwrap();
-        assert!(matches!(event, SubAgentEvent::Other));
-    }
-
-    #[test]
-    fn tool_result_meta_map_roundtrip() {
-        let meta: ToolResultMeta = ToolDisplayMeta::new("Read file", "Cargo.toml, 156 lines").into();
-        let map = meta.clone().into_map();
-        let parsed = ToolResultMeta::from_map(&map).expect("should deserialize ToolResultMeta");
-        assert_eq!(parsed, meta);
-    }
 }

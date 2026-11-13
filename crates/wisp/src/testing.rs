@@ -6,626 +6,83 @@
 
 use crate::app::message::Message;
 use crate::app::{App, AppConfig};
-use crate::attachment::{AttachmentOutcome, PromptAttachment, build_attachments_with};
-use crate::command::{AgentCommand, Command, CommandResult, FilesystemCommand, GitReviewCommand};
-use crate::file_index::{FileEntry, MAX_INDEXED_FILES, file_entries};
-use crate::git_review::{
-    ClientState, ConnectionState, DiffDocument, DiffReviewEvent, DiffScope, DiffSnapshot, FileDiff, FileStatus,
-    LIVE_PROTOCOL_VERSION, RemoteError, RemoteErrorCode, RepositoryAction, ServerEvent, StageState,
-};
+use crate::command::{Command, HostCommand, HostCommandResult};
+use crate::platform::terminal::inline_viewport_height;
 pub use crate::renderer::RenderStats;
-use crate::renderer::Renderer;
-use crate::session::platform::BrowserOpener;
-use crate::session::terminal::inline_viewport_height;
-use crate::session::workspace_status::WorkspaceStatus;
-use crate::settings::UiSettings;
+use crate::renderer::{DrawContext, Renderer};
+use crate::runtime::Host;
+use crate::runtime::runner::Runtimes;
+use crate::settings::{UiSettings, builtin_review_theme_choices};
 use crate::surfaces::composer::ComposerLayout;
-use acp_utils::client::AcpEvent;
+use crate::theme::Theme;
+use crate::view::generation::Generation;
+use acp_utils::client::{AcpEvent, connect_acp_client};
 use acp_utils::notifications::{
-    AetherCapabilities, SubAgentEvent, SubAgentProgressParams, SubAgentToolRequest, SubAgentToolResult,
-    WorkspaceStatusResponse,
+    ContextClearedParams, PromptSearchParams, SessionPreviewParams, WorkspaceListParams, WorkspaceMoveParams,
 };
-use agent_client_protocol::schema::MaybeUndefined;
-use agent_client_protocol::schema::v2::{self as acp, SessionId, SessionUpdate, ToolCallUpdate};
+pub use acp_utils::testing::sub_agent_tool_update;
+use acp_utils::testing::{
+    Channel, FakeAgent, FakeAgentRequests, announced, idle_state, initialize_request, message_chunk, on_session,
+    running_state,
+};
+use agent_client_protocol::v2::schema::{self as acp, CreateElicitationRequest, CreateElicitationResponse, SessionId};
+use agent_client_protocol::{Error, JsonRpcRequest, JsonRpcResponse, Responder};
 use clankerdiff_core::git_patch_from_texts;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use clankerdiff_ratatui::ThemeChoice;
+use client_core::runtime::{Input, SessionRuntime};
+use client_core::session_core::ForegroundOperation;
+use client_core::testing::{FakeGit, SessionCoreConfigBuilder, git_diff_agent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use futures::FutureExt;
 use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::borrow::Borrow;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tempfile::TempDir;
+use tokio::sync::oneshot;
+use tokio::task::{JoinHandle, LocalSet};
+use unicode_width::UnicodeWidthStr;
 
-/// A deterministic command runner for integration tests.
-///
-/// Commands are recorded in submission order. Tests may enqueue completions for
-/// commands whose results are part of the scenario; commands without a queued
-/// completion are still recorded and produce no state change.
-pub struct FakeExecutor {
-    /// Commands not yet consumed by a test through `next_command`.
-    available: VecDeque<Command>,
-    /// Commands not yet completed by `settle_tasks`.
-    pending: VecDeque<Command>,
-    git: FakeGit,
-    /// The review client's published state, or `None` when no review is attached.
-    published: Option<Arc<ClientState>>,
-    git_completion: Option<Result<(), String>>,
-    filesystem: FakeFilesystem,
-}
-
-impl Default for FakeExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FakeExecutor {
-    pub fn new() -> Self {
-        Self::with_git(FakeGit::default())
-    }
-
-    pub fn with_git(git: FakeGit) -> Self {
-        Self {
-            available: VecDeque::new(),
-            pending: VecDeque::new(),
-            git,
-            published: None,
-            git_completion: None,
-            filesystem: FakeFilesystem::default(),
-        }
-    }
-
-    pub fn git(&self) -> &FakeGit {
-        &self.git
-    }
-
-    /// Whether a review client is currently attached to the fake runtime.
-    pub fn git_review_active(&self) -> bool {
-        self.published.is_some()
-    }
-
-    pub fn git_mut(&mut self) -> &mut FakeGit {
-        &mut self.git
-    }
-
-    pub fn filesystem(&self) -> &FakeFilesystem {
-        &self.filesystem
-    }
-
-    pub fn filesystem_mut(&mut self) -> &mut FakeFilesystem {
-        &mut self.filesystem
-    }
-
-    pub fn next_git_review_state(&mut self) -> Option<Arc<ClientState>> {
-        self.sync_git_review()
-    }
-
-    pub fn record(&mut self, commands: impl IntoIterator<Item = Command>) {
-        for command in commands {
-            self.available.push_back(command.clone());
-            self.pending.push_back(command);
-        }
-    }
-
-    fn complete(&mut self, command: Command) -> Option<CommandResult> {
-        match command {
-            Command::Agent(AgentCommand::FetchWorkspaceStatus { cwd, .. }) => {
-                let status = self.git.workspace_status();
-                Some(CommandResult::WorkspaceResolved { cwd: cwd.clone(), status: status.into() })
-            }
-            Command::GitReview(GitReviewCommand::Open { .. }) => {
-                self.git_completion = None;
-                self.published = Some(Arc::new(ClientState::default().apply(&ServerEvent::Initialize {
-                    protocol_version: LIVE_PROTOCOL_VERSION,
-                    repository_root: self.git.root().to_string_lossy().into_owned(),
-                })));
-                self.next_git_review_state().map(CommandResult::GitReview)
-            }
-            Command::GitReview(GitReviewCommand::Event(event)) => self.on_review_event(event),
-            Command::GitReview(GitReviewCommand::Close) => {
-                self.published = None;
-                self.git_completion = None;
-                None
-            }
-            Command::Filesystem(FilesystemCommand::PrepareSubmission { attachments }) => {
-                Some(CommandResult::SubmissionPrepared(self.filesystem.build_attachments(&attachments)))
-            }
-            Command::Filesystem(FilesystemCommand::IndexFiles { request_id, root }) => {
-                Some(CommandResult::FilesIndexed { request_id, files: self.filesystem.index_files(&root) })
-            }
-            _ => None,
-        }
-    }
-
-    fn on_review_event(&mut self, event: DiffReviewEvent) -> Option<CommandResult> {
-        match event {
-            DiffReviewEvent::SetScope(scope) => self.reload(scope),
-            DiffReviewEvent::Refresh => {
-                self.git_completion = Some(Ok(()));
-                self.next_git_review_state().map(CommandResult::GitReview)
-            }
-            DiffReviewEvent::RepositoryAction(action) => {
-                self.git_completion = Some(self.git.apply(action).map_err(|error| error.to_string()));
-                self.next_git_review_state().map(CommandResult::GitReview)
-            }
-            DiffReviewEvent::Cancel | DiffReviewEvent::SubmitReview(_) | DiffReviewEvent::CopyFormattedReview(_) => {
-                None
-            }
-        }
-    }
-
-    fn sync_git_review(&mut self) -> Option<Arc<ClientState>> {
-        let current = self.published.clone()?;
-        let scope = current.snapshot.as_ref().map_or(DiffScope::default(), |snapshot| snapshot.scope);
-        match self.git.load_diff(scope) {
-            Ok(snapshot) if current.snapshot.as_deref() != Some(&snapshot) => {
-                self.publish(&current, &ServerEvent::Document(Arc::new(snapshot)))
-            }
-            Ok(_) if current.error.is_some() => self.publish(&current, &ServerEvent::Health { error: None }),
-            Ok(_) => None,
-            Err(error) if current.error.as_ref() == Some(&error) => None,
-            Err(error) if current.snapshot.is_none() && !matches!(current.connection, ConnectionState::Failed(_)) => {
-                self.publish(&current, &ServerEvent::Error(error))
-            }
-            Err(error) => self.publish(&current, &ServerEvent::Health { error: Some(error) }),
-        }
-    }
-
-    fn publish(&mut self, current: &Arc<ClientState>, event: &ServerEvent) -> Option<Arc<ClientState>> {
-        let next = current.as_ref().clone().apply(event);
-        if &next == current.as_ref() {
-            return None;
-        }
-        let next = Arc::new(next);
-        self.published = Some(Arc::clone(&next));
-        Some(next)
-    }
-
-    fn reload(&mut self, scope: DiffScope) -> Option<CommandResult> {
-        let current = self.published.clone()?;
-        match self.git.load_diff(scope) {
-            Ok(snapshot) => {
-                self.git_completion = Some(Ok(()));
-                self.publish(&current, &ServerEvent::Document(Arc::new(snapshot))).map(CommandResult::GitReview)
-            }
-            Err(error) => {
-                self.git_completion = Some(Err(error.to_string()));
-                None
-            }
-        }
-    }
-
-    fn take_pending(&mut self) -> Vec<Command> {
-        self.pending.drain(..).collect()
-    }
-
-    fn clear_available(&mut self) {
-        self.available.clear();
-    }
-
-    pub fn take_commands(&mut self) -> Vec<Command> {
-        self.pending.clear();
-        self.available.drain(..).collect()
-    }
-}
-
-/// An in-memory filesystem used by command-oriented tests.
-#[derive(Clone, Default)]
-pub struct FakeFilesystem {
-    files: BTreeMap<PathBuf, Vec<u8>>,
-    directories: BTreeSet<PathBuf>,
-    settings: Option<UiSettings>,
-}
-
-impl FakeFilesystem {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn create_dir(&mut self, path: impl Into<PathBuf>) {
-        self.directories.insert(path.into());
-    }
-
-    pub fn write_file(&mut self, path: impl Into<PathBuf>, contents: impl AsRef<[u8]>) {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            self.directories.insert(parent.to_path_buf());
-        }
-        self.files.insert(path, contents.as_ref().to_vec());
-    }
-
-    pub fn remove_file(&mut self, path: &Path) -> bool {
-        self.files.remove(path).is_some()
-    }
-
-    pub fn read_file(&self, path: &Path) -> Option<&[u8]> {
-        self.files.get(path).map(Vec::as_slice)
-    }
-
-    pub fn read_to_string(&self, path: &Path) -> Option<String> {
-        self.read_file(path).and_then(|contents| String::from_utf8(contents.to_vec()).ok())
-    }
-
-    pub fn contains(&self, path: &Path) -> bool {
-        self.files.contains_key(path) || self.directories.contains(path)
-    }
-
-    pub fn files(&self) -> impl Iterator<Item = (&Path, &[u8])> {
-        self.files.iter().map(|(path, contents)| (path.as_path(), contents.as_slice()))
-    }
-
-    pub fn directories(&self) -> impl Iterator<Item = &Path> {
-        self.directories.iter().map(PathBuf::as_path)
-    }
-
-    pub fn save_settings(&mut self, settings: UiSettings) {
-        self.settings = Some(settings);
-    }
-
-    pub fn settings(&self) -> Option<&UiSettings> {
-        self.settings.as_ref()
-    }
-
-    /// The runtime's file index over the in-memory tree, minus gitignore
-    /// semantics, which need a real repository.
-    pub fn index_files(&self, root: &Path) -> Vec<FileEntry> {
-        let paths = self.files.keys().filter(|path| path.starts_with(root)).cloned();
-        file_entries(root, paths, MAX_INDEXED_FILES)
-    }
-
-    /// The runtime's attachment preparation over in-memory contents: the same
-    /// pure encoding as the real reader, with reads answered from this tree.
-    pub fn build_attachments(&self, attachments: &[PromptAttachment]) -> AttachmentOutcome {
-        build_attachments_with(attachments, |path, display_name| {
-            if self.directories.contains(path) {
-                return Err(format!("Failed to read {display_name}: is a directory"));
-            }
-            self.files.get(path).cloned().ok_or_else(|| format!("Failed to read {display_name}: file not found"))
-        })
-    }
-}
-
-/// A small stateful Git model. It keeps working-tree, index, and committed
-/// snapshots separate so staging and discarding have observable semantics.
-#[derive(Clone, Default)]
-pub struct FakeGit {
-    state: std::sync::Arc<std::sync::Mutex<FakeGitState>>,
-}
-
-#[derive(Default)]
-struct FakeGitState {
-    root: PathBuf,
-    files: BTreeMap<String, FakeGitFile>,
-    commits: Vec<String>,
-    is_repo: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FakeGitFile {
-    pub path: String,
-    pub contents: Option<Vec<u8>>,
-    pub staged_contents: Option<Vec<u8>>,
-    pub committed_contents: Option<Vec<u8>>,
-}
-
-impl FakeGit {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let state = FakeGitState { root: root.into(), is_repo: true, ..FakeGitState::default() };
-        Self { state: std::sync::Arc::new(std::sync::Mutex::new(state)) }
-    }
-
-    pub fn not_a_repository(root: impl Into<PathBuf>) -> Self {
-        let state = FakeGitState { root: root.into(), ..FakeGitState::default() };
-        Self { state: std::sync::Arc::new(std::sync::Mutex::new(state)) }
-    }
-
-    pub fn set_repository_available(&mut self, available: bool) {
-        self.state.lock().unwrap().is_repo = available;
-    }
-
-    pub fn root(&self) -> PathBuf {
-        self.state.lock().unwrap().root.clone()
-    }
-
-    pub fn add_file(&mut self, path: impl Into<String>, contents: impl AsRef<[u8]>) {
-        let path = path.into();
-        self.state.lock().unwrap().files.insert(
-            path.clone(),
-            FakeGitFile {
-                path,
-                contents: Some(contents.as_ref().to_vec()),
-                staged_contents: None,
-                committed_contents: None,
-            },
-        );
-    }
-
-    pub fn write_file(&mut self, path: impl Into<String>, contents: impl AsRef<[u8]>) {
-        let path = path.into();
-        let mut state = self.state.lock().unwrap();
-        let file = state.files.entry(path.clone()).or_insert_with(|| FakeGitFile {
-            path,
-            contents: None,
-            staged_contents: None,
-            committed_contents: None,
-        });
-        file.contents = Some(contents.as_ref().to_vec());
-    }
-
-    pub fn remove_file(&mut self, path: &str) {
-        if let Some(file) = self.state.lock().unwrap().files.get_mut(path) {
-            file.contents = None;
-        }
-    }
-
-    pub fn stage(&mut self, path: &str) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let Some(file) = state.files.get_mut(path) else { return false };
-        file.staged_contents = file.contents.clone();
-        true
-    }
-
-    pub fn unstage(&mut self, path: &str) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let Some(file) = state.files.get_mut(path) else { return false };
-        file.staged_contents = file.committed_contents.clone();
-        true
-    }
-
-    pub fn stage_all(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        for file in state.files.values_mut() {
-            file.staged_contents = file.contents.clone();
-        }
-    }
-
-    pub fn unstage_all(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        for file in state.files.values_mut() {
-            file.staged_contents = file.committed_contents.clone();
-        }
-    }
-
-    pub fn discard(&mut self, path: &str) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let Some(file) = state.files.get_mut(path) else { return false };
-        file.contents = file.committed_contents.clone();
-        file.staged_contents = file.committed_contents.clone();
-        true
-    }
-
-    pub fn commit(&mut self, message: impl Into<String>) -> Result<(), RemoteError> {
-        let message = message.into();
-        let mut state = self.state.lock().unwrap();
-        if message.trim().is_empty() {
-            return Err(git_error("commit message must not be empty"));
-        }
-        if !state.files.values().any(|file| file.staged_contents != file.committed_contents) {
-            return Err(git_error("git operation `commit` failed with status Some(1)"));
-        }
-        for file in state.files.values_mut() {
-            if file.staged_contents != file.committed_contents {
-                file.committed_contents = file.staged_contents.clone();
-            }
-        }
-        state.commits.push(message);
-        Ok(())
-    }
-
-    pub fn file(&self, path: &str) -> Option<FakeGitFile> {
-        self.state.lock().unwrap().files.get(path).cloned()
-    }
-
-    pub fn files(&self) -> Vec<FakeGitFile> {
-        self.state.lock().unwrap().files.values().cloned().collect()
-    }
-
-    pub fn commits(&self) -> Vec<String> {
-        self.state.lock().unwrap().commits.clone()
-    }
-
-    pub fn status(&self, path: &str) -> Option<(FileStatus, StageState)> {
-        self.state.lock().unwrap().files.get(path).and_then(status_of)
-    }
-
-    pub fn apply(&mut self, action: RepositoryAction) -> Result<(), RemoteError> {
-        if !self.state.lock().unwrap().is_repo {
-            return Err(not_repository_error());
-        }
-        match action {
-            RepositoryAction::StagePaths(paths) => {
-                for path in paths {
-                    self.stage(path.as_str());
-                }
-                Ok(())
-            }
-            RepositoryAction::UnstagePaths(paths) => {
-                for path in paths {
-                    self.unstage(path.as_str());
-                }
-                Ok(())
-            }
-            RepositoryAction::StageAll => {
-                self.stage_all();
-                Ok(())
-            }
-            RepositoryAction::UnstageAll => {
-                self.unstage_all();
-                Ok(())
-            }
-            RepositoryAction::Commit { message } => self.commit(message),
-            RepositoryAction::Discard { path, status } => {
-                if status == FileStatus::Untracked {
-                    self.state.lock().unwrap().files.remove(path.as_str());
-                } else {
-                    self.discard(path.as_str());
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub fn workspace_status(&self) -> WorkspaceStatusResponse {
-        let state = self.state.lock().unwrap();
-        WorkspaceStatusResponse {
-            display_dir: state.root.to_string_lossy().into_owned(),
-            git_ref: Some("main".to_string()),
-        }
-    }
-
-    fn load_diff(&self, scope: DiffScope) -> Result<DiffSnapshot, RemoteError> {
-        let state = self.state.lock().unwrap();
-        if !state.is_repo {
-            return Err(not_repository_error());
-        }
-        let mut files = Vec::new();
-        for file in state.files.values() {
-            let (old, new) = match scope {
-                DiffScope::Staged => (&file.committed_contents, &file.staged_contents),
-                DiffScope::Unstaged => (&file.staged_contents, &file.contents),
-                DiffScope::Both => (&file.committed_contents, &file.contents),
-            };
-            if old == new {
-                continue;
-            }
-            let binary = old.as_ref().is_some_and(|bytes| is_binary(bytes))
-                || new.as_ref().is_some_and(|bytes| is_binary(bytes));
-            let mut diff = if binary {
-                FileDiff::from_texts(file.path.clone(), "", "").map_err(|error| git_error(error.to_string()))?
-            } else {
-                let old_text = old.as_deref().map(String::from_utf8_lossy).unwrap_or_default();
-                let new_text = new.as_deref().map(String::from_utf8_lossy).unwrap_or_default();
-                FileDiff::from_texts(file.path.clone(), &old_text, &new_text)
-                    .map_err(|error| git_error(error.to_string()))?
-            };
-            diff.status = match (old, new) {
-                (None, Some(_)) if file.committed_contents.is_none() && file.staged_contents.is_none() => {
-                    FileStatus::Untracked
-                }
-                (None, Some(_)) => FileStatus::Added,
-                (Some(_), None) => FileStatus::Deleted,
-                _ => FileStatus::Modified,
-            };
-            diff.old_path = old.is_some().then(|| diff.path.clone());
-            diff.staged = status_of(file).map_or(StageState::Unstaged, |(_, stage)| stage);
-            diff.binary = binary;
-            diff = diff.with_sources(fake_source(old.as_deref()), fake_source(new.as_deref()));
-            files.push(diff);
-        }
-        let document = DiffDocument { repo_root: state.root.to_string_lossy().into_owned(), files };
-        Ok(DiffSnapshot { scope, document: Arc::new(document) })
-    }
-}
-
-fn git_error(message: impl Into<String>) -> RemoteError {
-    RemoteError::new(RemoteErrorCode::Git, message)
-}
-
-fn not_repository_error() -> RemoteError {
-    git_error("path is not inside a Git worktree")
-}
-
-fn status_of(file: &FakeGitFile) -> Option<(FileStatus, StageState)> {
-    let staged_changed = file.staged_contents != file.committed_contents;
-    let working_changed = file.contents != file.staged_contents;
-    if !staged_changed && !working_changed {
-        return None;
-    }
-
-    if file.committed_contents.is_none() {
-        let stage = match (file.staged_contents.is_some(), working_changed) {
-            (true, true) => StageState::PartiallyStaged,
-            (true, false) => StageState::Staged,
-            (false, _) => StageState::Unstaged,
-        };
-        return Some((FileStatus::Untracked, stage));
-    }
-
-    let stage = match (staged_changed, working_changed) {
-        (true, true) => StageState::PartiallyStaged,
-        (true, false) => StageState::Staged,
-        (false, true) => StageState::Unstaged,
-        (false, false) => unreachable!("clean files returned above"),
-    };
-    let status = if file.contents.is_none() { FileStatus::Deleted } else { FileStatus::Modified };
-    Some((status, stage))
-}
-
-fn fake_source(bytes: Option<&[u8]>) -> clankerdiff_ratatui::diff::SourceResult {
-    use clankerdiff_ratatui::diff::{SourceDocument, SourceUnavailable};
-    match bytes {
-        None => Err(SourceUnavailable::Absent),
-        Some(bytes) if is_binary(bytes) => Err(SourceUnavailable::Binary),
-        Some(bytes) => SourceDocument::new(String::from_utf8_lossy(bytes)).map(std::sync::Arc::new),
-    }
-}
-
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8192).any(|byte| *byte == 0) || std::str::from_utf8(bytes).is_err()
-}
-
-/// Deterministic terminal wrapper used by focused golden tests.
-pub struct TestTerminal {
-    terminal: Terminal<TestBackend>,
-}
-
-impl TestTerminal {
-    pub fn new(width: u16, height: u16) -> Self {
-        Self { terminal: test_terminal(TestBackend::new(width, height)) }
-    }
-
-    pub fn terminal(&mut self) -> &mut Terminal<TestBackend> {
-        &mut self.terminal
-    }
-
-    pub fn resize(&mut self, width: u16, height: u16) {
-        self.terminal.backend_mut().resize(width, height);
-    }
-
-    pub fn viewport(&mut self) -> Buffer {
-        viewport_buffer(&mut self.terminal)
-    }
-
-    pub fn history(&mut self) -> Buffer {
-        history_buffer(&mut self.terminal)
-    }
-
-    pub fn conversation(&mut self) -> Buffer {
-        conversation_buffer(&mut self.terminal)
-    }
-}
-
-/// A backend that records terminal history operations without involving a real
-/// terminal. It is intentionally small: only operations with an observable
-/// presentation contract are recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendEvent {
     ShowCursor,
     Scroll,
 }
 
-#[derive(Debug)]
-pub struct RecordingBackend {
-    inner: TestBackend,
-    events: Vec<BackendEvent>,
+/// Counts of what the app asked the backend to do: a draw is one complete
+/// frame pushed at the terminal. Because ratatui diffs buffers before flushing,
+/// `cells_drawn` counts only cells that actually changed — a frame that
+/// repaints a settled screen costs nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackendStats {
+    pub draws: u64,
+    pub cells_drawn: u64,
+    pub scrolls: u64,
 }
 
-impl RecordingBackend {
+#[derive(Debug)]
+pub struct InstrumentedBackend {
+    inner: TestBackend,
+    events: Vec<BackendEvent>,
+    stats: BackendStats,
+}
+
+impl InstrumentedBackend {
     pub fn new(width: u16, height: u16) -> Self {
-        Self { inner: TestBackend::new(width, height), events: Vec::new() }
+        Self { inner: TestBackend::new(width, height), events: Vec::new(), stats: BackendStats::default() }
     }
 
-    pub fn events(&self) -> &[BackendEvent] {
-        &self.events
+    pub fn take_events(&mut self) -> Vec<BackendEvent> {
+        std::mem::take(&mut self.events)
     }
 
-    pub fn clear_events(&mut self) {
-        self.events.clear();
+    pub fn take_stats(&mut self) -> BackendStats {
+        std::mem::take(&mut self.stats)
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -641,14 +98,24 @@ impl RecordingBackend {
     }
 }
 
-impl Backend for RecordingBackend {
+impl Borrow<TestBackend> for InstrumentedBackend {
+    fn borrow(&self) -> &TestBackend {
+        &self.inner
+    }
+}
+
+impl Backend for InstrumentedBackend {
     type Error = std::convert::Infallible;
 
     fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.inner.draw(content)
+        self.stats.draws += 1;
+        let mut cells = 0u64;
+        let drawn = self.inner.draw(content.inspect(|_| cells += 1));
+        self.stats.cells_drawn += cells;
+        drawn
     }
 
     fn append_lines(&mut self, lines: u16) -> Result<(), Self::Error> {
@@ -694,127 +161,29 @@ impl Backend for RecordingBackend {
 
     fn scroll_region_up(&mut self, region: std::ops::Range<u16>, lines: u16) -> Result<(), Self::Error> {
         self.events.push(BackendEvent::Scroll);
-        let region = if region == (0..1) { 0..self.inner.size().unwrap().height } else { region };
-        self.inner.scroll_region_up(region, lines)
-    }
-
-    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, lines: u16) -> Result<(), Self::Error> {
-        self.events.push(BackendEvent::Scroll);
-        self.inner.scroll_region_down(region, lines)
-    }
-}
-
-/// Backend work since the last [`CountingBackend::take_stats`]: how much a
-/// frame pushed at the terminal. Because ratatui diffs buffers before flushing,
-/// `cells_drawn` counts only cells that actually changed — a frame that
-/// repaints a settled screen costs nothing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct BackendStats {
-    pub draws: u64,
-    pub cells_drawn: u64,
-    pub scrolls: u64,
-}
-
-/// A [`TestBackend`] that counts what rendering pushes at it, for tests that
-/// bound rendering work instead of timing it.
-#[derive(Debug)]
-pub struct CountingBackend {
-    inner: TestBackend,
-    stats: BackendStats,
-}
-
-impl CountingBackend {
-    pub fn new(width: u16, height: u16) -> Self {
-        Self { inner: TestBackend::new(width, height), stats: BackendStats::default() }
-    }
-
-    pub fn take_stats(&mut self) -> BackendStats {
-        std::mem::take(&mut self.stats)
-    }
-
-    pub fn buffer(&self) -> &Buffer {
-        self.inner.buffer()
-    }
-
-    pub fn scrollback(&self) -> &Buffer {
-        self.inner.scrollback()
-    }
-}
-
-impl Backend for CountingBackend {
-    type Error = std::convert::Infallible;
-
-    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        self.stats.draws += 1;
-        let mut cells = 0u64;
-        let drawn = self.inner.draw(content.inspect(|_| cells += 1));
-        self.stats.cells_drawn += cells;
-        drawn
-    }
-
-    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> Result<(), Self::Error> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
-        self.inner.get_cursor_position()
-    }
-
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
-        self.inner.set_cursor_position(position)
-    }
-
-    fn clear(&mut self) -> Result<(), Self::Error> {
-        self.inner.clear()
-    }
-
-    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn size(&self) -> Result<Size, Self::Error> {
-        self.inner.size()
-    }
-
-    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
-        self.inner.window_size()
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        self.inner.flush()
-    }
-
-    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, lines: u16) -> Result<(), Self::Error> {
         self.stats.scrolls += 1;
         self.inner.scroll_region_up(region, lines)
     }
 
     fn scroll_region_down(&mut self, region: std::ops::Range<u16>, lines: u16) -> Result<(), Self::Error> {
+        self.events.push(BackendEvent::Scroll);
         self.stats.scrolls += 1;
         self.inner.scroll_region_down(region, lines)
     }
 }
 
 /// A whole UI scenario: the app, the renderer that owns its scrollback, the
-/// terminal it draws into, and the receiver for the commands the app sends.
+/// terminal it draws into, and the fake world behind the host.
 ///
 /// Construct through [`TestUi::new`], [`TestUi::with_dimensions`], or
-/// [`TestUiBuilder`]. Input, ACP events, ticks, and task results are routed the
+/// [`TestUiBuilder`]. Input, ACP events, ticks, and host results are routed the
 /// same way the event loop routes them, and drawing happens against the same
 /// renderer instance every frame so committed scrollback survives.
 pub struct TestUi<B: Backend = TestBackend> {
     app: App,
     renderer: Renderer,
     terminal: Terminal<B>,
-    executor: FakeExecutor,
-    opened_urls: Arc<Mutex<Vec<String>>>,
+    world: World,
 }
 
 impl<B: Backend> TestUi<B>
@@ -825,58 +194,116 @@ where
     /// asserts on frame-level terminal commands). The app is the default
     /// scenario; configure anything else through [`TestUiBuilder`].
     pub fn with_backend(backend: B) -> Self {
-        let builder = TestUiBuilder::new();
-        let app = App::new(builder.app_config());
-        Self {
-            app,
-            renderer: Renderer::new(),
-            terminal: test_terminal(backend),
-            executor: FakeExecutor::new(),
-            opened_urls: builder.opened_urls.clone(),
-        }
+        TestUiBuilder::new().finish(backend)
     }
 
     /// The app under test, for the read-only queries assertions are built from.
     /// Drive it through this harness rather than mutating it directly, so the
-    /// commands it emits still reach the fake runtime.
+    /// commands it emits still reach the fake host.
     pub fn app(&self) -> &App {
         &self.app
     }
 
-    /// Delivers one message through the public application boundary and records
-    /// every command it emits in the fake runtime.
     pub fn deliver(&mut self, message: Message) {
-        self.executor.record(self.app.update(message));
-    }
-
-    pub fn deliver_result(&mut self, result: CommandResult) {
-        self.deliver(Message::CommandFinished(Box::new(result)));
-    }
-
-    /// Commands emitted by the public application boundary, in order.
-    pub fn executor(&self) -> &FakeExecutor {
-        &self.executor
-    }
-
-    pub fn executor_mut(&mut self) -> &mut FakeExecutor {
-        &mut self.executor
-    }
-
-    pub fn take_commands(&mut self) -> Vec<Command> {
-        self.executor.take_commands()
-    }
-
-    pub fn next_command(&mut self) -> Option<Command> {
-        self.executor.available.pop_front()
-    }
-
-    pub fn next_agent_command(&mut self) -> Option<AgentCommand> {
-        while let Some(command) = self.next_command() {
-            if let Command::Agent(command) = command {
-                return Some(command);
-            }
+        let commands = self.app.update(message);
+        if commands.is_empty() {
+            return;
         }
-        None
+        self.world.dispatch(commands);
+        self.settle_tasks();
+    }
+
+    pub fn settle_tasks(&mut self) {
+        self.world.settle(&mut self.app);
+    }
+
+    pub fn advance(&mut self, duration: Duration) {
+        self.world.tokio.block_on(self.world.local.run_until(tokio::time::advance(duration)));
+        self.settle_tasks();
+    }
+
+    pub fn deliver_host_result(&mut self, result: HostCommandResult) {
+        self.deliver(Message::Host(Box::new(result)));
+    }
+
+    pub fn applied_themes(&mut self) -> Vec<UiSettings> {
+        self.world.runtimes.host.applying.drain(..).map(|settings| *settings).collect()
+    }
+
+    pub fn agent(&mut self) -> &mut FakeAgentRequests {
+        &mut self.world.agent
+    }
+
+    pub fn held<T: JsonRpcRequest>(&mut self) -> (T, Responder<T::Response>) {
+        self.try_held::<T>().unwrap_or_else(|| panic!("the agent holds no {}", std::any::type_name::<T>()))
+    }
+
+    pub fn try_held<T: JsonRpcRequest>(&mut self) -> Option<(T, Responder<T::Response>)> {
+        self.world.agent.held::<T>().try_recv().ok()
+    }
+
+    pub fn answer<T: JsonRpcRequest>(&mut self, response: Result<T::Response, Error>) -> T {
+        let (request, responder) = self.held::<T>();
+        self.respond(responder, response);
+        request
+    }
+
+    pub fn respond<T: JsonRpcResponse>(&mut self, responder: Responder<T>, response: Result<T, Error>) {
+        let _ = match response {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        };
+        self.settle_tasks();
+    }
+
+    pub fn complete_prompt(&mut self, stop_reason: acp::StopReason) {
+        self.world.agent.turns.end(stop_reason);
+        self.settle_tasks();
+    }
+
+    pub fn insert_queued_prompts(&mut self) {
+        self.world.agent.turns.insert_waiting();
+        self.settle_tasks();
+    }
+
+    pub fn reject_queued_prompts(&mut self, error: &Error) {
+        self.world.agent.turns.reject_waiting(error);
+        self.settle_tasks();
+    }
+
+    pub fn refuse_prompts(&mut self, error: Error) {
+        self.world.agent.turns.refuse(error);
+    }
+
+    pub fn elicit(&mut self, request: CreateElicitationRequest) -> ElicitationReply {
+        let reply = self.world.agent.turns.ask(request);
+        self.settle_tasks();
+        ElicitationReply(reply)
+    }
+
+    pub fn answer_to(&mut self, mut reply: ElicitationReply) -> CreateElicitationResponse {
+        self.settle_tasks();
+        reply.0.try_recv().expect("the question was answered").expect("the answer reached the agent")
+    }
+
+    pub fn quit_answering(self, reply: ElicitationReply) -> CreateElicitationResponse {
+        let Self { app, world, .. } = self;
+        drop(app);
+        let ElicitationReply(reply) = reply;
+        world
+            .tokio
+            .block_on(world.local.run_until(reply))
+            .expect("the question was answered")
+            .expect("the answer reached the agent")
+    }
+
+    pub fn disconnect_agent(&mut self) {
+        self.world.connection.abort();
+        self.settle_tasks();
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.world.root
     }
 
     pub fn backend(&self) -> &B {
@@ -887,12 +314,8 @@ where
         self.terminal.backend_mut()
     }
 
-    pub fn viewport_area(&mut self) -> ratatui::layout::Rect {
-        self.terminal.get_frame().area()
-    }
-
     pub fn viewport_height(&mut self) -> u16 {
-        self.viewport_area().height
+        self.terminal.get_frame().area().height
     }
 
     /// Measures the composer at `width` with the active theme.
@@ -905,11 +328,7 @@ where
 
     /// Draws one frame, like the event loop does after every input batch.
     pub fn draw(&mut self) {
-        self.try_draw().unwrap();
-    }
-
-    pub fn try_draw(&mut self) -> Result<(), crate::error::RenderError<B::Error>> {
-        self.renderer.draw(&mut self.terminal, &mut self.app)
+        self.renderer.draw(&mut self.terminal, &mut self.app).unwrap();
     }
 
     pub fn render_stats(&mut self) -> RenderStats {
@@ -919,97 +338,11 @@ where
     /// URLs elicitation prompts asked to open, in order. The harness records
     /// them instead of spawning a browser, so no test touches the host.
     pub fn opened_urls(&self) -> Vec<String> {
-        self.opened_urls.lock().unwrap().clone()
+        self.world.runtimes.host.opened_urls.clone()
     }
 
-    /// Seeds a deterministic long conversation: `turns` completed turns of
-    /// user messages, thoughts, markdown prose with fenced code, bash and edit
-    /// tool calls with diffs, and a sub-agent tree every eighth turn — drawing
-    /// after each turn so scrollback commits exactly like a live session.
-    pub fn seed_long_history(&mut self, turns: usize) {
-        for turn in 0..turns {
-            let prompt = format!("Turn {turn}: reconcile the writer path in module_{turn} and add a regression test.");
-            self.submit(&prompt);
-            self.acp_event(session_update(acp::SessionUpdate::UserMessage(
-                acp::UserMessage::new(format!("seed-user-{turn}"))
-                    .content(vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))]),
-            )));
-            self.acp_event(session_update(acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
-                acp::ContentBlock::Text(acp::TextContent::new(format!(
-                    "Reading module_{turn} to find the torn-update window before touching any call site."
-                ))),
-                format!("seed-thought-{turn}"),
-            ))));
-            self.acp_event(text_chunk_with_id(&format!("seed-response-{turn}"), SEED_PROSE));
-            self.acp_event(text_chunk_with_id(&format!("seed-response-{turn}"), SEED_CODE_BLOCK));
-            let bash = format!("seed-bash-{turn}");
-            self.acp_event(seed_bash_tool(&bash));
-            self.acp_event(tool_completed(&bash));
-            let edit = format!("seed-edit-{turn}");
-            self.acp_event(seed_edit_tool(&edit, turn));
-            self.acp_event(seed_tool_diff(&edit, turn));
-            if turn % 8 == 0 {
-                self.seed_sub_agent_tree(turn);
-            }
-            self.acp_event(text_chunk_with_id(&format!("seed-closing-{turn}"), SEED_CLOSING));
-            self.complete_prompt(acp::StopReason::EndTurn);
-            self.draw();
-        }
-    }
-
-    /// One spawn tool whose sub-agents run and finish, leaving a sealed tree.
-    fn seed_sub_agent_tree(&mut self, turn: usize) {
-        let parent = format!("seed-spawn-{turn}");
-        self.acp_event(seed_spawn_tool(&parent));
-        self.acp_event(tool_completed(&parent));
-        for agent in ["explorer", "fixer"] {
-            let task = format!("{parent}-{agent}");
-            self.acp_event(seed_sub_agent(
-                &parent,
-                &task,
-                agent,
-                SubAgentEvent::ToolCall {
-                    request: SubAgentToolRequest {
-                        id: format!("{task}-grep"),
-                        name: "grep".to_string(),
-                        arguments: r#"{"pattern":"torn update"}"#.to_string(),
-                    },
-                },
-            ));
-            self.acp_event(seed_sub_agent(
-                &parent,
-                &task,
-                agent,
-                SubAgentEvent::ToolResult {
-                    result: SubAgentToolResult {
-                        id: format!("{task}-grep"),
-                        name: "grep".to_string(),
-                        result_meta: None,
-                    },
-                },
-            ));
-            self.acp_event(seed_sub_agent(&parent, &task, agent, SubAgentEvent::Done));
-        }
-    }
-
-    /// Streams one assistant message of `total_bytes` in `chunk_bytes` chunks,
-    /// drawing after every chunk the way the event loop draws after every
-    /// wakeup. The message stays one open item while it streams.
-    pub fn stream_message(&mut self, content: StreamContent, total_bytes: usize, chunk_bytes: usize) {
-        let thought = matches!(content, StreamContent::Thought);
-        let message = match content {
-            StreamContent::Prose => prose_message(total_bytes),
-            StreamContent::CodeBlock => code_block_message(total_bytes),
-            StreamContent::Thought => thought_message(total_bytes),
-        };
-        for chunk in chunk_message(&message, chunk_bytes.max(1)) {
-            if thought {
-                self.acp_event(thought_chunk(&chunk));
-            } else {
-                self.acp_event(text_chunk(&chunk));
-            }
-            self.draw();
-        }
+    pub fn bells(&self) -> usize {
+        self.world.runtimes.host.bells
     }
 
     /// Finishes the in-flight turn and advances synthetic time past every
@@ -1052,68 +385,114 @@ where
         self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
+    pub fn turn(&mut self, prompt: &str, reply: &str) {
+        self.submit(prompt);
+        self.acp_event(text_chunk(reply));
+        self.complete_prompt(acp::StopReason::EndTurn);
+    }
+
     pub fn paste(&mut self, text: &str) {
         self.deliver(Message::Terminal(Event::Paste(text.to_string())));
     }
 
     pub fn acp_event(&mut self, event: AcpEvent) {
-        self.deliver(Message::Agent(Box::new(event)));
+        self.deliver(Message::Session(Box::new(Input::Event(event))));
+    }
+
+    pub fn run_command(&mut self, command: &str) {
+        self.type_text(command);
+        self.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+
+    pub fn open_session_picker(&mut self, sessions: Vec<acp::SessionInfo>) {
+        self.run_command("/resume");
+        self.answer::<acp::ListSessionsRequest>(Ok(acp::ListSessionsResponse::new(sessions)));
     }
 
     pub fn begin_resume(&mut self, session_id: &str, cwd: &str) {
-        self.deliver_result(CommandResult::SessionsListed(Ok(acp::ListSessionsResponse::new(vec![
-            acp::SessionInfo::new(session_id.to_string(), cwd),
-        ]))));
+        self.open_session_picker(vec![acp::SessionInfo::new(session_id.to_string(), cwd)]);
         self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    }
-
-    pub fn complete_prompt(&mut self, stop_reason: acp::StopReason) {
-        self.deliver_result(CommandResult::Prompt(Ok(acp::PromptResponse::new())));
-        let session_id = self.app.session_id().clone();
-        let update = acp::SessionUpdate::StateUpdate(acp::StateUpdate::Idle(
-            acp::IdleStateUpdate::new().stop_reason(stop_reason),
-        ));
-        self.acp_event(acp::UpdateSessionNotification::new(session_id, update).into());
     }
 
     pub fn tick(&mut self, now: Instant) {
         self.deliver(Message::Tick(now));
     }
+}
 
-    /// Completes the commands configured on the fake executor without touching
-    /// the real filesystem, Git repository, terminal, or ACP connection.
-    pub fn settle_tasks(&mut self) {
-        self.executor.clear_available();
-        let mut initial_batch = true;
-        loop {
-            let pending = self.executor.take_pending();
-            if pending.is_empty() {
-                if let Some(state) = self.executor.next_git_review_state() {
-                    self.deliver_result(CommandResult::GitReview(state));
+pub struct ElicitationReply(oneshot::Receiver<Result<CreateElicitationResponse, Error>>);
+
+struct World {
+    tokio: tokio::runtime::Runtime,
+    local: LocalSet,
+    runtimes: Runtimes<FakeTuiHost>,
+    agent: FakeAgentRequests,
+    connection: JoinHandle<Result<(), Error>>,
+    _workspace: TempDir,
+    root: PathBuf,
+}
+
+impl World {
+    fn dispatch(&mut self, commands: Vec<Command>) {
+        let _runtime = self.tokio.enter();
+        self.runtimes.dispatch(commands);
+    }
+
+    fn settle(&mut self, app: &mut App) {
+        let Self { tokio, local, runtimes, .. } = self;
+        tokio.block_on(local.run_until(async {
+            let mut quiet_turns = 0;
+            while quiet_turns < QUIET_TURNS
+                || matches!(app.core().foreground(), ForegroundOperation::PreparingPrompt(_))
+            {
+                let message = match runtimes.host.results.pop_front() {
+                    Some(result) => Some(Message::Host(Box::new(result))),
+                    None => runtimes.session.next().now_or_never().map(|input| Message::Session(Box::new(input))),
+                };
+                let Some(message) = message else {
+                    quiet_turns += 1;
+                    tokio::task::yield_now().await;
                     continue;
-                }
-                if let Some(result) = self.executor.git_completion.take() {
-                    self.deliver_result(CommandResult::GitReviewAction(result));
-                    continue;
-                }
-                return;
+                };
+                quiet_turns = 0;
+                runtimes.deliver(app, message);
             }
-            if initial_batch {
-                for command in &pending {
-                    if matches!(command, Command::Agent(_)) {
-                        self.executor.available.push_back(command.clone());
-                    }
-                }
+        }));
+    }
+}
+
+#[derive(Default)]
+struct FakeTuiHost {
+    themes: Vec<String>,
+    review_themes: Vec<ThemeChoice>,
+    results: VecDeque<HostCommandResult>,
+    applying: VecDeque<Box<UiSettings>>,
+    opened_urls: Vec<String>,
+    bells: usize,
+}
+
+impl Host for FakeTuiHost {
+    fn execute(&mut self, command: HostCommand) {
+        match command {
+            HostCommand::ListThemes => self.results.push_back(HostCommandResult::ThemesListed(self.themes.clone())),
+            HostCommand::ListReviewThemes => {
+                let mut choices = builtin_review_theme_choices();
+                choices.extend(self.review_themes.iter().cloned());
+                self.results.push_back(HostCommandResult::ReviewThemesListed(choices));
             }
-            for command in pending {
-                if let Some(result) = self.executor.complete(command) {
-                    self.deliver(Message::CommandFinished(Box::new(result)));
-                }
+            HostCommand::ApplyTheme { settings } => self.applying.push_back(settings),
+            HostCommand::RingBell => self.bells += 1,
+            HostCommand::OpenUrl { elicitation, url } => {
+                self.opened_urls.push(url);
+                self.results.push_back(HostCommandResult::UrlOpened { elicitation, result: Ok(()) });
             }
-            initial_batch = false;
+            HostCommand::CopyUrl { elicitation, .. } => {
+                self.results.push_back(HostCommandResult::UrlCopied { elicitation, result: Ok(()) });
+            }
         }
     }
 }
+
+const QUIET_TURNS: usize = 64;
 
 impl TestUi<TestBackend> {
     /// The default scenario: 40x15 terminal, plain app, recording prompt handle.
@@ -1138,46 +517,9 @@ impl Default for TestUi<TestBackend> {
     }
 }
 
-/// A backend whose screen and scrollback buffers can be read back, so a
-/// [`TestUi`] built on it can expose viewport/history/conversation text.
-pub trait BuffersReader {
-    fn screen(&self) -> &Buffer;
-    fn scrollback(&self) -> &Buffer;
-}
-
-impl BuffersReader for TestBackend {
-    fn screen(&self) -> &Buffer {
-        self.buffer()
-    }
-
-    fn scrollback(&self) -> &Buffer {
-        self.scrollback()
-    }
-}
-
-impl BuffersReader for CountingBackend {
-    fn screen(&self) -> &Buffer {
-        self.buffer()
-    }
-
-    fn scrollback(&self) -> &Buffer {
-        self.scrollback()
-    }
-}
-
-impl BuffersReader for RecordingBackend {
-    fn screen(&self) -> &Buffer {
-        self.buffer()
-    }
-
-    fn scrollback(&self) -> &Buffer {
-        self.scrollback()
-    }
-}
-
 impl<B> TestUi<B>
 where
-    B: Backend + BuffersReader,
+    B: Backend + Borrow<TestBackend>,
     B::Error: std::fmt::Debug,
 {
     /// What the inline viewport currently shows: the composer, status line,
@@ -1219,68 +561,47 @@ where
         row_containing(&self.viewport(), needle)
     }
 
+    pub fn click_text(&mut self, needle: &str) {
+        let viewport = self.viewport();
+        let rows: Vec<u16> = (viewport.area.top()..viewport.area.bottom())
+            .filter(|&row| row_text(&viewport, row).contains(needle))
+            .collect();
+        let [row] = rows[..] else {
+            panic!("expected one row showing {needle:?}, found rows {rows:?}:\n{}", buffer_text(&viewport));
+        };
+        let text = row_text(&viewport, row);
+        let column = u16::try_from(text[..text.find(needle).expect("the row shows needle")].width()).unwrap();
+        let kind = MouseEventKind::Down(MouseButton::Left);
+        self.terminal_event(Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+    }
+
     pub fn assert_viewport_contains(&mut self, needle: &str) {
-        let viewport = self.viewport_text();
-        assert!(
-            viewport.contains(needle),
-            "viewport should contain {needle:?}:
-{viewport}"
-        );
+        assert_text_contains("viewport", &self.viewport_text(), needle, true);
     }
 
     pub fn assert_viewport_not_contains(&mut self, needle: &str) {
-        let viewport = self.viewport_text();
-        assert!(
-            !viewport.contains(needle),
-            "viewport should not contain {needle:?}:
-{viewport}"
-        );
+        assert_text_contains("viewport", &self.viewport_text(), needle, false);
     }
 
     pub fn assert_history_contains(&mut self, needle: &str) {
-        let history = self.history_text();
-        assert!(
-            history.contains(needle),
-            "history should contain {needle:?}:
-{history}"
-        );
+        assert_text_contains("history", &self.history_text(), needle, true);
     }
 
     pub fn assert_history_not_contains(&mut self, needle: &str) {
-        let history = self.history_text();
-        assert!(
-            !history.contains(needle),
-            "history should not contain {needle:?}:
-{history}"
-        );
+        assert_text_contains("history", &self.history_text(), needle, false);
     }
 
     pub fn assert_conversation_contains(&mut self, needle: &str) {
-        let conversation = self.conversation_text();
-        assert!(
-            conversation.contains(needle),
-            "conversation should contain {needle:?}:
-{conversation}"
-        );
+        assert_text_contains("conversation", &self.conversation_text(), needle, true);
     }
 
     pub fn assert_conversation_not_contains(&mut self, needle: &str) {
-        let conversation = self.conversation_text();
-        assert!(
-            !conversation.contains(needle),
-            "conversation should not contain {needle:?}:
-{conversation}"
-        );
+        assert_text_contains("conversation", &self.conversation_text(), needle, false);
     }
 
     /// Asserts the viewport's visible text matches `expected` row-by-row.
     pub fn assert_viewport<S: AsRef<str>>(&mut self, expected: &[S]) {
         assert_buffer_eq(&self.viewport(), expected);
-    }
-
-    /// Asserts the committed history's visible text matches `expected` row-by-row.
-    pub fn assert_history<S: AsRef<str>>(&mut self, expected: &[S]) {
-        assert_buffer_eq(&self.history(), expected);
     }
 
     /// Asserts the stitched conversation's visible text matches `expected` row-by-row.
@@ -1289,22 +610,16 @@ where
     }
 }
 
-/// Builds a [`TestUi`]: the terminal dimensions plus every app-scenario option
-/// a test cares about. Defaults match a plain `make_app()`-style scenario.
 pub struct TestUiBuilder {
     width: u16,
     height: u16,
-    working_dir: Option<PathBuf>,
-    workspace_access: crate::session::WorkspaceAccess,
-    capabilities: AetherCapabilities,
-    prompt_capabilities: acp::PromptCapabilities,
-    config_options: Vec<acp::SessionConfigOption>,
-    auth_methods: Vec<acp::AuthMethod>,
-    session_capabilities: Option<acp::SessionCapabilities>,
+    session: SessionCoreConfigBuilder,
+    agent: Vec<Box<dyn FnOnce(FakeAgent) -> FakeAgent>>,
     settings: UiSettings,
-    workspace_status: Option<WorkspaceStatus>,
+    themes: Vec<String>,
+    review_themes: Vec<ThemeChoice>,
     git: FakeGit,
-    opened_urls: Arc<Mutex<Vec<String>>>,
+    files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Default for TestUiBuilder {
@@ -1312,17 +627,13 @@ impl Default for TestUiBuilder {
         Self {
             width: 40,
             height: 15,
-            working_dir: None,
-            workspace_access: crate::session::WorkspaceAccess::Local,
-            capabilities: AetherCapabilities::default(),
-            prompt_capabilities: acp::PromptCapabilities::new(),
-            config_options: Vec::new(),
-            auth_methods: Vec::new(),
-            session_capabilities: None,
+            session: SessionCoreConfigBuilder::new(),
+            agent: Vec::new(),
             settings: UiSettings::default(),
-            workspace_status: None,
+            themes: Vec::new(),
+            review_themes: Vec::new(),
             git: FakeGit::default(),
-            opened_urls: Arc::new(Mutex::new(Vec::new())),
+            files: Vec::new(),
         }
     }
 }
@@ -1338,28 +649,13 @@ impl TestUiBuilder {
         self
     }
 
-    pub fn remote_workspace(mut self) -> Self {
-        self.workspace_access = crate::session::WorkspaceAccess::Remote;
+    pub fn session(mut self, describe: impl FnOnce(SessionCoreConfigBuilder) -> SessionCoreConfigBuilder) -> Self {
+        self.session = describe(self.session);
         self
     }
 
-    pub fn working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
-        self.working_dir = Some(working_dir.into());
-        self
-    }
-
-    pub fn prompt_capabilities(mut self, capabilities: acp::PromptCapabilities) -> Self {
-        self.prompt_capabilities = capabilities;
-        self
-    }
-
-    pub fn config_options(mut self, options: Vec<acp::SessionConfigOption>) -> Self {
-        self.config_options = options;
-        self
-    }
-
-    pub fn auth_methods(mut self, methods: Vec<acp::AuthMethod>) -> Self {
-        self.auth_methods = methods;
+    pub fn agent(mut self, script: impl FnOnce(FakeAgent) -> FakeAgent + 'static) -> Self {
+        self.agent.push(Box::new(script));
         self
     }
 
@@ -1368,8 +664,13 @@ impl TestUiBuilder {
         self
     }
 
-    pub fn workspace_status(mut self, workspace_status: WorkspaceStatus) -> Self {
-        self.workspace_status = Some(workspace_status);
+    pub fn themes(mut self, themes: &[&str]) -> Self {
+        self.themes = themes.iter().map(|theme| (*theme).to_owned()).collect();
+        self
+    }
+
+    pub fn review_themes(mut self, themes: Vec<ThemeChoice>) -> Self {
+        self.review_themes = themes;
         self
     }
 
@@ -1378,174 +679,88 @@ impl TestUiBuilder {
         self
     }
 
-    /// Overrides the capabilities wholesale, for tests that care about metadata
-    /// the individual toggles do not cover.
-    pub fn session_capabilities(mut self, capabilities: acp::SessionCapabilities) -> Self {
-        self.session_capabilities = Some(capabilities);
-        self
-    }
-
-    pub fn prompt_search(mut self) -> Self {
-        self.capabilities.prompt_search = true;
-        self
-    }
-
-    pub fn session_preview(mut self) -> Self {
-        self.capabilities.session_preview = true;
-        self
-    }
-
-    pub fn workspace_move(mut self) -> Self {
-        self.capabilities.workspace_move = true;
+    pub fn file(mut self, path: impl Into<PathBuf>, contents: impl AsRef<[u8]>) -> Self {
+        self.files.push((path.into(), contents.as_ref().to_vec()));
         self
     }
 
     /// Builds the whole UI scenario.
     pub fn build(self) -> TestUi {
-        self.finish()
+        let backend = TestBackend::new(self.width, self.height);
+        self.finish(backend)
     }
 
-    pub fn build_from_session(self, session: crate::session::Session) -> (TestUi, UnboundedReceiver<AcpEvent>) {
-        let (app, events, _) = App::from_session(session, self.settings.clone());
-        let mut ui = self.finish_with_app(app);
-        ui.executor.record(ui.app.take_commands());
-        (ui, events)
-    }
+    fn finish<B: Backend>(self, backend: B) -> TestUi<B>
+    where
+        B::Error: std::fmt::Debug,
+    {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("the test runtime starts");
+        let local = LocalSet::new();
+        let workspace = TempDir::new().expect("the workspace is created");
+        let root = workspace.path().canonicalize().expect("the workspace has a path");
+        for (path, contents) in &self.files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("the directory is created");
+            std::fs::write(path, contents).expect("the file is written");
+        }
+        let mut session = self.session.git_diff();
+        if !self.files.is_empty() {
+            session = session.working_dir(&root);
+        }
+        let (agent, requests) = self
+            .agent
+            .into_iter()
+            .fold(session.agent(), |agent, script| script(agent))
+            .hold::<acp::ListSessionsRequest>()
+            .hold::<acp::ResumeSessionRequest>()
+            .hold::<acp::NewSessionRequest>()
+            .hold::<acp::LoginAuthRequest>()
+            .hold::<SessionPreviewParams>()
+            .hold::<PromptSearchParams>()
+            .hold::<WorkspaceListParams>()
+            .hold::<WorkspaceMoveParams>()
+            .capture();
+        let git = if self.files.is_empty() { self.git } else { FakeGit::new(&root) };
+        let git =
+            self.files.iter().fold(git, |git, (path, contents)| git.with_untracked(path.to_string_lossy(), contents));
+        let server = git_diff_agent(agent, git);
+        let (connection, client) = tokio.block_on(local.run_until(async {
+            let (agent_end, client_end) = Channel::duplex();
+            let connection = tokio::task::spawn_local(server.connect_to(agent_end));
+            let client = connect_acp_client(client_end, initialize_request()).await.expect("the agent connects");
+            (connection, client)
+        }));
 
-    fn finish(self) -> TestUi {
-        let app = App::new(self.app_config());
-        self.finish_with_app(app)
-    }
-
-    fn finish_with_app(self, app: App) -> TestUi {
-        TestUi {
-            app,
+        let config = AppConfig { session: session.build(), settings: self.settings };
+        let host = FakeTuiHost { themes: self.themes, review_themes: self.review_themes, ..FakeTuiHost::default() };
+        let mut ui = TestUi {
+            app: App::new(config),
             renderer: Renderer::new(),
-            terminal: test_terminal(TestBackend::new(self.width, self.height)),
-            executor: FakeExecutor::with_git(self.git),
-            opened_urls: self.opened_urls,
-        }
-    }
-
-    fn app_config(&self) -> AppConfig {
-        let session_capabilities = self
-            .session_capabilities
-            .clone()
-            .unwrap_or_else(|| acp::SessionCapabilities::new().meta(Some(self.capabilities.clone().to_meta())));
-        AppConfig {
-            initialize_response: acp::InitializeResponse::new(
-                agent_client_protocol::schema::ProtocolVersion::V2,
-                acp::Implementation::new("aether", "test"),
-            )
-            .capabilities(
-                acp::AgentCapabilities::new().session(session_capabilities.prompt(self.prompt_capabilities.clone())),
-            )
-            .auth_methods(self.auth_methods.clone()),
-            session_response: acp::NewSessionResponse::new("test-session").config_options(self.config_options.clone()),
-            workspace_status: self
-                .workspace_status
-                .clone()
-                .unwrap_or_else(|| WorkspaceStatus::new("~/code/demo", Some("main".to_string()))),
-            working_dir: self.working_dir.clone().unwrap_or_else(|| PathBuf::from(".")),
-            workspace_access: self.workspace_access,
-            settings: self.settings.clone(),
-            browser_opener: {
-                let opened = self.opened_urls.clone();
-                Arc::new(move |url: &str| {
-                    opened.lock().unwrap().push(url.to_string());
-                    Ok(())
-                }) as BrowserOpener
+            terminal: test_terminal(backend),
+            world: World {
+                tokio,
+                local,
+                runtimes: Runtimes { session: SessionRuntime::new(client.handle, client.event_rx), host },
+                agent: requests,
+                connection,
+                _workspace: workspace,
+                root,
             },
-            clipboard_writer: Arc::new(|_| Ok(())),
-        }
+        };
+        let commands = ui.app.take_commands();
+        ui.world.dispatch(commands);
+        ui.settle_tasks();
+        ui
     }
-}
-
-/// The terminal a scenario draws into: the inline viewport sized from the
-/// backend, exactly as the real event loop enters it.
-fn test_terminal<B: Backend>(backend: B) -> Terminal<B>
-where
-    B::Error: std::fmt::Debug,
-{
-    let height = backend.size().unwrap().height;
-    Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(inline_viewport_height(height)) })
-        .unwrap()
-}
-
-/// What the inline viewport shows: `terminal.get_frame().area()` clipped out of
-/// the backend's full screen buffer.
-fn viewport_buffer<B>(terminal: &mut Terminal<B>) -> Buffer
-where
-    B: Backend + BuffersReader,
-{
-    let area = terminal.get_frame().area();
-    let screen = terminal.backend().screen();
-    let mut viewport = Buffer::empty(Rect::new(0, 0, area.width, area.height));
-    for y in 0..area.height {
-        for x in 0..area.width {
-            viewport[(x, y)] = screen[(area.x + x, area.y + y)].clone();
-        }
-    }
-    viewport
-}
-
-/// Content Ratatui's `insert_before` committed above the inline viewport.
-fn history_buffer<B>(terminal: &mut Terminal<B>) -> Buffer
-where
-    B: Backend + BuffersReader,
-{
-    let viewport_area = terminal.get_frame().area();
-    let screen = terminal.backend().screen();
-    let scrollback = terminal.backend().scrollback();
-    let history_height = scrollback.area.height.saturating_add(viewport_area.top());
-    let mut history = Buffer::empty(Rect::new(0, 0, screen.area.width, history_height));
-    for y in 0..scrollback.area.height {
-        for x in 0..scrollback.area.width {
-            history[(x, y)] = scrollback[(x, y)].clone();
-        }
-    }
-    for y in 0..viewport_area.top() {
-        for x in 0..screen.area.width {
-            history[(x, scrollback.area.height + y)] = screen[(x, y)].clone();
-        }
-    }
-    history
-}
-
-fn conversation_buffer<B>(terminal: &mut Terminal<B>) -> Buffer
-where
-    B: Backend + BuffersReader,
-{
-    let history = history_buffer(terminal);
-    let viewport = viewport_buffer(terminal);
-    let mut conversation =
-        Buffer::empty(Rect::new(0, 0, viewport.area.width, history.area.height.saturating_add(viewport.area.height)));
-    for y in 0..history.area.height {
-        for x in 0..history.area.width {
-            conversation[(x, y)] = history[(x, y)].clone();
-        }
-    }
-    for y in 0..viewport.area.height {
-        for x in 0..viewport.area.width {
-            conversation[(x, history.area.height + y)] = viewport[(x, y)].clone();
-        }
-    }
-    conversation
 }
 
 /// Whether any cell drawn with `symbol` satisfies `predicate`.
 pub fn has_cell(buffer: &Buffer, symbol: &str, predicate: impl Fn(&Cell) -> bool) -> bool {
-    for y in buffer.area.top()..buffer.area.bottom() {
-        for x in buffer.area.left()..buffer.area.right() {
-            if let Some(cell) = buffer.cell((x, y))
-                && cell.symbol() == symbol
-                && predicate(cell)
-            {
-                return true;
-            }
-        }
-    }
-    false
+    buffer.content().iter().any(|cell| cell.symbol() == symbol && predicate(cell))
 }
 
 pub fn line_text(line: &ratatui::text::Line<'_>) -> String {
@@ -1555,20 +770,16 @@ pub fn line_text(line: &ratatui::text::Line<'_>) -> String {
 /// How many rows contain at least one cell with `background`.
 pub fn rows_with_background(buffer: &Buffer, background: ratatui::style::Color) -> usize {
     (buffer.area.top()..buffer.area.bottom())
-        .filter(|&y| {
-            (buffer.area.left()..buffer.area.right())
-                .any(|x| buffer.cell((x, y)).is_some_and(|cell| cell.bg == background))
-        })
+        .filter(|&y| row_cells(buffer, y).iter().any(|cell| cell.bg == background))
         .count()
 }
 
+pub fn row_cells(buffer: &Buffer, y: u16) -> Vec<&Cell> {
+    (buffer.area.left()..buffer.area.right()).filter_map(|x| buffer.cell((x, y))).collect()
+}
+
 pub fn row_containing(buffer: &Buffer, needle: &str) -> Option<u16> {
-    (buffer.area.top()..buffer.area.bottom()).find(|&y| {
-        let row = (buffer.area.left()..buffer.area.right())
-            .map(|x| buffer.cell((x, y)).map_or(" ", Cell::symbol))
-            .collect::<String>();
-        row.contains(needle)
-    })
+    (buffer.area.top()..buffer.area.bottom()).find(|&y| row_text(buffer, y).contains(needle))
 }
 
 pub fn buffer_text(buffer: &Buffer) -> String {
@@ -1604,75 +815,12 @@ pub fn row_text(buffer: &Buffer, y: u16) -> String {
     (buffer.area.left()..buffer.area.right()).map(|x| buffer.cell((x, y)).map_or(" ", Cell::symbol)).collect()
 }
 
-/// The shape of message [`TestUi::stream_message`] streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamContent {
-    /// Flowing paragraphs, so finalization sealing runs as blank lines land and
-    /// the open item stays small.
-    Prose,
-    /// One fenced Rust code block. No blank line outside the fence can finalize
-    /// it while it streams, so the open item grows to the whole message — the
-    /// shape that keeps re-rendering everything received so far.
-    CodeBlock,
-    /// A thinking stream: line-per-sentence thought chunks, which drive the
-    /// progress band's activity rather than appending to the conversation.
-    Thought,
-}
-
-const SEED_PROSE: &str = "\
-Examining the request. The module guards its invariants behind a shared handle,
-so the fix has to land on the writer side rather than at each call site. I will
-rework the boundary so retries cannot observe a torn update, then cover the
-regression with a test that fails on the current code.
-
-";
-
-const SEED_CODE_BLOCK: &str = "\
-```rust
-fn reconcile(state: &mut State, incoming: Vec<Delta>) -> Outcome {
-    let mut applied = Vec::with_capacity(incoming.len());
-    for delta in incoming {
-        if !state.accepts(&delta) {
-            continue;
-        }
-        state.apply(&delta);
-        applied.push(delta);
-    }
-    state.commit(applied)
-}
-```
-
-";
-
-const SEED_CLOSING: &str = "\
-Done — the writer now retries atomically and the regression test covers the
-torn window.
-
-";
-
-const SEED_DIFF_BEFORE: &str = "\
-fn reconcile(state: &mut State, incoming: Vec<Delta>) -> Outcome {
-    let mut applied = Vec::new();
-    for delta in incoming {
-        state.apply(&delta);
-    }
-    state.commit(Vec::new())
-}
-";
-
-const SEED_DIFF_AFTER: &str = "\
-fn reconcile(state: &mut State, incoming: Vec<Delta>) -> Outcome {
-    let mut applied = Vec::with_capacity(incoming.len());
-    for delta in incoming {
-        state.apply(&delta);
-        applied.push(delta);
-    }
-    state.commit(applied)
-}
-";
-
 pub fn session_update(update: acp::SessionUpdate) -> AcpEvent {
-    acp::UpdateSessionNotification::new(SessionId::new("test-session"), update).into()
+    on_session("test-session", update)
+}
+
+pub fn context_cleared() -> AcpEvent {
+    AcpEvent::ContextCleared(ContextClearedParams { session_id: SessionId::new("test-session") })
 }
 
 pub fn compaction_update(id: &str, status: acp::CompactionStatus) -> AcpEvent {
@@ -1684,36 +832,15 @@ pub fn text_chunk(text: &str) -> AcpEvent {
 }
 
 pub fn text_chunk_with_id(message_id: &str, text: &str) -> AcpEvent {
-    session_update(acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-        acp::ContentBlock::Text(acp::TextContent::new(text)),
-        message_id.to_string(),
-    )))
+    session_update(message_chunk(message_id, text))
 }
 
 pub fn thought_chunk(text: &str) -> AcpEvent {
-    session_update(acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
-        acp::ContentBlock::Text(acp::TextContent::new(text)),
-        "thought",
-    )))
+    thought_chunk_with_id("thought", text)
 }
 
-fn seed_bash_tool(id: &str) -> AcpEvent {
-    let mut tool_call = ToolCallUpdate::new(id.to_string()).title(format!("Run {id}"));
-    tool_call.name = MaybeUndefined::Value("bash".into());
-    tool_call.raw_input = MaybeUndefined::Value(json!({ "command": "cargo test --module writer" }));
-    session_update(SessionUpdate::ToolCallUpdate(tool_call))
-}
-
-fn seed_edit_tool(id: &str, turn: usize) -> AcpEvent {
-    session_update(SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(id.to_string()).title(format!("Editing src/module_{turn}.rs")),
-    ))
-}
-
-fn seed_spawn_tool(id: &str) -> AcpEvent {
-    let mut tool_call = ToolCallUpdate::new(id.to_string()).title(format!("Spawning sub-agents ({id})"));
-    tool_call.name = MaybeUndefined::Value("spawn_subagent".into());
-    session_update(SessionUpdate::ToolCallUpdate(tool_call))
+pub fn thought_chunk_with_id(message_id: &str, text: &str) -> AcpEvent {
+    session_update(acp_utils::testing::thought_chunk(message_id, text))
 }
 
 pub fn text_diff(path: &str, old: &str, new: &str) -> acp::Diff {
@@ -1722,119 +849,84 @@ pub fn text_diff(path: &str, old: &str, new: &str) -> acp::Diff {
         .with_patch(diff_text.map(acp::DiffPatch::new))
 }
 
+pub fn sub_agent_started(parent: &str, session: &str, agent: &str) -> AcpEvent {
+    announced("test-session", parent, acp::SubagentUpdate::new(session).title(agent).state(running_state())).into()
+}
+
+pub fn sub_agent_finished(parent: &str, session: &str, agent: &str, stop_reason: acp::StopReason) -> AcpEvent {
+    announced("test-session", parent, acp::SubagentUpdate::new(session).title(agent).state(idle_state(stop_reason)))
+        .into()
+}
+
 pub fn tool_completed(id: &str) -> AcpEvent {
-    session_update(acp::SessionUpdate::ToolCallUpdate(
-        acp::ToolCallUpdate::new(id.to_string()).status(acp::ToolCallStatus::Completed),
-    ))
+    tool_status(id, acp::ToolCallStatus::Completed)
 }
 
-fn seed_tool_diff(id: &str, turn: usize) -> AcpEvent {
-    let diff = text_diff(&format!("/src/module_{turn}.rs"), SEED_DIFF_BEFORE, SEED_DIFF_AFTER);
-    session_update(acp::SessionUpdate::ToolCallUpdate(
-        acp::ToolCallUpdate::new(id.to_string())
-            .content(vec![acp::ToolCallContent::Diff(diff)])
-            .status(acp::ToolCallStatus::Completed),
-    ))
+pub fn tool_status(id: &str, status: acp::ToolCallStatus) -> AcpEvent {
+    session_update(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id.to_string()).status(status)))
 }
 
-fn seed_sub_agent(parent: &str, task: &str, agent: &str, event: SubAgentEvent) -> AcpEvent {
-    AcpEvent::SubAgentProgress(SubAgentProgressParams {
-        parent_tool_id: parent.to_string(),
-        task_id: task.to_string(),
-        agent_name: agent.to_string(),
-        event,
-    })
+pub fn numbered_lines(prefix: &str, count: usize) -> String {
+    let mut lines = String::new();
+    for index in 0..count {
+        let _ = write!(lines, "{prefix}-{index}\n\n");
+    }
+    lines
 }
 
-fn prose_message(total_bytes: usize) -> String {
-    let mut message = String::new();
-    let mut sentence = 0;
-    while message.len() < total_bytes {
-        for _ in 0..4 {
-            let _ =
-                write!(message, "Sentence {sentence} carries ordinary words so wrapping and parsing do real work. ");
-            sentence += 1;
-        }
-        message.push_str("\n\n");
-    }
-    message
+pub fn render_surface<R>(mut buffer: Buffer, render: impl FnOnce(&mut Buffer, &mut DrawContext<'_>) -> R) -> Buffer {
+    let theme = Theme::default();
+    let mut cx = DrawContext { theme: &theme, theme_generation: Generation::default() };
+    render(&mut buffer, &mut cx);
+    buffer
 }
 
-fn code_block_message(total_bytes: usize) -> String {
-    let mut message = String::from("```rust\n");
-    let mut line = 0;
-    while message.len() < total_bytes {
-        let _ = writeln!(message, "let value_{line} = state.reconcile(incoming[{line}]).expect(\"delta accepted\");");
-        line += 1;
-    }
-    message.push_str("```\n");
-    message
+fn assert_text_contains(surface: &str, text: &str, needle: &str, expected: bool) {
+    let should = if expected { "should" } else { "should not" };
+    assert!(text.contains(needle) == expected, "{surface} {should} contain {needle:?}:\n{text}");
 }
 
-fn thought_message(total_bytes: usize) -> String {
-    let mut message = String::new();
-    let mut step = 0;
-    while message.len() < total_bytes {
-        let _ = writeln!(message, "Considering step {step} of the plan before acting on it.");
-        step += 1;
-    }
-    message
+/// The terminal a scenario draws into: the inline viewport sized from the
+/// backend, exactly as the real event loop enters it.
+fn test_terminal<B: Backend>(backend: B) -> Terminal<B>
+where
+    B::Error: std::fmt::Debug,
+{
+    let height = backend.size().unwrap().height;
+    Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(inline_viewport_height(height)) })
+        .unwrap()
 }
 
-pub fn chunk_message(message: &str, chunk_bytes: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut rest = message;
-    while !rest.is_empty() {
-        let mut end = rest.len().min(chunk_bytes);
-        while !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        chunks.push(rest[..end].to_string());
-        rest = &rest[end..];
-    }
-    chunks
+/// What the inline viewport shows: `terminal.get_frame().area()` clipped out of
+/// the backend's full screen buffer.
+fn viewport_buffer<B: Backend + Borrow<TestBackend>>(terminal: &mut Terminal<B>) -> Buffer {
+    let area = terminal.get_frame().area();
+    let backend: &TestBackend = terminal.backend().borrow();
+    crop(backend.buffer(), area, 0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::TerminalCommand;
-    use crate::git_review::{FileStatus, StageState};
+/// Content Ratatui's `insert_before` committed above the inline viewport.
+fn history_buffer<B: Backend + Borrow<TestBackend>>(terminal: &mut Terminal<B>) -> Buffer {
+    let viewport_top = terminal.get_frame().area().top();
+    let backend: &TestBackend = terminal.backend().borrow();
+    let mut history = backend.scrollback().clone();
+    let above_viewport = Rect { height: viewport_top, ..backend.buffer().area };
+    history.merge(&crop(backend.buffer(), above_viewport, history.area.height));
+    history
+}
 
-    #[test]
-    fn fake_executor_preserves_command_order() {
-        let mut executor = FakeExecutor::new();
-        executor
-            .record([Command::Filesystem(FilesystemCommand::ListThemes), Command::Terminal(TerminalCommand::RingBell)]);
+fn conversation_buffer<B: Backend + Borrow<TestBackend>>(terminal: &mut Terminal<B>) -> Buffer {
+    let mut conversation = history_buffer(terminal);
+    let viewport = terminal.get_frame().area();
+    let backend: &TestBackend = terminal.backend().borrow();
+    conversation.merge(&crop(backend.buffer(), viewport, conversation.area.height));
+    conversation
+}
 
-        assert!(matches!(executor.take_commands()[..], [Command::Filesystem(_), Command::Terminal(_)]));
+fn crop(buffer: &Buffer, area: Rect, y: u16) -> Buffer {
+    let mut cropped = Buffer::empty(Rect { x: 0, y, ..area });
+    for position in area.positions() {
+        cropped[(position.x - area.x, position.y - area.y + y)] = buffer[position].clone();
     }
-
-    #[test]
-    fn fake_filesystem_persists_files_and_settings_in_memory() {
-        let mut filesystem = FakeFilesystem::new();
-        let path = PathBuf::from("workspace/src/main.rs");
-        filesystem.write_file(&path, "fn main() {}");
-        filesystem.save_settings(UiSettings::default());
-
-        assert_eq!(filesystem.read_to_string(&path).as_deref(), Some("fn main() {}"));
-        assert!(filesystem.contains(Path::new("workspace/src")));
-        assert!(filesystem.settings().is_some());
-    }
-
-    #[test]
-    fn fake_git_models_staging_and_discarding_state() {
-        let mut git = FakeGit::new("workspace");
-        git.add_file("src/main.rs", "initial\n");
-        assert_eq!(git.status("src/main.rs"), Some((FileStatus::Untracked, StageState::Unstaged)));
-
-        git.stage("src/main.rs");
-        assert_eq!(git.status("src/main.rs"), Some((FileStatus::Untracked, StageState::Staged)));
-        git.commit("initial").unwrap();
-
-        git.write_file("src/main.rs", "changed\n");
-        assert_eq!(git.status("src/main.rs"), Some((FileStatus::Modified, StageState::Unstaged)));
-        git.discard("src/main.rs");
-        assert_eq!(git.file("src/main.rs").and_then(|file| file.contents), Some(b"initial\n".to_vec()));
-    }
+    cropped
 }

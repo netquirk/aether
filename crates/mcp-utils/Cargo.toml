@@ -1,6 +1,6 @@
 [package]
 name = "aether-mcp-utils"
-version = "0.7.4"
+version = "0.7.17"
 edition = "2024"
 description = "MCP client and server utilities for the Aether AI agent framework"
 license = "MIT"
@@ -25,40 +25,74 @@ workspace = true
 
 [features]
 default = ["client"]
-testing = ["client"]
+testing = ["client", "dep:axum", "rmcp/transport-streamable-http-server"]
 client = [
     "dep:aether-auth",
-    "aether-auth/mcp",
+    "aether-auth/sigv4",
     "dep:async-stream",
-    "dep:llm",
+    "dep:async-trait",
+    "dep:chrono",
     "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sse-stream",
+    "dep:tokio-stream",
+    "dep:utils",
+    "rmcp/auth",
     "rmcp/transport-streamable-http-client-reqwest",
     "rmcp/transport-child-process",
 ]
 
 [dependencies]
-chrono = { workspace = true }
 futures = { workspace = true }
-serde = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "sync", "net", "time"] }
-tokio-util = { workspace = true }
-rmcp = { workspace = true, features = ["client", "elicitation", "server", "transport-async-rw"] }
-tracing = { workspace = true }
-utils = { package = "aether-utils", path = "../utils", version = "0.2.16" }
-schemars = { workspace = true }
-
-# client-only deps
-aether-auth = { path = "../aether-auth", version = "0.1.16", optional = true }
-async-stream = { workspace = true, optional = true }
-llm = { package = "aether-llm", path = "../llm", optional = true, version = "0.9.4" }
-serde_json = { workspace = true }
-regex = { workspace = true }
-reqwest = { workspace = true, optional = true }
+rmcp = { workspace = true, features = ["client", "elicitation", "server", "transport-async-rw", "transport-io"] }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "net", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
+# client-only deps
+axum = { workspace = true, optional = true }
+aether-auth = { path = "../aether-auth", version = "0.1.21", optional = true }
+async-stream = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# Must match the sse-stream version in the signature of rmcp's StreamableHttpClient.
+sse-stream = { version = "0.2.6", optional = true }
+tokio-stream = { workspace = true, features = ["sync"], optional = true }
+utils = { package = "aether-utils", path = "../utils", version = "0.3.1", optional = true }
+
+[[test]]
+name = "client"
+required-features = ["testing"]
+
+[[test]]
+name = "oauth"
+required-features = ["testing"]
+
+[[test]]
+name = "gateway"
+required-features = ["testing"]
+
+[[test]]
+name = "server"
+required-features = ["testing"]
+
+[[test]]
+name = "http_headers"
+required-features = ["testing"]
+
+[[test]]
+name = "sigv4"
+required-features = ["testing"]
+
 [dev-dependencies]
-aether-doctest = { path = "../doctest" }
-rmcp = { workspace = true, features = ["macros"] }
-tempfile = { workspace = true }
-tracing-subscriber = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+axum = { workspace = true }
+rmcp = { workspace = true, features = ["macros", "transport-streamable-http-server"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

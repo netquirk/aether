@@ -1,5 +1,5 @@
 use crate::theme::Theme;
-use agent_client_protocol::schema::v2::{PlanEntry, PlanEntryStatus};
+use agent_client_protocol::v2::schema::{PlanEntry, PlanEntryStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -12,18 +12,18 @@ const SQUARE_FILLED: &str = "\u{25A0}";
 
 /// Renders the plan checklist as a ratatui widget. Callers inset the area they
 /// pass to [`Widget::render`] rather than asking for an indent.
-pub struct PlanView<'a> {
+pub(crate) struct PlanView<'a> {
     entries: &'a [PlanEntry],
     theme: &'a Theme,
 }
 
 impl<'a> PlanView<'a> {
-    pub fn new(entries: &'a [PlanEntry], theme: &'a Theme) -> Self {
+    pub(crate) fn new(entries: &'a [PlanEntry], theme: &'a Theme) -> Self {
         Self { entries, theme }
     }
 
     /// Number of lines the plan view will occupy (header + blank + entries).
-    pub fn line_count(&self) -> usize {
+    pub(crate) fn line_count(&self) -> usize {
         if self.entries.is_empty() { 0 } else { self.entries.len() + 2 }
     }
 }
@@ -39,39 +39,24 @@ impl Widget for PlanView<'_> {
 }
 
 fn build_plan_lines(entries: &[PlanEntry], theme: &Theme) -> Vec<Line<'static>> {
-    let header_style = Style::new().fg(theme.muted);
+    let header_style = Style::from(theme.muted);
 
     let mut lines = Vec::with_capacity(entries.len() + 2);
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("Plan", header_style)));
 
+    let crossed_out = Style::from((theme.muted, Modifier::CROSSED_OUT));
     for entry in entries {
-        let mut spans = Vec::new();
-        match &entry.status {
-            PlanEntryStatus::Completed => {
-                spans.push(Span::styled(format!("  {CHECKBOX_FILLED} "), Style::new().fg(theme.muted)));
-                spans.push(Span::styled(
-                    entry.content.clone(),
-                    Style::new().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT),
-                ));
-            }
-            PlanEntryStatus::Cancelled => {
-                spans.push(Span::styled("  × ", Style::new().fg(theme.muted)));
-                spans.push(Span::styled(
-                    entry.content.clone(),
-                    Style::new().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT),
-                ));
-            }
-            PlanEntryStatus::InProgress => {
-                spans.push(Span::styled(format!("  {SQUARE_FILLED} "), Style::new().fg(theme.info)));
-                spans.push(Span::styled(entry.content.clone(), Style::new().fg(theme.text_primary)));
-            }
-            _ => {
-                spans.push(Span::styled(format!("  {CHECKBOX_EMPTY} "), Style::new().fg(theme.muted)));
-                spans.push(Span::styled(entry.content.clone(), Style::new().fg(theme.muted)));
-            }
-        }
-        lines.push(Line::from(spans));
+        let (glyph, color, style) = match &entry.status {
+            PlanEntryStatus::Completed => (CHECKBOX_FILLED, theme.muted, crossed_out),
+            PlanEntryStatus::Cancelled => ("×", theme.muted, crossed_out),
+            PlanEntryStatus::InProgress => (SQUARE_FILLED, theme.info, Style::from(theme.text_primary)),
+            _ => (CHECKBOX_EMPTY, theme.muted, Style::from(theme.muted)),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {glyph} "), color),
+            Span::styled(entry.content.clone(), style),
+        ]));
     }
 
     lines
@@ -80,7 +65,7 @@ fn build_plan_lines(entries: &[PlanEntry], theme: &Theme) -> Vec<Line<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v2::{PlanEntryPriority, PlanEntryStatus};
+    use agent_client_protocol::v2::schema::{PlanEntryPriority, PlanEntryStatus};
 
     fn test_theme() -> Theme {
         Theme::default()

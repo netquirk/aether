@@ -6,8 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, StreamState, ToolEvent, TurnEvent, TurnOutcome};
-use llm::{ContentBlock, LlmCallPurpose, MessageId, ModelIdentity, ToolCallError, ToolCallRequest, ToolCallResult};
+use aether_core::events::{AgentEvent, ContextEvent, StreamState, TurnOutcome};
+use llm::{ChatMessage, ContentBlock, MessageId};
 use tempfile::TempDir;
 
 use crate::model::{SessionControlEvent, SessionEvent, SessionMeta, UserEvent};
@@ -39,11 +39,18 @@ pub fn user_message_with(content: Vec<ContentBlock>) -> SessionEvent {
 
 /// The complete assistant text for `message_id`.
 pub fn assistant_text(message_id: &str, text: &str) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Message(MessageEvent::Text {
-        message_id: message_id.into(),
-        chunk: text.into(),
-        is_complete: true,
-    }))
+    SessionEvent::Agent(AgentEvent::text(message_id, text, StreamState::Complete))
+}
+
+/// The agent recording a text-only assistant reply into its context.
+pub fn assistant_reply(message_id: &str, text: &str) -> SessionEvent {
+    recorded_reply(llm::testing::assistant_message().id(message_id).text(text).build())
+}
+
+/// The agent recording `message` into its context; build one with
+/// [`llm::testing::assistant_message`].
+pub fn recorded_reply(message: ChatMessage) -> SessionEvent {
+    SessionEvent::Agent(AgentEvent::Context(ContextEvent::ReplyRecorded { message }))
 }
 
 /// A streaming assistant text chunk, which is never persisted.
@@ -53,57 +60,22 @@ pub fn partial_text(message_id: &str, chunk: &str) -> SessionEvent {
 
 /// A tool call issued by the agent.
 pub fn tool_call(id: &str, name: &str, arguments: &str) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Call {
-        request: ToolCallRequest { id: id.into(), name: name.into(), arguments: arguments.into() },
-    }))
+    SessionEvent::Agent(AgentEvent::tool_call(id, name, arguments))
 }
 
 /// A successful tool result for `id`.
 pub fn tool_result(id: &str, name: &str, result: &str) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Result {
-        result: ToolCallResult { id: id.into(), name: name.into(), arguments: "{}".into(), result: result.into() },
-        result_meta: None,
-    }))
+    SessionEvent::Agent(AgentEvent::tool_result(id, name, "{}", result))
 }
 
 /// A failed tool execution for `id`.
 pub fn tool_error(id: &str, name: &str, error: &str) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Error {
-        error: ToolCallError { id: id.into(), name: name.into(), arguments: Some("{}".into()), error: error.into() },
-    }))
-}
-
-/// A tool call refused by policy for `id`.
-pub fn tool_refused(id: &str, name: &str, arguments: &str, reason: &str) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Refused {
-        request: ToolCallRequest { id: id.into(), name: name.into(), arguments: arguments.into() },
-        reason: reason.into(),
-    }))
+    SessionEvent::Agent(AgentEvent::tool_error(id, name, "{}", error))
 }
 
 /// The terminal event of a turn.
 pub fn turn_ended(outcome: TurnOutcome) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Turn(TurnEvent::Ended { outcome }))
-}
-
-/// A `LlmCallStarted` turn event recording the model that served the call.
-pub fn llm_call_started(
-    purpose: LlmCallPurpose,
-    provider: Option<&str>,
-    model_id: Option<&str>,
-    display_name: &str,
-) -> SessionEvent {
-    SessionEvent::Agent(AgentEvent::Turn(TurnEvent::LlmCallStarted {
-        purpose,
-        model: ModelIdentity {
-            provider: provider.map(str::to_string),
-            model_id: model_id.map(str::to_string),
-            pricing: None,
-        },
-        display_name: display_name.to_string(),
-        attempt: 0,
-        max_attempts: 1,
-    }))
+    SessionEvent::Agent(AgentEvent::turn_ended(outcome))
 }
 
 /// A control event recording an agent switch.

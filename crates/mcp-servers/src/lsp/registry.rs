@@ -1,11 +1,8 @@
-//! LSP Registry - manages LSP daemon clients with lazy connection
-//!
-//! The registry lazily connects to the LSP daemon on first access for each language.
-//! LSP server configurations are managed by the daemon (`aether-lspd`).
+//! LSP Registry - holds one LSP daemon client per workspace
 //!
 //! # Architecture
 //!
-//! Agents connect to a shared daemon (`aether-lspd`) that manages LSP servers.
+//! Agents connect to a shared daemon (`clankerdiff-lspd`) that manages LSP servers.
 //! This avoids spawning duplicate LSP servers when running multiple agents
 //! concurrently.
 
@@ -15,15 +12,15 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use aether_lspd::{
-    ClientError, LANGUAGE_METADATA, LanguageId, LspClient, detect_project_languages, get_config_for_language,
-    server_metadata_for_language, socket_path,
-};
+use clankerdiff_lspd::{LanguageId, LspClient, WorkspaceKey, detect_project_languages, path_to_uri};
 use futures::future::join_all;
 use lsp_types::{Diagnostic, Uri};
-use tokio::sync::RwLock;
+
+use super::common::{find_document_symbol_line, find_symbol_column, find_symbol_line};
+use super::error::LspError;
+use crate::workspace_paths::{resolve_file, resolve_path};
 
 /// A resolved symbol location with its LSP client, ready for protocol calls.
 pub struct ResolvedSymbol {
@@ -34,16 +31,13 @@ pub struct ResolvedSymbol {
     /// 0-indexed column number
     pub column: u32,
     /// The LSP client for this file's language
-    pub client: Arc<LspClient>,
+    pub client: LspClient,
 }
-
-use super::common::{find_document_symbol_line, find_symbol_column, find_symbol_line, path_to_uri};
-use super::error::LspError;
 
 #[doc = include_str!("../docs/lsp_registry.md")]
 pub struct LspRegistry {
-    /// LSP daemon client slots keyed by the daemon socket path they share.
-    clients: HashMap<PathBuf, RwLock<Option<Arc<LspClient>>>>,
+    clients: HashMap<WorkspaceKey, OnceLock<LspClient>>,
+    languages: HashMap<LanguageId, WorkspaceKey>,
     /// The project root directory
     root_path: PathBuf,
 }
@@ -56,16 +50,12 @@ impl Debug for LspRegistry {
 
 impl LspRegistry {
     /// Create a new registry for the given project root
-    ///
-    /// LSP server configurations are managed by the daemon.
     pub fn new(root_path: PathBuf) -> Self {
         let root_path = root_path.canonicalize().unwrap_or(root_path);
-        let clients = LANGUAGE_METADATA
-            .iter()
-            .filter(|metadata| get_config_for_language(metadata.id).is_some())
-            .map(|metadata| (socket_path(&root_path, metadata.id), RwLock::new(None)))
-            .collect();
-        Self { clients, root_path }
+        let languages: HashMap<LanguageId, WorkspaceKey> =
+            LanguageId::ALL.iter().map(|&language| (language, WorkspaceKey::resolve(&root_path, language))).collect();
+        let clients = languages.values().map(|workspace| (workspace.clone(), OnceLock::new())).collect();
+        Self { clients, languages, root_path }
     }
 
     /// Create a new registry and spawn LSP servers for detected project languages.
@@ -84,57 +74,10 @@ impl LspRegistry {
         &self.root_path
     }
 
-    /// Get or connect to the LSP daemon client for a file path.
-    pub async fn get_or_spawn(&self, file_path: &Path) -> Result<Arc<LspClient>, LspError> {
-        let language_id = LanguageId::from_path(file_path);
-        self.get_or_spawn_for_language(language_id).await
-    }
-
-    /// Get or connect to the LSP daemon client for a specific language.
-    pub async fn get_or_spawn_for_language(&self, language_id: LanguageId) -> Result<Arc<LspClient>, LspError> {
-        let slot = self.slot(language_id)?;
-        if let Some(client) = connected(slot).await {
-            return Ok(client);
-        }
-
-        let mut client = slot.write().await;
-        if let Some(connected) = client.as_ref().filter(|client| client.is_connected()) {
-            return Ok(Arc::clone(connected));
-        }
-
-        let connected = LspClient::connect(&self.root_path, language_id)
-            .await
-            .map(Arc::new)
-            .map_err(|error| connection_error(language_id, error))
-            .inspect_err(
-                |error| tracing::error!(%error, language = language_id.as_str(), "Failed to connect to LSP daemon"),
-            )?;
-        *client = Some(Arc::clone(&connected));
-        Ok(connected)
-    }
-
-    /// Get the LSP daemon client for a specific language, if already connected
-    pub async fn get_client_for_language(&self, language_id: LanguageId) -> Option<Arc<LspClient>> {
-        connected(self.slot(language_id).ok()?).await
-    }
-
-    /// Get all active LSP daemon clients
-    pub async fn active_clients(&self) -> Vec<Arc<LspClient>> {
-        let mut active = Vec::new();
-        for slot in self.clients.values() {
-            if let Some(client) = connected(slot).await {
-                active.push(client);
-            }
-        }
-        active
-    }
-
-    /// Check if an LSP is configured for a given file path
-    ///
-    /// This checks the daemon's configuration registry.
-    pub fn has_config_for(&self, file_path: &Path) -> bool {
-        let language_id = LanguageId::from_path(file_path);
-        get_config_for_language(language_id).is_some()
+    pub fn resolve_file(&self, raw: &str) -> Result<String, LspError> {
+        resolve_file(&self.root_path, raw)
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|error| LspError::InvalidPath(error.to_string()))
     }
 
     /// Connect to LSP daemon for all detected project languages.
@@ -144,21 +87,15 @@ impl LspRegistry {
     /// at boot time so LSPs can start indexing immediately.
     pub async fn spawn_project_lsps(&self) {
         let languages = detect_project_languages(&self.root_path);
-        let spawn_futures: Vec<_> =
-            languages.iter().map(|&lang| async move { (lang, self.get_or_spawn_for_language(lang).await) }).collect();
+        let connections =
+            languages.iter().map(|&language| async move { (language, self.client(language).connect().await) });
 
-        for (lang, result) in join_all(spawn_futures).await {
+        for (language, result) in join_all(connections).await {
             match result {
-                Ok(_) => tracing::info!("Connected to LSP daemon for {:?} based on project detection", lang),
-                Err(error) => tracing::warn!(%error, language = lang.as_str(), "Failed to start project LSP"),
+                Ok(()) => tracing::info!("Connected to LSP daemon for {:?} based on project detection", language),
+                Err(error) => tracing::warn!(%error, language = language.as_str(), "Failed to start project LSP"),
             }
         }
-    }
-
-    fn slot(&self, language_id: LanguageId) -> Result<&RwLock<Option<Arc<LspClient>>>, LspError> {
-        self.clients
-            .get(&socket_path(&self.root_path, language_id))
-            .ok_or_else(|| LspError::UnsupportedLanguage(language_id.as_str().to_string()))
     }
 
     /// Resolve a symbol's position, convert its path to a URI, and select its LSP client.
@@ -173,7 +110,7 @@ impl LspRegistry {
     ) -> Result<ResolvedSymbol, LspError> {
         let content = tokio::fs::read_to_string(file_path).await?;
         let uri = path_to_uri(Path::new(file_path))?;
-        let client = self.get_or_spawn(Path::new(file_path)).await?;
+        let client = self.client_for(Path::new(file_path))?.clone();
 
         let hinted =
             line_hint.and_then(|line| find_symbol_column(&content, symbol, line).ok().map(|column| (line, column)));
@@ -208,7 +145,7 @@ impl LspRegistry {
             return self.collect_file_diagnostics(file_path).await;
         }
 
-        let clients = self.active_clients().await;
+        let clients = self.active_clients();
         if clients.is_empty() {
             return Err(LspError::ServerUnavailable(
                 "No active LSP clients. Open a source file first so its language server can start.".to_string(),
@@ -226,12 +163,12 @@ impl LspRegistry {
     }
 
     pub async fn queue_diagnostic_refresh(&self, file_path: &str) {
-        let resolved_path = self.resolve_path(file_path);
+        let resolved_path = resolve_path(&self.root_path, PathBuf::from(file_path));
 
-        let client = match self.get_or_spawn(&resolved_path).await {
+        let client = match self.client_for(&resolved_path) {
             Ok(client) => client,
             Err(error) => {
-                tracing::debug!(path = %resolved_path.display(), %error, "Failed to start LSP for diagnostic refresh");
+                tracing::debug!(path = %resolved_path.display(), %error, "No LSP for diagnostic refresh");
                 return;
             }
         };
@@ -250,8 +187,8 @@ impl LspRegistry {
     }
 
     async fn collect_file_diagnostics(&self, file_path: &str) -> Result<HashMap<Uri, Vec<Diagnostic>>, LspError> {
-        let resolved_path = self.resolve_path(file_path);
-        let client = self.get_or_spawn(&resolved_path).await?;
+        let resolved_path = resolve_path(&self.root_path, PathBuf::from(file_path));
+        let client = self.client_for(&resolved_path)?;
         let uri = path_to_uri(&resolved_path)?;
         let params_list = client.get_diagnostics(Some(uri)).await?;
         let mut result: HashMap<Uri, Vec<Diagnostic>> = HashMap::new();
@@ -259,27 +196,21 @@ impl LspRegistry {
         Ok(result)
     }
 
-    fn resolve_path(&self, file_path: &str) -> PathBuf {
-        if Path::new(file_path).is_absolute() { PathBuf::from(file_path) } else { self.root_path.join(file_path) }
-    }
-}
-
-async fn connected(slot: &RwLock<Option<Arc<LspClient>>>) -> Option<Arc<LspClient>> {
-    slot.read().await.as_ref().filter(|client| client.is_connected()).cloned()
-}
-
-fn connection_error(language_id: LanguageId, error: ClientError) -> LspError {
-    if matches!(&error, ClientError::InitializationFailed(_))
-        && let Some(metadata) = server_metadata_for_language(language_id)
-        && let Some(instructions) = metadata.installation_instructions
-    {
-        return LspError::ServerUnavailable(format!(
-            "{} could not start: {error}. {instructions}",
-            metadata.display_name
-        ));
+    fn client_for(&self, file_path: &Path) -> Result<&LspClient, LspError> {
+        LanguageId::from_path(file_path)
+            .map(|language| self.client(language))
+            .ok_or_else(|| LspError::UnsupportedLanguage(file_path.display().to_string()))
     }
 
-    LspError::Client(error)
+    /// Clients are created on first use because `LspClient::new` spawns a tokio task.
+    fn client(&self, language: LanguageId) -> &LspClient {
+        let workspace = &self.languages[&language];
+        self.clients[workspace].get_or_init(|| LspClient::new(workspace.clone()))
+    }
+
+    fn active_clients(&self) -> Vec<&LspClient> {
+        self.clients.values().filter_map(OnceLock::get).filter(|client| client.is_connected()).collect()
+    }
 }
 
 fn merge_diagnostics(
@@ -296,37 +227,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slot_uses_shared_socket_identity_for_typescript_family() {
-        let registry = LspRegistry::new(PathBuf::from("/tmp"));
+    fn file_arguments_resolve_against_the_project_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let registry = LspRegistry::new(temp.path().to_path_buf());
 
-        assert!(std::ptr::eq(
-            registry.slot(LanguageId::TypeScript).unwrap(),
-            registry.slot(LanguageId::TypeScriptReact).unwrap()
-        ));
-    }
-
-    #[test]
-    fn slot_uses_shared_socket_identity_for_c_family() {
-        let registry = LspRegistry::new(PathBuf::from("/tmp"));
-
-        assert!(std::ptr::eq(registry.slot(LanguageId::C).unwrap(), registry.slot(LanguageId::Cpp).unwrap()));
-    }
-
-    #[test]
-    fn test_has_config_for() {
-        let registry = LspRegistry::new(PathBuf::from("/tmp"));
-
-        assert!(registry.has_config_for(Path::new("foo.rs")));
-        assert!(registry.has_config_for(Path::new("bar.ts")));
-        assert!(registry.has_config_for(Path::new("baz.py")));
-        assert!(!registry.has_config_for(Path::new("unknown.xyz")));
-    }
-
-    #[tokio::test]
-    async fn test_no_clients_initially() {
-        let registry = LspRegistry::new(PathBuf::from("/tmp"));
-
-        assert!(registry.active_clients().await.is_empty());
+        let expected = registry.root_path().join("src/main.rs");
+        assert_eq!(registry.resolve_file("src/main.rs").unwrap(), expected.to_string_lossy());
+        assert_eq!(registry.resolve_file("/elsewhere/lib.rs").unwrap(), "/elsewhere/lib.rs");
+        assert!(registry.resolve_file("  ").is_err());
     }
 
     #[cfg(unix)]

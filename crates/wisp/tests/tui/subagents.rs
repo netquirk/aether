@@ -1,152 +1,115 @@
 use super::support::*;
-use unicode_width::UnicodeWidthStr;
 
-fn sub_agent_progress(parent_tool_id: &str, task_id: &str, agent_name: &str, event: SubAgentEvent) -> AcpEvent {
-    AcpEvent::SubAgentProgress(SubAgentProgressParams {
-        parent_tool_id: parent_tool_id.to_string(),
-        task_id: task_id.to_string(),
-        agent_name: agent_name.to_string(),
-        event,
-    })
-}
-
-fn sub_agent_tool_call(parent_id: &str, task_id: &str, agent: &str, tool_id: &str, name: &str, args: &str) -> AcpEvent {
-    sub_agent_progress(
-        parent_id,
-        task_id,
-        agent,
-        SubAgentEvent::ToolCall {
-            request: SubAgentToolRequest {
-                id: tool_id.to_string(),
-                name: name.to_string(),
-                arguments: args.to_string(),
-            },
-        },
+fn sub_agent_tool_call(session: &str, tool_id: &str, name: &str, args: &str) -> AcpEvent {
+    let raw_input: serde_json::Value = serde_json::from_str(args).expect("tool arguments are JSON");
+    sub_agent_tool_update(
+        session,
+        acp::ToolCallUpdate::new(tool_id.to_string()).title(name).name(name).raw_input(raw_input),
     )
 }
 
-fn sub_agent_done(parent_id: &str, task_id: &str, agent: &str) -> AcpEvent {
-    sub_agent_progress(parent_id, task_id, agent, SubAgentEvent::Done)
+fn sub_agent_tool_completed(session: &str, tool_id: &str) -> AcpEvent {
+    sub_agent_tool_update(session, acp::ToolCallUpdate::new(tool_id.to_string()).status(acp::ToolCallStatus::Completed))
 }
 
-#[test]
-fn spawn_tool_seals_only_after_its_sub_agents_finish() {
-    let mut app = make_app();
-    let tool_state = |app: &TestUi| {
-        app.app()
-            .conversation_items()
-            .iter()
-            .find_map(|item| matches!(item.content(), ConversationContent::Tool(_)).then(|| item.state()))
-            .expect("the parent tool item must exist")
-    };
-
-    app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(tool_completed("parent-1"));
-    assert_eq!(
-        tool_state(&app),
-        ItemState::Open,
-        "a background spawn completes before its agents report, so it must stay open"
-    );
-
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
-    assert_eq!(tool_state(&app), ItemState::Open, "an active sub-agent keeps the parent redrawable");
-
-    app.acp_event(sub_agent_progress(
-        "parent-1",
-        "task-a",
-        "explorer",
-        SubAgentEvent::ToolResult {
-            result: SubAgentToolResult { id: "c1".to_string(), name: "grep".to_string(), result_meta: None },
-        },
-    ));
-    app.acp_event(sub_agent_done("parent-1", "task-a", "explorer"));
-
-    assert_eq!(tool_state(&app), ItemState::Sealed, "rendering is final once every sub-agent has finished");
-}
-
-#[test]
-fn sub_agent_progress_event_is_handled() {
-    let mut app = make_app();
-    app.acp_event(tool_call("parent-1", "spawn_subagent"));
-
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", r#"{"pattern":"test"}"#));
-
-    assert!(app.app().is_agent_busy());
-}
-
-#[test]
-fn sub_agent_parent_stays_live_while_child_running() {
-    let mut app = make_app();
-    app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(tool_completed("parent-1"));
-
-    // parent completed, no sub-agents → should drain
-    app.acp_event(text_chunk("Done"));
-    app.complete_prompt(acp::StopReason::EndTurn);
-    assert!(
-        app.app().conversation_items().iter().any(|item| {
-            matches!(item.content(), ConversationContent::Tool(tool) if tool.title() == "spawn_subagent")
+fn spawn_tool(app: &TestUi) -> &ToolCall {
+    app.app()
+        .core()
+        .conversation()
+        .items()
+        .iter()
+        .find_map(|item| match item.content() {
+            ConversationContent::Tool(tool) if tool.title() == "spawn_subagent" => Some(tool),
+            _ => None,
         })
-    );
+        .expect("the spawn tool must exist")
 }
 
 #[test]
-fn sub_agent_keeps_agent_busy() {
-    let mut app = make_app();
+fn running_sub_agent_keeps_agent_busy_after_its_spawn_completes() {
+    let mut app = TestUi::new();
     app.acp_event(tool_call("parent-1", "spawn_subagent"));
     app.acp_event(tool_completed("parent-1"));
+    assert!(!app.app().core().is_agent_busy(), "a completed spawn with no sub-agents is idle");
 
-    // still busy because prompt_in_flight was never set in this test
-    // but the sub-agent running check uses any_running which includes sub-agents
+    app.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    app.acp_event(sub_agent_tool_call("child-a", "c1", "grep", r#"{"pattern":"test"}"#));
+    assert!(app.app().core().is_agent_busy());
+
+    app.acp_event(sub_agent_tool_completed("child-a", "c1"));
+    app.acp_event(sub_agent_finished("parent-1", "child-a", "explorer", acp::StopReason::EndTurn));
+    assert!(!app.app().core().is_agent_busy());
 }
 
 #[test]
-fn sub_agent_context_cleared_removes_state() {
-    let mut app = make_app();
+fn a_sub_agent_finishes_when_its_own_session_goes_idle() {
+    let mut app = TestUi::new();
+    app.submit("explore");
     app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
+    app.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
 
-    assert!(app.app().is_agent_busy());
+    app.acp_event(idle_notification("child-a", Some(acp::StopReason::EndTurn)).into());
 
-    app.acp_event(AcpEvent::ContextCleared(acp_utils::notifications::ContextClearedParams {}));
+    assert_eq!(spawn_tool(&app).sub_agents[0].status(), Some(ToolStatus::Success));
+    assert!(app.app().core().is_agent_busy(), "a sub-agent going idle does not end the parent's turn");
+}
 
-    assert!(!app.app().is_agent_busy());
+#[test]
+fn a_failed_sub_agent_renders_as_failed() {
+    let mut app = TestUi::new();
+    app.acp_event(tool_call("parent-1", "spawn_subagent"));
+    app.acp_event(tool_completed("parent-1"));
+    app.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    app.acp_event(sub_agent_finished("parent-1", "child-a", "explorer", acp::ErrorStopReason::new().into()));
+
+    app.assert_viewport_contains("✗ explorer");
+}
+
+#[test]
+fn sub_agents_and_clears_for_another_session_are_ignored() {
+    let mut app = TestUi::new();
+    app.acp_event(tool_call("parent-1", "spawn_subagent"));
+    let other_session = SessionId::new("other-session");
+
+    app.acp_event(
+        announced(other_session.clone(), "parent-1", acp::SubagentUpdate::new("child-a").state(running_state())).into(),
+    );
+    app.acp_event(sub_agent_tool_call("child-a", "c1", "grep", "{}"));
+    app.acp_event(AcpEvent::ContextCleared(ContextClearedParams { session_id: other_session }));
+
+    let items = app.app().core().conversation().items();
+    assert_eq!(items.len(), 1, "another session's sub-agent and clear leave this conversation alone");
+    assert_eq!(spawn_tool(&app).sub_agents, []);
 }
 
 #[test]
 fn sub_agent_wants_tick_while_running() {
-    let mut app = make_app();
+    let mut app = TestUi::new();
     app.submit("explore");
     app.acp_event(tool_call("parent-1", "spawn_subagent"));
     app.acp_event(tool_completed("parent-1"));
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
+    app.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    app.acp_event(sub_agent_tool_call("child-a", "c1", "grep", "{}"));
 
     assert!(app.app().wants_tick());
 
-    app.acp_event(sub_agent_done("parent-1", "task-a", "explorer"));
+    app.acp_event(sub_agent_finished("parent-1", "child-a", "explorer", acp::StopReason::EndTurn));
     app.complete_prompt(acp::StopReason::EndTurn);
 
-    // after finalization, sub-agent tools are finalized
     assert!(!app.app().wants_tick());
 }
 
 #[test]
 fn sub_agent_renders_tree_guides_in_viewport() {
     let mut ui = TestUi::new();
-
-    // Start a parent tool call and enter prompt mode
     ui.acp_event(tool_call("parent-1", "spawn_subagent"));
     ui.acp_event(tool_completed("parent-1"));
 
-    // Add sub-agents with child tools
-    ui.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", r#"{"pattern":"test"}"#));
-    ui.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c2", "read", r#"{"path":"src/main.rs"}"#));
+    ui.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    ui.acp_event(sub_agent_tool_call("child-a", "c1", "grep", r#"{"pattern":"test"}"#));
+    ui.acp_event(sub_agent_tool_call("child-a", "c2", "read", r#"{"path":"src/main.rs"}"#));
 
-    ui.draw();
-    let viewport = ui.viewport_text();
-
-    // Tree guides should be visible for the sub-agent
-    assert!(viewport.contains("explorer"), "viewport should show agent name:\n{viewport}");
+    ui.assert_viewport_contains("explorer");
 }
 
 #[test]
@@ -154,102 +117,48 @@ fn completed_sub_agent_bash_tool_renders_a_highlighted_command() {
     let mut ui = TestUi::with_dimensions(100, 20);
     ui.acp_event(tool_call("parent-1", "spawn_subagent"));
     ui.acp_event(tool_completed("parent-1"));
+    ui.acp_event(sub_agent_started("parent-1", "child-a", "builder"));
     ui.acp_event(sub_agent_tool_call(
-        "parent-1",
-        "task-a",
-        "builder",
+        "child-a",
         "bash-1",
         "coding__bash",
         r#"{"command":"if true; then echo $HOME; fi"}"#,
     ));
-    ui.acp_event(sub_agent_progress(
-        "parent-1",
-        "task-a",
-        "builder",
-        SubAgentEvent::ToolResult {
-            result: SubAgentToolResult { id: "bash-1".to_string(), name: "bash".to_string(), result_meta: None },
-        },
-    ));
+    ui.acp_event(sub_agent_tool_completed("child-a", "bash-1"));
 
-    ui.draw();
-
-    let conversation = ui.conversation();
-    let command = "if true; then echo $HOME; fi";
-    let row = row_containing(&conversation, command).expect("rendered sub-agent Bash command");
-    let text = row_text(&conversation, row);
-    assert!(text.contains(&format!("bash {command}")), "command should share the tool row: {text:?}");
-    let command_start = u16::try_from(text[..text.find(command).expect("command position")].width()).unwrap();
-    let gap = conversation.cell((conversation.area.left() + command_start - 1, row)).expect("gap before command");
-    assert_eq!(gap.bg, Color::Reset, "the gap should not set a background");
-    let cells = (command_start..command_start + u16::try_from(command.width()).unwrap())
-        .filter_map(|offset| conversation.cell((conversation.area.left() + offset, row)))
-        .filter(|cell| cell.symbol() != " ")
-        .collect::<Vec<_>>();
-    assert!(cells.iter().all(|cell| cell.bg == Color::Reset), "command should sit on the terminal background");
-    let keyword = cells.iter().find(|cell| cell.symbol() == "i").expect("if keyword");
-    let variable = cells.iter().find(|cell| cell.symbol() == "$").expect("shell variable");
-    assert_ne!(keyword.fg, variable.fg, "shell keywords and variables should use distinct token colors");
+    assert_shell_command_highlighted(&mut ui, "bash", "if true; then echo $HOME; fi");
 }
 
 #[test]
-fn sub_agent_drain_includes_sub_agents_in_history_items() {
-    let mut app = make_app();
-    app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(tool_completed("parent-1"));
-
-    // Add, complete, and mark done a sub-agent
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
-    app.acp_event(sub_agent_progress(
-        "parent-1",
-        "task-a",
-        "explorer",
-        SubAgentEvent::ToolResult {
-            result: SubAgentToolResult { id: "c1".to_string(), name: "grep".to_string(), result_meta: None },
-        },
-    ));
-    app.acp_event(sub_agent_done("parent-1", "task-a", "explorer"));
-
-    // End prompt to finalize everything
-    app.acp_event(text_chunk("Done"));
-    app.complete_prompt(acp::StopReason::EndTurn);
-
-    let tool_item = app.app().conversation_items().iter().find_map(|item| match item.content() {
-        ConversationContent::Tool(tool) if tool.title() == "spawn_subagent" => Some(tool),
-        _ => None,
-    });
-
-    assert!(tool_item.is_some(), "parent tool should be in the conversation");
-    let sub_agents = &tool_item.unwrap().sub_agents;
-    assert_eq!(sub_agents.len(), 1);
-    assert_eq!(sub_agents[0].agent_name, "explorer");
-    assert!(sub_agents[0].done);
-    assert_eq!(sub_agents[0].tool_calls.len(), 1);
-    assert_eq!(sub_agents[0].tool_calls[0].name, "grep");
-}
-
-#[test]
-fn sub_agent_prompt_error_finalizes_sub_agents() {
-    let mut app = make_app();
-    app.submit("work");
-    app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
-
-    // A failed prompt should finalize sub-agents
-    app.deliver_result(prompt_failed("internal error"));
-
-    assert!(!app.app().wants_tick());
-}
-
-#[test]
-fn sub_agent_prompt_cancelled_finalizes_sub_agents() {
-    let mut app = make_app();
+fn a_cancelled_prompt_stops_ticking_for_its_sub_agents() {
+    let mut app = TestUi::new();
     app.submit("explore");
     app.acp_event(tool_call("parent-1", "spawn_subagent"));
-    app.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
+    app.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    app.acp_event(sub_agent_tool_call("child-a", "c1", "grep", "{}"));
 
     app.complete_prompt(acp::StopReason::Cancelled);
 
     assert!(!app.app().wants_tick());
+}
+
+#[test]
+fn a_replayed_running_sub_agent_is_unconfirmed_once_the_resume_completes() {
+    let mut app = TestUi::new();
+    app.begin_resume("saved", "/tmp/saved");
+    let spawn = acp::ToolCallUpdate::new("parent-1").title("spawn_subagent").status(acp::ToolCallStatus::Completed);
+    app.acp_event(acp::UpdateSessionNotification::new("saved", acp::SessionUpdate::ToolCallUpdate(spawn)).into());
+    app.acp_event(
+        announced("saved", "parent-1", acp::SubagentUpdate::new("child-a").title("explorer").state(running_state()))
+            .into(),
+    );
+    assert!(app.app().wants_tick(), "replayed history still looks live until the resume completes");
+
+    app.answer::<Resume>(Ok(acp::ResumeSessionResponse::new()));
+
+    assert_eq!(spawn_tool(&app).sub_agents[0].status(), None);
+    assert!(!app.app().wants_tick());
+    app.assert_viewport_contains("? explorer");
 }
 
 #[test]
@@ -258,336 +167,11 @@ fn sub_agent_multiple_sub_agents_per_parent() {
     ui.acp_event(tool_call("parent-1", "spawn_subagent"));
     ui.acp_event(tool_completed("parent-1"));
 
-    ui.acp_event(sub_agent_tool_call("parent-1", "task-a", "explorer", "c1", "grep", "{}"));
-    ui.acp_event(sub_agent_tool_call("parent-1", "task-b", "builder", "c2", "write", "{}"));
+    ui.acp_event(sub_agent_started("parent-1", "child-a", "explorer"));
+    ui.acp_event(sub_agent_tool_call("child-a", "c1", "grep", "{}"));
+    ui.acp_event(sub_agent_started("parent-1", "child-b", "builder"));
+    ui.acp_event(sub_agent_tool_call("child-b", "c2", "write", "{}"));
 
-    ui.draw();
-    let viewport = ui.viewport_text();
-
-    // Both agent names should be visible
-    assert!(viewport.contains("explorer"), "viewport should show explorer:\n{viewport}");
-    assert!(viewport.contains("builder"), "viewport should show builder:\n{viewport}");
-}
-
-mod progress_indicator_tests {
-    use super::*;
-    use wisp::conversation::progress_indicator::SPINNER_FRAMES;
-
-    #[test]
-    fn idle_renders_no_progress_indicator() {
-        let mut ui = TestUi::new();
-        ui.draw();
-        let full = ui.viewport_text();
-        let has_spinner = SPINNER_FRAMES.iter().any(|frame| full.contains(frame));
-        assert!(!has_spinner, "buffer should not contain spinner when idle:\n{full}");
-        assert!(!full.contains("Working…"), "{full}");
-        assert!(!full.contains("esc to interrupt"), "{full}");
-    }
-
-    #[test]
-    fn prompt_shows_progress_with_esc_hint() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        assert!(
-            ui.app().progress_indicator().is_active(),
-            "progress indicator not active. prompt_in_flight={}, is_agent_busy={}",
-            ui.app().waiting_for_response(),
-            ui.app().is_agent_busy()
-        );
-        // Use a 120-char terminal to fit the full tip + esc hint on one line
-        ui.resize(120, 30);
-        ui.draw();
-        let full = ui.viewport_text();
-        let has_spinner = SPINNER_FRAMES.iter().any(|frame| full.contains(frame));
-        assert!(has_spinner, "full buffer should contain spinner during prompt:\n{full}");
-        assert!(full.contains("esc to interrupt"), "full buffer should show esc hint:\n{full}");
-    }
-
-    #[test]
-    fn completed_prompt_hides_progress() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(text_chunk("response"));
-        ui.complete_prompt(acp::StopReason::EndTurn);
-        ui.draw();
-        let full = ui.viewport_text();
-        assert!(!full.contains("esc to interrupt"), "{full}");
-        assert!(!full.contains("Working…"), "{full}");
-    }
-
-    #[test]
-    fn compaction_active_shows_compacting_message() {
-        let mut ui = TestUi::new();
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(viewport.contains("Compacting context"), "{viewport}");
-    }
-
-    #[test]
-    fn compaction_inactive_hides_indicator() {
-        let mut ui = TestUi::new();
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::Completed));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Compacting context"), "{viewport}");
-    }
-
-    #[test]
-    fn compaction_during_prompt_shows_esc_hint() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.resize(120, 30);
-        ui.draw();
-        let full = ui.viewport_text();
-        assert!(full.contains("Compacting context"), "{full}");
-        assert!(full.contains("esc to interrupt"), "{full}");
-    }
-
-    #[test]
-    fn workspace_moving_shows_progress() {
-        let mut ui = TestUiBuilder::new().workspace_move().build();
-        ui.type_text("/move");
-        ui.key(key(KeyCode::Tab));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspaces_listed(vec![
-            workspace_entry("/home/user/code/current", true),
-            workspace_entry("/home/user/code/other", false),
-        ]));
-        ui.key(key(KeyCode::Enter));
-        let _ = ui.next_agent_command().unwrap();
-        ui.resize(120, 30);
-        ui.draw();
-        let full = ui.viewport_text();
-        assert!(full.contains("Moving workspace"), "{full}");
-        assert!(!full.contains("esc to interrupt"), "{full}");
-    }
-
-    #[test]
-    fn workspace_loading_session_shows_progress() {
-        let mut ui = TestUiBuilder::new().workspace_move().build();
-        ui.type_text("/move");
-        ui.key(key(KeyCode::Tab));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspaces_listed(vec![
-            workspace_entry("/home/user/code/current", true),
-            workspace_entry("/home/user/code/other", false),
-        ]));
-        ui.key(key(KeyCode::Enter));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspace_moved("/home/user/code/other"));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(viewport.contains("Loading session in new workspace"), "{viewport}");
-    }
-
-    #[test]
-    fn workspace_move_failure_clears_indicator() {
-        let mut ui = TestUiBuilder::new().workspace_move().build();
-        ui.type_text("/move");
-        ui.key(key(KeyCode::Tab));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspaces_listed(vec![
-            workspace_entry("/home/user/code/current", true),
-            workspace_entry("/home/user/code/other", false),
-        ]));
-        ui.key(key(KeyCode::Enter));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspace_move_failed("permission denied"));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Moving workspace"), "{viewport}");
-        assert!(!viewport.contains("Loading session"), "{viewport}");
-    }
-
-    #[test]
-    fn workspace_move_precedence_over_compaction() {
-        let mut ui = TestUiBuilder::new().workspace_move().build();
-        ui.type_text("/move");
-        ui.key(key(KeyCode::Tab));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspaces_listed(vec![
-            workspace_entry("/home/user/code/current", true),
-            workspace_entry("/home/user/code/other", false),
-        ]));
-        ui.key(key(KeyCode::Enter));
-        let _ = ui.next_agent_command().unwrap();
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(viewport.contains("Moving workspace"), "{viewport}");
-        assert!(!viewport.contains("Compacting"), "{viewport}");
-    }
-
-    #[test]
-    fn compaction_precedence_over_agent_work() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(viewport.contains("Compacting context"), "{viewport}");
-    }
-
-    #[test]
-    fn wants_tick_true_immediately_after_prompt_submit() {
-        let mut app = make_app();
-        assert!(!app.app().wants_tick(), "wants_tick should be false when idle");
-        app.submit("hello");
-        assert!(app.app().wants_tick(), "wants_tick should be true immediately after prompt submit (raw state)");
-    }
-
-    #[test]
-    fn wants_tick_true_during_compaction() {
-        let mut app = make_app();
-        app.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        assert!(app.app().wants_tick(), "wants_tick should be true during compaction");
-    }
-
-    #[test]
-    fn wants_tick_true_during_workspace_move() {
-        let mut app = make_app_with_workspace_move();
-        app.type_text("/move");
-        app.key(key(KeyCode::Tab));
-        let _ = app.next_agent_command().unwrap();
-        app.deliver_result(workspaces_listed(vec![
-            workspace_entry("/home/user/code/current", true),
-            workspace_entry("/home/user/code/other", false),
-        ]));
-        app.key(key(KeyCode::Enter));
-        let _ = app.next_agent_command().unwrap();
-        assert!(app.app().wants_tick(), "wants_tick should be true during workspace move");
-    }
-
-    #[test]
-    fn wants_tick_false_after_idle() {
-        let mut app = make_app();
-        app.submit("hello");
-        app.acp_event(text_chunk("done"));
-        app.complete_prompt(acp::StopReason::EndTurn);
-        assert!(!app.app().wants_tick(), "wants_tick should be false after prompt completes and no other activity");
-    }
-
-    #[test]
-    fn tick_animates_spinner_deterministically() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-
-        let now = Instant::now();
-
-        // Capture rendering at tick 0
-        ui.resize(120, 30);
-        ui.draw();
-        let full_a = ui.viewport_text();
-
-        // Advance tick once
-        ui.tick(now);
-        ui.draw();
-        let full_b = ui.viewport_text();
-
-        // Different frames should produce different braille characters
-        assert_ne!(full_a, full_b, "spinner should animate with each tick");
-    }
-
-    #[test]
-    fn tick_stops_when_idle() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-
-        let now = Instant::now();
-        ui.tick(now);
-
-        // Complete the prompt
-        ui.acp_event(text_chunk("response"));
-        ui.complete_prompt(acp::StopReason::EndTurn);
-        // Tick while idle — should not change
-        ui.tick(now);
-        ui.resize(120, 30);
-        ui.draw();
-        let full = ui.viewport_text();
-        assert!(!full.contains("esc to interrupt"), "{full}");
-    }
-
-    #[test]
-    fn progress_is_not_inserted_into_scrollback() {
-        let mut ui = TestUi::new();
-        // Fill enough content to trigger scrollback
-        ui.submit("hello");
-        let mut response = String::new();
-        for i in 0..20 {
-            writeln!(response, "line-{i}").unwrap();
-        }
-        ui.acp_event(text_chunk(&response));
-        ui.complete_prompt(acp::StopReason::EndTurn);
-
-        // Submit another prompt so we can see progress indicator
-        ui.submit("another");
-        ui.draw();
-
-        let scrollback = ui.history_text();
-        let has_spinner = SPINNER_FRAMES.iter().any(|frame| scrollback.contains(frame));
-        assert!(!has_spinner, "scrollback should not contain progress spinner:\n{scrollback}");
-        assert!(!scrollback.contains("esc to interrupt"), "scrollback should not contain esc hint:\n{scrollback}");
-        assert!(!scrollback.contains("Working…"), "scrollback should not contain Working:\n{scrollback}");
-    }
-
-    #[test]
-    fn context_cleared_resets_progress_state() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.acp_event(AcpEvent::ContextCleared(ContextClearedParams {}));
-
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Compacting"), "{viewport}");
-        assert!(!viewport.contains("esc to interrupt"), "{viewport}");
-        assert!(!ui.app().wants_tick(), "wants_tick should be false after context cleared");
-    }
-
-    #[test]
-    fn new_session_resets_progress_state() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.complete_prompt(acp::StopReason::EndTurn);
-        ui.type_text("/clear");
-        ui.key(key(KeyCode::Tab));
-        ui.deliver_result(new_session_created("new-session", Vec::new()));
-
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Compacting"), "{viewport}");
-        assert!(!ui.app().wants_tick(), "wants_tick should be false after new session");
-    }
-
-    #[test]
-    fn session_loaded_resets_progress_state() {
-        let mut ui = TestUi::new();
-        ui.submit("hello");
-        ui.acp_event(compaction_update("compaction", acp::CompactionStatus::InProgress));
-        ui.complete_prompt(acp::StopReason::EndTurn);
-        ui.begin_resume("loaded-session", "/tmp");
-        ui.deliver_result(session_loaded("loaded-session", Vec::new()));
-
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Compacting"), "{viewport}");
-    }
-
-    #[test]
-    fn workspace_list_failed_clears_indicator() {
-        let mut ui = TestUiBuilder::new().workspace_move().build();
-        ui.type_text("/move");
-        ui.key(key(KeyCode::Tab));
-        let _ = ui.next_agent_command().unwrap();
-        ui.deliver_result(workspace_list_failed("network error"));
-
-        ui.draw();
-        let viewport = ui.viewport_text();
-        assert!(!viewport.contains("Moving workspace"), "{viewport}");
-        assert!(!ui.app().wants_tick(), "wants_tick should be false after list failure");
-    }
+    ui.assert_viewport_contains("explorer");
+    ui.assert_viewport_contains("builder");
 }

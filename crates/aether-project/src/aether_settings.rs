@@ -1,56 +1,16 @@
-use utils::SettingsStore;
+use utils::path::aether_home;
 
 use crate::agent_config::AgentConfig;
 use crate::error::SettingsError;
-use crate::{McpFileSpec, McpSourceSpec, PromptSource};
+use crate::{McpSourceSpec, PromptSource};
 use aether_core::core::Prompt;
-use aether_core::mcp::ToolOutputSettings;
-use aether_core::mcp::tool_output::ToolOutputCap;
 use llm::ProviderConnectionOverrides;
-use mcp_utils::client::McpConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use utils::variables::{VarError, Vars};
-
-/// Environment variable that overrides the per-call tool result byte cap for a
-/// single run. `0` disables the cap; an unparseable value is ignored.
-pub const AETHER_TOOL_OUTPUT_MAX_BYTES_ENV: &str = "AETHER_TOOL_OUTPUT_MAX_BYTES";
-/// Environment variable that overrides the directory the cap writes full
-/// truncated tool outputs to.
-pub const PRAIRIE_TOOL_OUTPUT_DIR_ENV: &str = "PRAIRIE_TOOL_OUTPUT_DIR";
-/// Parses `AETHER_TOOL_OUTPUT_MAX_BYTES` from the process environment.
-pub fn tool_output_max_bytes_from_env() -> Option<usize> {
-    std::env::var(AETHER_TOOL_OUTPUT_MAX_BYTES_ENV).ok().and_then(|value| value.parse().ok())
-}
-/// Returns the directory named by `PRAIRIE_TOOL_OUTPUT_DIR` in the process
-/// environment, or `None` when unset / blank.
-pub fn tool_output_dir_from_env() -> Option<PathBuf> {
-    std::env::var(PRAIRIE_TOOL_OUTPUT_DIR_ENV).ok().map(PathBuf::from).filter(|path| !path.as_os_str().is_empty())
-}
-
-/// What the settings loader does with a top-level key that [`AetherSettings`]
-/// does not declare.
-///
-/// A key Aether does not recognise is either a typo or a setting written by a
-/// newer Aether. The policy decides whether the document that carries it is
-/// refused or loaded with the key ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UnknownKeyPolicy {
-    /// Refuse the document: the loader returns a [`SettingsError::ParseError`]
-    /// that names the offending key. The settings Aether owns — the user-level
-    /// and the project-level file — are loaded with this policy, so a key the
-    /// operator believes is in effect cannot be dropped without saying so.
-    #[default]
-    Reject,
-    /// Warn about every offending key and ignore it. A document the operator
-    /// named explicitly may have been written by another Aether build, so the
-    /// run starts and the warning names the key the operator has to remove.
-    Warn,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -66,7 +26,7 @@ pub enum CredentialsStoreConfig {
     /// Holds credentials in an encrypted file
     EncryptedFile {
         /// File path for the encrypted credential blob. Defaults to
-        /// `.aether/credentials.enc` in the Aether home directory when unset.
+        /// `credentials.enc` in the Aether home directory when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
         /// Environment variable name to read the passphrase from. Uses
@@ -79,37 +39,8 @@ pub enum CredentialsStoreConfig {
 const PROJECT_SETTINGS_PATH: &str = ".aether/settings.json";
 const USER_SETTINGS_FILENAME: &str = "settings.json";
 
-/// Resolve the [`ToolOutputCap`] for a run. The layering, lowest to highest
-/// precedence, is:
-///
-/// 1. The 16 KiB default for `max_bytes` and `<project_root>/.prairie/out` for
-///    `output_dir`.
-/// 2. The top-level `AetherSettings.tool_output` block.
-/// 3. The per-agent `AgentConfig.tool_output` override.
-/// 4. The `AETHER_TOOL_OUTPUT_MAX_BYTES` env var (wins over settings for
-///    `max_bytes`; an unparseable value is ignored). `0` disables the cap.
-/// 5. The `PRAIRIE_TOOL_OUTPUT_DIR` env var (wins over settings for
-///    `output_dir`; an empty value is ignored).
-pub fn resolve_tool_output_cap(
-    project_root: &Path,
-    settings: Option<&ToolOutputSettings>,
-    agent_override: Option<&ToolOutputSettings>,
-    env_max_bytes: Option<usize>,
-    env_output_dir: Option<PathBuf>,
-) -> ToolOutputCap {
-    // Merge agent override over top-level settings on a per-field basis, then
-    // let the env vars override the merged values.
-    let mut merged = settings.cloned().unwrap_or_default();
-    if let Some(agent) = agent_override.cloned() {
-        merged.merge(agent);
-    }
-    let max_bytes = env_max_bytes.unwrap_or_else(|| merged.resolved_max_bytes());
-    let output_dir = env_output_dir.unwrap_or_else(|| merged.resolved_output_dir(project_root));
-    ToolOutputCap::new(max_bytes, output_dir)
-}
-
 pub fn user_settings_path() -> Option<PathBuf> {
-    SettingsStore::new("AETHER_HOME", ".aether").map(|store| store.home().join(USER_SETTINGS_FILENAME))
+    aether_home().map(|home| home.join(USER_SETTINGS_FILENAME))
 }
 
 pub fn user_settings_exist() -> bool {
@@ -122,21 +53,6 @@ pub fn project_settings_path(project_root: &Path) -> PathBuf {
 
 pub fn project_settings_exist(project_root: &Path) -> bool {
     project_settings_path(project_root).is_file()
-}
-
-/// Root that file-backed settings resources resolve against for the settings file at
-/// `settings_path`: the project root (the parent of `.aether`) when the settings file lives in a
-/// `.aether` directory, otherwise the settings file's directory.
-pub fn settings_resource_root(settings_path: &Path) -> PathBuf {
-    let Some(settings_dir) = settings_path.parent() else {
-        return PathBuf::from(".");
-    };
-
-    if settings_dir.file_name().and_then(|name| name.to_str()) == Some(".aether") {
-        return settings_dir.parent().unwrap_or(settings_dir).to_path_buf();
-    }
-
-    settings_dir.to_path_buf()
 }
 
 #[doc = include_str!("docs/aether_settings.md")]
@@ -166,147 +82,9 @@ pub struct AetherSettings {
     /// OpenTelemetry `GenAI` telemetry configuration. Its presence enables telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetrySettings>,
-    /// Per-call tool result cap applied by the MCP runtime. Inherited by every
-    /// agent unless the agent sets its own `toolOutput` block. The cap writes
-    /// full truncated tool results to disk so the model can read them back in
-    /// ranges, and embeds a marker in the returned text naming the on-disk
-    /// file. See [`ToolOutputSettings`] for the layering rules and
-    /// `AETHER_TOOL_OUTPUT_MAX_BYTES` / `PRAIRIE_TOOL_OUTPUT_DIR` for the env
-    /// overrides.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_output: Option<ToolOutputSettings>,
-    /// Run-time knobs that affect the headless CLI only. The CLI surfaces a
-    /// live one-line warning when a provider call exceeds
-    /// `providerStallWarnSeconds` and a hung turn is still in flight (TASK-24-378),
-    /// and emits a periodic heartbeat log line while a turn is in flight
-    /// (TASK-26-111, `heartbeatSeconds`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<RunSettings>,
-    /// Extra environment variables that every shell command a run starts sees
-    /// — the `bash` tool of the built-in `coding` MCP server. Keys declared
-    /// here are merged over the process environment for those commands: a
-    /// configured key can shadow `PATH`, `HOME`, or any other variable for the
-    /// duration of the spawned `bash` process. The internal gateway socket
-    /// `AETHER_MCP_IPC_SOCKET` is always written after this map so it cannot
-    /// be spoofed via config.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub shell_environment: BTreeMap<String, String>,
     /// The agents defined for this project. At least one agent is required.
     #[schemars(length(min = 1))]
     pub agents: Vec<AgentConfig>,
-}
-
-/// Top-level keys that the [`AetherSettings`] deserialiser recognises. Every
-/// other key in the root JSON object is either refused — with a parse error
-/// that names it — or warned about and ignored, depending on the
-/// [`UnknownKeyPolicy`] the loader applies. Keep this list in sync with the
-/// `#[derive(schemars::JsonSchema)]` definition of [`AetherSettings`]; the
-/// `known_top_level_keys_match_schema` test in this module will fail the build
-/// if they ever drift.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "agent",
-    "prompts",
-    "mcps",
-    "providers",
-    "credentialsStore",
-    "telemetry",
-    "toolOutput",
-    "run",
-    "shellEnvironment",
-    "agents",
-];
-
-/// Settings that tune the headless CLI's behaviour during a run. Every field
-/// is optional: an unset field disables the corresponding behaviour so the
-/// existing run shape is unchanged when the block is absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RunSettings {
-    /// Seconds a provider call may wait before the CLI prints a one-line
-    /// stall warning naming the elapsed wait. Unset (or `0`) disables the
-    /// warning so the existing run shape is preserved when the block is
-    /// absent. Surfaced by the headless CLI while the turn is still live so a
-    /// hung turn is visible instead of silent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_stall_warn_seconds: Option<u64>,
-    /// Seconds between heartbeat log lines the CLI emits while an agent turn
-    /// is in flight (TASK-26-111). Defaults to
-    /// [`DEFAULT_HEARTBEAT_SECONDS`] (30 s) so a hung turn is visible in the
-    /// run log without any user configuration. Unset inherits the default;
-    /// `0` disables the heartbeat so a caller can opt out via the settings
-    /// file. Like the provider-stall warning, the heartbeat only fires while
-    /// a turn is active, so a turn that finishes before the first interval
-    /// does not log anything.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub heartbeat_seconds: Option<u64>,
-    /// Seconds a tool-spawned shell command (the `bash` tool of the built-in
-    /// `coding` MCP server) may run before it is killed (TASK-26-395). Unset
-    /// (or `0`) disables the limit so the existing run shape is preserved when
-    /// the block is absent. Resolved via
-    /// [`RunSettings::shell_command_timeout`] so the disabled path returns
-    /// `None` and callers can treat it as "no limit".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell_command_timeout_seconds: Option<u64>,
-}
-
-/// Default interval (in seconds) between heartbeat log lines emitted by the
-/// headless CLI while an agent turn is in flight (TASK-26-111). Configurable
-/// via the top-level `run.heartbeatSeconds` setting; `0` (and an unset
-/// `heartbeatSeconds` after the default is applied via
-/// [`RunSettings::heartbeat_interval`]) disables the heartbeat.
-pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 30;
-
-impl RunSettings {
-    /// Threshold as a `Duration`; `None` when unset or zero so callers can
-    /// skip the warning loop entirely on the disabled path.
-    pub fn provider_stall_warn(&self) -> Option<Duration> {
-        self.provider_stall_warn_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
-    }
-
-    /// Heartbeat interval as a `Duration`. Falls back to
-    /// [`DEFAULT_HEARTBEAT_SECONDS`] when the field is unset (so the
-    /// heartbeat is on by default) and returns `None` when the resolved value
-    /// is zero (so a caller who explicitly sets `0` opts out). Keeping the
-    /// default and the "zero disables" rule here means callers do not need to
-    /// duplicate the resolution: an absent `run` block still produces a
-    /// 30 s heartbeat.
-    pub fn heartbeat_interval(&self) -> Option<Duration> {
-        let seconds = self.heartbeat_seconds.unwrap_or(DEFAULT_HEARTBEAT_SECONDS);
-        (seconds > 0).then(|| Duration::from_secs(seconds))
-    }
-
-    /// Default heartbeat interval for a wholly-absent `run` block. Equivalent
-    /// to [`RunSettings::heartbeat_interval`] on a default-constructed
-    /// `RunSettings`; exposed so callers that only hold an
-    /// `Option<RunSettings>` (e.g. the headless CLI's `RunConfig`
-    /// constructors) can resolve the default without constructing a fresh
-    /// `RunSettings` themselves.
-    pub fn default_heartbeat_interval() -> Option<Duration> {
-        RunSettings::default().heartbeat_interval()
-    }
-
-    /// Per-command shell timeout as a `Duration`; `None` when unset or zero
-    /// so callers can treat the disabled path as "no limit" and skip the
-    /// kill path entirely.
-    pub fn shell_command_timeout(&self) -> Option<Duration> {
-        self.shell_command_timeout_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
-    }
-
-    // Pass-by-value matches the merge pattern on `TelemetrySettings` /
-    // `TelemetryContentSettings` even though the body owns a single field
-    // each; the symmetry matters more than the micro-savings.
-    #[allow(clippy::needless_pass_by_value)]
-    fn merge(&mut self, next: Self) {
-        merge_field(&mut self.provider_stall_warn_seconds, next.provider_stall_warn_seconds);
-        merge_field(&mut self.heartbeat_seconds, next.heartbeat_seconds);
-        merge_field(&mut self.shell_command_timeout_seconds, next.shell_command_timeout_seconds);
-    }
-}
-
-/// Returns the keys present in `value` that [`AetherSettings`] does not
-/// declare, preserving their original ordering for stable, testable output.
-fn unrecognized_settings_keys(value: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
-    value.keys().filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())).cloned().collect()
 }
 
 /// One settings layer's OpenTelemetry configuration. Every field is optional:
@@ -417,26 +195,6 @@ impl TelemetrySettings {
 }
 
 impl TelemetryContentSettings {
-    pub fn system_instructions(&self) -> bool {
-        self.system_instructions.unwrap_or(false)
-    }
-
-    pub fn input_messages(&self) -> bool {
-        self.input_messages.unwrap_or(false)
-    }
-
-    pub fn output_messages(&self) -> bool {
-        self.output_messages.unwrap_or(false)
-    }
-
-    pub fn tool_definitions(&self) -> bool {
-        self.tool_definitions.unwrap_or(false)
-    }
-
-    pub fn tool_calls(&self) -> bool {
-        self.tool_calls.unwrap_or(false)
-    }
-
     fn merge(&mut self, next: &Self) {
         merge_field(&mut self.system_instructions, next.system_instructions);
         merge_field(&mut self.input_messages, next.input_messages);
@@ -449,16 +207,6 @@ impl TelemetryContentSettings {
 impl OtlpTelemetrySettings {
     pub fn resolved_headers(&self, vars: &Vars) -> Result<BTreeMap<String, String>, VarError> {
         self.headers.iter().map(|(name, value)| Ok((name.clone(), vars.expand(value)?))).collect()
-    }
-}
-
-fn is_default<T: Default + PartialEq>(value: &T) -> bool {
-    value == &T::default()
-}
-
-fn merge_field<T>(current: &mut Option<T>, next: Option<T>) {
-    if next.is_some() {
-        *current = next;
     }
 }
 
@@ -483,49 +231,22 @@ impl SettingsFileSource {
 }
 
 impl AetherSettings {
-    /// Load the settings Aether owns for `project_root`: the user-level
-    /// (`$AETHER_HOME/settings.json`) and the project-level
-    /// (`.aether/settings.json`) documents. A top-level key neither document
-    /// declares is refused, so a setting the operator believes is in effect
-    /// cannot be dropped without the run saying so.
     pub fn load_default(project_root: &Path) -> Result<Self, SettingsError> {
-        Self::load_with_policy(project_root, default_sources(project_root), UnknownKeyPolicy::Reject)
+        Self::load(project_root, default_sources(project_root))
     }
 
     pub fn load(
         project_root: &Path,
         sources: impl IntoIterator<Item = AetherSettingsSource>,
     ) -> Result<Self, SettingsError> {
-        Self::load_with_policy(project_root, sources, UnknownKeyPolicy::Reject)
-    }
-
-    /// Load settings from `sources`, applying `policy` to every top-level key
-    /// the documents do not declare.
-    pub fn load_with_policy(
-        project_root: &Path,
-        sources: impl IntoIterator<Item = AetherSettingsSource>,
-        policy: UnknownKeyPolicy,
-    ) -> Result<Self, SettingsError> {
         sources.into_iter().try_fold(Self::default(), |config, source| {
-            let next = Self::load_source(project_root, source, policy)?;
+            let next = Self::load_source(project_root, source)?;
             Ok(config.merge(next))
         })
     }
 
-    pub fn load_file_for_export(path: &Path) -> Result<Self, SettingsError> {
-        let content = read_to_string(path).map_err(|source| {
-            SettingsError::IoError(format!("failed to read settings file '{}': {source}", path.display()))
-        })?;
-        let mut settings = Self::try_from(content.as_str())?;
-        settings.inline_resources(&settings_resource_root(path))?;
-        Ok(settings)
-    }
-
     pub fn merge(mut self, next: Self) -> Self {
-        if next.agent.is_some() {
-            self.agent = next.agent;
-        }
-
+        merge_field(&mut self.agent, next.agent);
         if !next.prompts.is_empty() {
             self.prompts = next.prompts;
         }
@@ -534,26 +255,10 @@ impl AetherSettings {
         }
         self.providers.merge(next.providers);
 
-        if next.credentials_store.is_some() {
-            self.credentials_store = next.credentials_store;
-        }
-
+        merge_field(&mut self.credentials_store, next.credentials_store);
         if let Some(next_telemetry) = next.telemetry {
             self.telemetry.get_or_insert_default().merge(next_telemetry);
         }
-
-        if let Some(next_tool_output) = next.tool_output {
-            self.tool_output.get_or_insert_default().merge(next_tool_output);
-        }
-
-        if let Some(next_run) = next.run {
-            self.run.get_or_insert_default().merge(next_run);
-        }
-
-        // Project-layer shell environment wins on every shared key, so a
-        // project file can shadow values contributed by user-level settings
-        // without dropping the user's other entries.
-        self.shell_environment.extend(next.shell_environment);
 
         for next_agent in next.agents {
             if let Some(existing) = self.agents.iter_mut().find(|agent| agent.name.trim() == next_agent.name.trim()) {
@@ -573,38 +278,44 @@ impl AetherSettings {
     /// external file references, suitable for shipping to a machine or
     /// container that does not have the authoring repository mounted.
     pub fn inline_resources(&mut self, root: &Path) -> Result<(), SettingsError> {
-        self.prompts = inline_prompt_sources(&self.prompts, root)?;
-        self.mcps = inline_mcp_sources(&self.mcps, root)?;
-        for agent in &mut self.agents {
-            agent.prompts = inline_prompt_sources(&agent.prompts, root)?;
-            agent.mcps = inline_mcp_sources(&agent.mcps, root)?;
+        for (prompts, mcps) in self.resource_sources_mut() {
+            *prompts = inline_prompt_sources(prompts, root)?;
+            *mcps = inline_mcp_sources(mcps, root)?;
         }
         Ok(())
     }
 
-    fn load_source(
-        project_root: &Path,
-        source: AetherSettingsSource,
-        policy: UnknownKeyPolicy,
-    ) -> Result<Self, SettingsError> {
+    fn resource_sources_mut(&mut self) -> impl Iterator<Item = (&mut Vec<PromptSource>, &mut Vec<McpSourceSpec>)> {
+        std::iter::once((&mut self.prompts, &mut self.mcps))
+            .chain(self.agents.iter_mut().map(|agent| (&mut agent.prompts, &mut agent.mcps)))
+    }
+
+    fn load_source(project_root: &Path, source: AetherSettingsSource) -> Result<Self, SettingsError> {
         match source {
-            AetherSettingsSource::File(source) => load_file_source(project_root, source, false, policy),
-            AetherSettingsSource::OptionalFile(source) => load_file_source(project_root, source, true, policy),
-            AetherSettingsSource::Json(json) => parse_settings(json.as_str(), policy),
+            AetherSettingsSource::File(source) => load_file_source(project_root, source, false),
+            AetherSettingsSource::OptionalFile(source) => load_file_source(project_root, source, true),
+            AetherSettingsSource::Json(json) => Self::try_from(json.as_str()),
             AetherSettingsSource::Value(settings) => Ok(*settings),
         }
     }
 }
 
+impl TryFrom<&str> for AetherSettings {
+    type Error = SettingsError;
+
+    fn try_from(content: &str) -> Result<Self, Self::Error> {
+        serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))
+    }
+}
+
 fn default_sources(project_root: &Path) -> Vec<AetherSettingsSource> {
-    let aether_home = SettingsStore::new("AETHER_HOME", ".aether").map(|store| store.home().to_path_buf());
-    default_sources_for_home(project_root, aether_home.as_deref())
+    default_sources_for_home(project_root, aether_home().as_deref())
 }
 
 fn default_sources_for_home(project_root: &Path, aether_home: Option<&Path>) -> Vec<AetherSettingsSource> {
     let mut sources = Vec::new();
     if let Some(aether_home) = aether_home {
-        sources.push(AetherSettingsSource::OptionalFile(SettingsFileSource::new("settings.json", aether_home)));
+        sources.push(AetherSettingsSource::OptionalFile(SettingsFileSource::new(USER_SETTINGS_FILENAME, aether_home)));
     }
     sources.push(AetherSettingsSource::OptionalFile(SettingsFileSource::new(PROJECT_SETTINGS_PATH, project_root)));
     sources
@@ -614,11 +325,10 @@ fn load_file_source(
     project_root: &Path,
     source: SettingsFileSource,
     missing_is_empty: bool,
-    policy: UnknownKeyPolicy,
 ) -> Result<AetherSettings, SettingsError> {
     let root = resolve_against(project_root, source.root);
     let path = resolve_against(&root, source.path);
-    let settings = load_file(&path, missing_is_empty, policy)?;
+    let settings = load_file(&path, missing_is_empty)?;
     let source_root = (root != project_root).then_some(root.as_path());
     Ok(normalize_resource_paths(settings, source_root))
 }
@@ -627,10 +337,10 @@ fn resolve_against(base: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() { path } else { base.join(path) }
 }
 
-fn load_file(path: &Path, missing_is_empty: bool, policy: UnknownKeyPolicy) -> Result<AetherSettings, SettingsError> {
+fn load_file(path: &Path, missing_is_empty: bool) -> Result<AetherSettings, SettingsError> {
     match read_to_string(path) {
         Ok(content) if content.trim().is_empty() => Ok(AetherSettings::default()),
-        Ok(content) => parse_settings(content.as_str(), policy),
+        Ok(content) => AetherSettings::try_from(content.as_str()),
         Err(error) if missing_is_empty && error.kind() == std::io::ErrorKind::NotFound => Ok(AetherSettings::default()),
         Err(error) => Err(SettingsError::IoError(format!("Failed to read {}: {}", path.display(), error))),
     }
@@ -638,14 +348,10 @@ fn load_file(path: &Path, missing_is_empty: bool, policy: UnknownKeyPolicy) -> R
 
 fn normalize_resource_paths(mut settings: AetherSettings, source_root: Option<&Path>) -> AetherSettings {
     let Some(root) = source_root else { return settings };
-    promote_prompt_sources(&mut settings.prompts, root);
-    promote_mcp_sources(&mut settings.mcps, root);
-
-    for agent in &mut settings.agents {
-        promote_prompt_sources(&mut agent.prompts, root);
-        promote_mcp_sources(&mut agent.mcps, root);
+    for (prompts, mcps) in settings.resource_sources_mut() {
+        promote_prompt_sources(prompts, root);
+        promote_mcp_sources(mcps, root);
     }
-
     settings
 }
 
@@ -664,45 +370,11 @@ fn inline_prompt_sources(sources: &[PromptSource], root: &Path) -> Result<Vec<Pr
 }
 
 fn inline_mcp_sources(sources: &[McpSourceSpec], root: &Path) -> Result<Vec<McpSourceSpec>, SettingsError> {
-    let mut inlined = Vec::new();
-    for source in sources {
-        let McpSourceSpec::File(McpFileSpec { path, defer_tools, optional }) = source else {
-            inlined.push(source.clone());
-            continue;
-        };
-
-        let full_path = match path.resolve(root) {
-            Ok(full_path) => full_path,
-            Err(VarError::NotFound(variable)) => {
-                if *optional {
-                    tracing::warn!(
-                        "Skipping optional MCP config '{}': variable '{variable}' is not defined",
-                        path.as_authored()
-                    );
-                    continue;
-                }
-                return Err(SettingsError::UnresolvedMcpConfigVariable {
-                    path: path.as_authored().to_string(),
-                    variable,
-                });
-            }
-        };
-
-        if !full_path.is_file() {
-            if *optional {
-                continue;
-            }
-            return Err(SettingsError::InvalidMcpConfigPath { path: path.as_authored().to_string() });
-        }
-
-        let mut config = McpConfig::from_json_file(&full_path)
-            .map_err(|e| SettingsError::IoError(format!("Failed to read MCP config '{}': {e}", full_path.display())))?;
-        if *defer_tools {
-            config.defer_all_tools();
-        }
-        inlined.push(McpSourceSpec::Inline { servers: config.servers });
-    }
-    Ok(inlined)
+    sources
+        .iter()
+        .filter_map(|spec| spec.load(root).transpose())
+        .map(|config| config.map(McpSourceSpec::Inline))
+        .collect()
 }
 
 fn promote_prompt_sources(sources: &mut [PromptSource], source_root: &Path) {
@@ -724,62 +396,25 @@ fn promote_mcp_sources(sources: &mut [McpSourceSpec], source_root: &Path) {
     }
 }
 
-impl TryFrom<&str> for AetherSettings {
-    type Error = SettingsError;
-
-    fn try_from(content: &str) -> Result<Self, Self::Error> {
-        parse_settings(content, UnknownKeyPolicy::Reject)
-    }
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
-/// Parse a settings document, applying `policy` to the top-level keys the
-/// document declares but [`AetherSettings`] does not.
-fn parse_settings(content: &str, policy: UnknownKeyPolicy) -> Result<AetherSettings, SettingsError> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| SettingsError::ParseError(e.to_string()))?;
-
-    if let serde_json::Value::Object(ref mut map) = value {
-        let unknown = unrecognized_settings_keys(map);
-        match policy {
-            UnknownKeyPolicy::Reject => {
-                if !unknown.is_empty() {
-                    return Err(unknown_top_level_key_error(&unknown));
-                }
-            }
-            UnknownKeyPolicy::Warn => {
-                for key in &unknown {
-                    tracing::warn!("Unrecognised key '{key}' in Aether settings; ignoring it");
-                }
-                for key in &unknown {
-                    map.remove(key);
-                }
-            }
-        }
+fn merge_field<T>(current: &mut Option<T>, next: Option<T>) {
+    if next.is_some() {
+        *current = next;
     }
-
-    serde_json::from_value(value).map_err(|e| SettingsError::ParseError(e.to_string()))
-}
-
-/// The parse error for a document that names top-level keys [`AetherSettings`]
-/// does not declare. The message names every offending key so the operator can
-/// see which one to fix.
-fn unknown_top_level_key_error(keys: &[String]) -> SettingsError {
-    let named = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
-    let label = if keys.len() == 1 { "key" } else { "keys" };
-    SettingsError::ParseError(format!(
-        "unknown top-level {label} in Aether settings: {named} (known keys: {})",
-        KNOWN_TOP_LEVEL_KEYS.join(", ")
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{agent_config, agent_json, agent_json_with, home, project, settings_agent};
+    use crate::testing::{
+        agent_config, agent_json, agent_json_with, has_prompt_file, home, mcp_json, project, settings_agent,
+        settings_with_mcps,
+    };
     use crate::{AgentCatalog, McpFileSpec, McpSourceSpec, PromptSource};
-    use aether_core::agent_spec::McpConfigSource;
-    use aether_core::core::Prompt;
-    use aether_core::mcp::tool_output::DEFAULT_MAX_BYTES;
+    use aether_core::mcp::McpConfig;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -794,30 +429,26 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)]
     fn parses_telemetry_camel_case_and_http_protobuf() {
-        let config = AetherSettings::try_from(
-            json!({
-                "telemetry": {
-                    "serviceName": "aether-test",
-                    "sampleRatio": 0.5,
-                    "content": {
-                        "systemInstructions": true,
-                        "inputMessages": true,
-                        "outputMessages": false,
-                        "toolDefinitions": true,
-                        "toolCalls": true
-                    },
-                    "traces": { "enabled": true },
-                    "metrics": { "enabled": false },
-                    "otlp": {
-                        "endpoint": "http://localhost:4318",
-                        "headers": { "authorization": "Bearer token" }
-                    }
+        let config = serde_json::from_value::<AetherSettings>(json!({
+            "telemetry": {
+                "serviceName": "aether-test",
+                "sampleRatio": 0.5,
+                "content": {
+                    "systemInstructions": true,
+                    "inputMessages": true,
+                    "outputMessages": false,
+                    "toolDefinitions": true,
+                    "toolCalls": true
                 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
+                "traces": { "enabled": true },
+                "metrics": { "enabled": false },
+                "otlp": {
+                    "endpoint": "http://localhost:4318",
+                    "headers": { "authorization": "Bearer token" }
+                }
+            },
+            "agents": [agent_json("alpha", "Alpha")]
+        }))
         .unwrap();
 
         let telemetry = config.telemetry.as_ref().unwrap();
@@ -836,14 +467,10 @@ mod tests {
 
     #[test]
     fn telemetry_with_no_enabled_signals_does_not_require_endpoint() {
-        let config = AetherSettings::try_from(
-            json!({
-                "telemetry": { "traces": { "enabled": false }, "metrics": { "enabled": false } },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
+        let config = serde_json::from_value::<AetherSettings>(json!({
+            "telemetry": { "traces": { "enabled": false }, "metrics": { "enabled": false } },
+            "agents": [agent_json("alpha", "Alpha")]
+        }))
         .unwrap();
 
         assert!(!config.telemetry.unwrap().effective_enabled());
@@ -968,12 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_resource_root_uses_project_root_for_aether_dir_settings() {
-        assert_eq!(settings_resource_root(Path::new("/repo/.aether/settings.json")), PathBuf::from("/repo"));
-        assert_eq!(settings_resource_root(Path::new("/repo/config/settings.json")), PathBuf::from("/repo/config"));
-    }
-
-    #[test]
     fn project_settings_exist_checks_project_settings_file() {
         let project = project();
         assert!(!project_settings_exist(project.root()));
@@ -1066,8 +687,9 @@ mod tests {
     #[test]
     fn load_default_merges_user_and_project_settings_with_project_winning() {
         let project = project();
-        let home = home().settings(
-            &json!({
+        let home = home().file(
+            ".aether/settings.json",
+            json!({
                 "agent": "shared",
                 "prompts": ["USER.md"],
                 "agents": [agent_json("shared", "User shared"), agent_json("user-only", "User only")]
@@ -1076,7 +698,7 @@ mod tests {
         );
         project.write(
             ".aether/settings.json",
-            &json!({
+            json!({
                 "agent": "project-only",
                 "prompts": ["PROJECT.md"],
                 "agents": [agent_json("shared", "Project shared"), agent_json("project-only", "Project only")]
@@ -1084,7 +706,7 @@ mod tests {
             .to_string(),
         );
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
         assert_eq!(
             config,
@@ -1104,9 +726,10 @@ mod tests {
     #[test]
     fn load_default_uses_user_settings_when_project_settings_are_missing() {
         let project = project();
-        let home = home().settings(&json!({ "agents": [agent_json("user-only", "User only")] }).to_string());
+        let home = home()
+            .file(".aether/settings.json", json!({ "agents": [agent_json("user-only", "User only")] }).to_string());
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
         assert_eq!(
             config,
@@ -1119,9 +742,10 @@ mod tests {
         let project = project();
         let home = home()
             .file(".aether/agents/user.md", "User instructions")
-            .file(".aether/mcp/user.json", r#"{"servers":{}}"#)
-            .settings(
-                &json!({
+            .file(".aether/mcp/user.json", mcp_json("user"))
+            .file(
+                ".aether/settings.json",
+                json!({
                     "agents": [agent_json_with(
                         "user-only",
                         "User only",
@@ -1131,20 +755,13 @@ mod tests {
                 .to_string(),
             );
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
         let catalog = AgentCatalog::from_settings(project.root(), config).unwrap();
         let spec = catalog.resolve("user-only").unwrap();
 
-        let expected_prompt = aether_home.join("agents/user.md");
-        assert!(spec.prompts.iter().any(|prompt| match prompt {
-            Prompt::File { path, .. } => path == &expected_prompt,
-            Prompt::Text(_) | Prompt::McpInstructions(_) => false,
-        }));
-        assert!(matches!(
-            &spec.mcp_config_sources[0],
-            McpConfigSource::File { path, defer_tools: false } if path == &aether_home.join("mcp/user.json")
-        ));
+        assert!(has_prompt_file(&spec, aether_home.join("agents/user.md")));
+        assert_eq!(spec.mcp.servers.keys().collect::<Vec<_>>(), ["user"]);
     }
 
     #[test]
@@ -1152,10 +769,10 @@ mod tests {
         let home = home();
         let project = project().file(
             ".aether/settings.json",
-            &json!({ "agents": [agent_json("project-only", "Project only")] }).to_string(),
+            json!({ "agents": [agent_json("project-only", "Project only")] }).to_string(),
         );
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
 
         assert_eq!(
@@ -1171,7 +788,7 @@ mod tests {
     fn load_default_returns_default_when_user_and_project_settings_are_missing() {
         let project = project();
         let home = home();
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
         assert_eq!(config, AetherSettings::default());
     }
@@ -1179,8 +796,8 @@ mod tests {
     #[test]
     fn load_default_rejects_malformed_user_settings() {
         let project = project();
-        let home = home().settings("{not-json");
-        let aether_home = home.aether();
+        let home = home().file(".aether/settings.json", "{not-json");
+        let aether_home = home.path(".aether");
         let err = load_default_from_home(project.root(), &aether_home).unwrap_err();
         assert!(matches!(err, SettingsError::ParseError(_)));
     }
@@ -1231,9 +848,9 @@ mod tests {
 
         assert_eq!(settings.prompts, vec![PromptSource::Text { text: "Be helpful".to_string() }]);
         assert_eq!(settings.agents[0].prompts, vec![PromptSource::Text { text: "Edit carefully".to_string() }]);
-        assert!(matches!(&settings.mcps[0], McpSourceSpec::Inline { servers } if servers.contains_key("coding")));
+        assert!(matches!(&settings.mcps[0], McpSourceSpec::Inline(config) if config.servers.contains_key("coding")));
         assert!(
-            matches!(&settings.agents[0].mcps[0], McpSourceSpec::Inline { servers } if servers.contains_key("coding"))
+            matches!(&settings.agents[0].mcps[0], McpSourceSpec::Inline(config) if config.servers.contains_key("coding"))
         );
 
         let serialized = serde_json::to_string(&settings).unwrap();
@@ -1252,8 +869,8 @@ mod tests {
 
         settings.inline_resources(project.root()).unwrap();
 
-        assert!(settings.prompts.is_empty());
-        assert!(settings.mcps.is_empty());
+        assert_eq!(settings.prompts.len(), 0);
+        assert_eq!(settings.mcps.len(), 0);
     }
 
     #[test]
@@ -1270,35 +887,12 @@ mod tests {
     }
 
     #[test]
-    fn resolves_inline_mcp_config() {
-        let dir = project().file("PROMPT.md", "Be helpful");
-        let config = AetherSettings {
-            agent: None,
-            agents: vec![AgentConfig {
-                mcps: vec![McpSourceSpec::Inline { servers: BTreeMap::new() }],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
-
-        let catalog = AgentCatalog::from_settings(dir.root(), config).unwrap();
-        let spec = catalog.resolve("alpha").unwrap();
-
-        assert_eq!(spec.mcp_config_sources.len(), 1);
-        assert!(matches!(spec.mcp_config_sources[0], McpConfigSource::Inline(_)));
-    }
-
-    #[test]
     fn parses_top_level_prompt_and_mcp_defaults() {
-        let config = AetherSettings::try_from(
-            json!({
-                "prompts": [{ "type": "file", "path": "BASE.md" }],
-                "mcps": [{ "type": "file", "path": "mcp.json" }],
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
+        let config = serde_json::from_value::<AetherSettings>(json!({
+            "prompts": [{ "type": "file", "path": "BASE.md" }],
+            "mcps": [{ "type": "file", "path": "mcp.json" }],
+            "agents": [agent_json("alpha", "Alpha")]
+        }))
         .unwrap();
 
         assert_eq!(
@@ -1314,19 +908,15 @@ mod tests {
 
     #[test]
     fn parses_and_serializes_string_shorthand_for_file_sources() {
-        let config = AetherSettings::try_from(
-            json!({
-                "prompts": ["BASE.md"],
-                "mcps": ["mcp.json"],
-                "agents": [agent_json_with(
-                    "alpha",
-                    "Alpha",
-                    json!({ "prompts": ["AGENT.md"], "mcps": ["agent-mcp.json"] }),
-                )]
-            })
-            .to_string()
-            .as_str(),
-        )
+        let config = serde_json::from_value::<AetherSettings>(json!({
+            "prompts": ["BASE.md"],
+            "mcps": ["mcp.json"],
+            "agents": [agent_json_with(
+                "alpha",
+                "Alpha",
+                json!({ "prompts": ["AGENT.md"], "mcps": ["agent-mcp.json"] }),
+            )]
+        }))
         .unwrap();
 
         assert_eq!(
@@ -1351,14 +941,6 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_legacy_proxy_mcp_file_as_deferred() {
-        let source: McpSourceSpec =
-            serde_json::from_value(serde_json::json!({"type":"file", "path":"mcp.json", "proxy":true})).unwrap();
-
-        assert!(matches!(source, McpSourceSpec::File(McpFileSpec { defer_tools: true, .. })));
-    }
-
-    #[test]
     fn serializes_deferred_mcp_file_as_typed_object() {
         let source: McpSourceSpec = McpFileSpec::new("mcp.json").defer_tools().into();
 
@@ -1368,173 +950,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_key_warns_and_still_loads() {
-        let value = json!({
-            "mcpServers": ["mcp.json"],
-            "typoField": 42,
-            "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
-        });
-
-        let unknown = {
-            let parsed: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_value(value.clone()).expect("object parses");
-            unrecognized_settings_keys(&parsed)
-        };
-        assert_eq!(unknown, vec!["mcpServers".to_string(), "typoField".to_string()]);
-
-        let observed = capture_warnings(|| {
-            AetherSettings::load_with_policy(
-                Path::new("/project"),
-                [AetherSettingsSource::Json(value.to_string())],
-                UnknownKeyPolicy::Warn,
-            )
-            .expect("unknown keys are warned, not rejected");
-        });
-        assert_eq!(observed.len(), 2, "one warning per unknown key: {observed:?}");
-        assert!(observed.iter().any(|line| line.contains("'mcpServers'")), "{observed:?}");
-        assert!(observed.iter().any(|line| line.contains("'typoField'")), "{observed:?}");
-    }
-
-    #[test]
-    fn valid_config_warns_nothing() {
-        let value = json!({
-            "agent": "alpha",
-            "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
-        });
-        let parsed: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(value.clone()).expect("object parses");
-        assert!(unrecognized_settings_keys(&parsed).is_empty());
-
-        let observed = capture_warnings(|| {
-            AetherSettings::try_from(value.to_string().as_str()).expect("valid config parses");
-        });
-        assert!(observed.is_empty(), "valid config should not warn: {observed:?}");
-    }
-
-    #[test]
-    fn warn_policy_ignores_unknown_top_level_key_in_the_project_settings() {
-        let project = project();
-        project.write(
-            ".aether/settings.json",
-            &json!({
-                "totallyMadeUp": true,
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string(),
-        );
-
-        let home = home();
-        let aether_home = home.aether();
-        let config = load_default_from_home_with_policy(project.root(), &aether_home, UnknownKeyPolicy::Warn)
-            .expect("an unknown key is warned, not rejected");
-        assert_eq!(config.agents.len(), 1);
-        assert_eq!(config.agents[0].name, "alpha");
-    }
-
-    #[test]
-    fn known_top_level_keys_match_schema() {
-        use schemars::schema_for;
-        let schema = schema_for!(AetherSettings);
-        let mut schema_keys: Vec<String> = schema
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .expect("schema has a properties object")
-            .keys()
-            .cloned()
-            .collect();
-        schema_keys.sort();
-        let mut const_keys: Vec<String> = KNOWN_TOP_LEVEL_KEYS.iter().map(ToString::to_string).collect();
-        const_keys.sort();
-        assert_eq!(
-            const_keys, schema_keys,
-            "KNOWN_TOP_LEVEL_KEYS drifted from the AetherSettings schema; keep them in lock-step so unknown-key detection never silently drops a real field"
-        );
-    }
-
-    fn capture_warnings<F: FnOnce()>(body: F) -> Vec<String> {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-
-        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("capture mutex poisoned").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let make_writer = {
-            let buf = Arc::clone(&buf);
-            move || CaptureWriter(Arc::clone(&buf))
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, body);
-
-        String::from_utf8(buf.lock().expect("capture mutex poisoned").clone())
-            .expect("warning output is utf-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[test]
-    fn rejects_unknown_top_level_field_and_names_it() {
+    fn rejects_old_top_level_mcp_servers_field() {
         let err = AetherSettings::try_from(
             json!({
-                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))],
-                "completelyMadeUpKey": 42
+                "mcpServers": ["mcp.json"],
+                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))]
             })
             .to_string()
             .as_str(),
         )
         .unwrap_err();
 
-        match &err {
-            SettingsError::ParseError(message) => assert!(
-                message.contains("completelyMadeUpKey"),
-                "expected the unknown key name in the parse error, got: {message}"
-            ),
-            _ => panic!("expected SettingsError::ParseError, got: {err}"),
-        }
-    }
-
-    #[test]
-    fn load_default_rejects_unknown_top_level_field_and_names_it() {
-        let project = project().file(
-            ".aether/settings.json",
-            &json!({
-                "agents": [agent_json_with("alpha", "Alpha", json!({ "prompts": ["PROMPT.md"] }))],
-                "mysteryToggle": true
-            })
-            .to_string(),
-        );
-
-        let err = AetherSettings::load_default(project.root()).unwrap_err();
-
-        match &err {
-            SettingsError::ParseError(message) => assert!(
-                message.contains("mysteryToggle"),
-                "load_default must surface the offending key, got: {message}"
-            ),
-            _ => panic!("expected SettingsError::ParseError, got: {err}"),
-        }
+        assert!(matches!(err, SettingsError::ParseError(message) if message.contains("mcpServers")));
     }
 
     #[test]
     fn load_default_resolves_workspace_scoped_user_prompt_and_mcp_paths() {
-        let project = project().file("AGENTS.md", "Agent instructions").file(".aether/mcp.json", r#"{"servers":{}}"#);
-        let home = home().file(".aether/agents/planner/SYSTEM.md", "System instructions").settings(
-            &json!({
+        let project = project().file("AGENTS.md", "Agent instructions").file(".aether/mcp.json", mcp_json("project"));
+        let home = home().file(".aether/agents/planner/SYSTEM.md", "System instructions").file(
+            ".aether/settings.json",
+            json!({
                 "agents": [agent_json_with(
                     "planner",
                     "Plans work",
@@ -1550,32 +985,21 @@ mod tests {
             .to_string(),
         );
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let config = load_default_from_home(project.root(), &aether_home).unwrap();
         let catalog = AgentCatalog::from_settings(project.root(), config).unwrap();
         let spec = catalog.resolve("planner").unwrap();
 
-        let expected_system = aether_home.join("agents/planner/SYSTEM.md");
-        let expected_agents = project.root().join("AGENTS.md");
-        assert!(spec.prompts.iter().any(|p| match p {
-            Prompt::File { path, .. } => path == &expected_system,
-            _ => false,
-        }));
-        assert!(spec.prompts.iter().any(|p| match p {
-            Prompt::File { path, .. } => path == &expected_agents,
-            _ => false,
-        }));
-        assert!(matches!(
-            &spec.mcp_config_sources[0],
-            McpConfigSource::File { path, defer_tools: false } if *path == project.root().join(".aether/mcp.json")
-        ));
+        assert!(has_prompt_file(&spec, aether_home.join("agents/planner/SYSTEM.md")));
+        assert!(has_prompt_file(&spec, project.root().join("AGENTS.md")));
+        assert_eq!(spec.mcp.servers.keys().collect::<Vec<_>>(), ["project"]);
     }
 
     #[test]
     fn workspace_scoped_paths_expand_in_project_settings_without_absolutizing_normal_relative_paths() {
         let project = project().file("PROJECT.md", "Project prompt").file("AGENTS.md", "Agent prompt").file(
             ".aether/settings.json",
-            &json!({
+            json!({
                 "agents": [agent_json_with(
                     "alpha",
                     "Alpha",
@@ -1627,91 +1051,41 @@ mod tests {
     }
 
     #[test]
-    fn optional_workspace_scoped_mcp_source_is_skipped_when_missing() {
-        let project = project().file("BASE.md", "Base instructions");
-        let config = AetherSettings {
-            agents: vec![AgentConfig {
-                prompts: vec![PromptSource::file("BASE.md")],
-                mcps: vec![McpFileSpec::new("${WORKSPACE}/.aether/mcp.json").optional().into()],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
+    fn mcp_sources_without_loadable_servers_resolve_to_no_servers() {
+        let project = project().file("PROMPT.md", "Be helpful");
+        let sources: [McpSourceSpec; 3] = [
+            McpSourceSpec::Inline(McpConfig::default()),
+            McpFileSpec::new("${WORKSPACE}/.aether/mcp.json").optional().into(),
+            McpFileSpec::new("${DEFINITELY_NOT_SET_VAR_MCP_OPTIONAL}/mcp.json").optional().into(),
+        ];
 
-        let config = AetherSettings::load(project.root(), [AetherSettingsSource::Value(Box::new(config))]).unwrap();
-        let catalog = AgentCatalog::from_settings(project.root(), config).unwrap();
-        let spec = catalog.resolve("alpha").unwrap();
-
-        assert!(spec.mcp_config_sources.is_empty());
+        for source in sources {
+            let catalog =
+                AgentCatalog::from_settings(project.root(), settings_with_mcps(vec![source.clone()])).unwrap();
+            assert!(catalog.resolve("alpha").unwrap().mcp.is_empty(), "{source:?}");
+        }
     }
 
     #[test]
-    fn optional_mcp_source_skips_unresolved_variable() {
-        let project = project().file("BASE.md", "Base instructions");
-        let config = AetherSettings {
-            agents: vec![AgentConfig {
-                prompts: vec![PromptSource::file("BASE.md")],
-                mcps: vec![McpFileSpec::new("${DEFINITELY_NOT_SET_VAR_MCP_OPTIONAL}/mcp.json").optional().into()],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
+    fn required_mcp_sources_that_cannot_load_error() {
+        let project = project().file("PROMPT.md", "Be helpful");
+        let error = |source| AgentCatalog::from_settings(project.root(), settings_with_mcps(vec![source])).unwrap_err();
 
-        let config = AetherSettings::load(project.root(), [AetherSettingsSource::Value(Box::new(config))]).unwrap();
-        let catalog = AgentCatalog::from_settings(project.root(), config).unwrap();
-        let spec = catalog.resolve("alpha").unwrap();
-
-        assert!(spec.mcp_config_sources.is_empty());
-    }
-
-    #[test]
-    fn required_mcp_source_errors_on_unresolved_variable() {
-        let project = project().file("BASE.md", "Base instructions");
-        let config = AetherSettings {
-            agents: vec![AgentConfig {
-                prompts: vec![PromptSource::file("BASE.md")],
-                mcps: vec![McpSourceSpec::file("${DEFINITELY_NOT_SET_VAR_MCP_REQ}/mcp.json")],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
-
-        let err = AgentCatalog::from_settings(project.root(), config).unwrap_err();
-        assert!(matches!(err, SettingsError::UnresolvedMcpConfigVariable { .. }));
-    }
-
-    #[test]
-    fn required_workspace_scoped_mcp_source_errors_when_missing() {
-        let project = project().file("BASE.md", "Base instructions");
-        let config = AetherSettings {
-            agents: vec![AgentConfig {
-                prompts: vec![PromptSource::file("BASE.md")],
-                mcps: vec![McpSourceSpec::file("nonexistent.json")],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
-
-        let err = AgentCatalog::from_settings(project.root(), config).unwrap_err();
-        assert!(matches!(err, SettingsError::InvalidMcpConfigPath { .. }));
+        assert!(matches!(
+            error(McpSourceSpec::file("${DEFINITELY_NOT_SET_VAR_MCP_REQ}/mcp.json")),
+            SettingsError::UnresolvedMcpConfigVariable { .. }
+        ));
+        assert!(matches!(error(McpSourceSpec::file("nonexistent.json")), SettingsError::InvalidMcpConfigPath { .. }));
     }
 
     #[test]
     fn optional_existing_mcp_source_preserves_defer_tools_flag() {
-        let project = project().file("BASE.md", "Base instructions").file("mcp.json", r#"{"servers":{}}"#);
-        let config = AetherSettings {
-            agents: vec![AgentConfig {
-                prompts: vec![PromptSource::file("BASE.md")],
-                mcps: vec![McpFileSpec::new("mcp.json").defer_tools().optional().into()],
-                ..agent_config("alpha")
-            }],
-            ..AetherSettings::default()
-        };
+        let project = project().file("PROMPT.md", "Be helpful").file("mcp.json", mcp_json("lazy"));
+        let settings = settings_with_mcps(vec![McpFileSpec::new("mcp.json").defer_tools().optional().into()]);
 
-        let catalog = AgentCatalog::from_settings(project.root(), config).unwrap();
-        let spec = catalog.resolve("alpha").unwrap();
+        let spec = AgentCatalog::from_settings(project.root(), settings).unwrap().resolve("alpha").unwrap();
 
-        assert!(matches!(&spec.mcp_config_sources[0], McpConfigSource::File { defer_tools: true, .. }));
+        assert!(spec.mcp.servers["lazy"].defer_tools().defers_tools());
     }
 
     #[test]
@@ -1719,13 +1093,6 @@ mod tests {
         let source: McpSourceSpec = McpFileSpec::new("${WORKSPACE}/.aether/mcp.json").optional().into();
         let value = serde_json::to_value(source).unwrap();
         assert_eq!(value, serde_json::json!({"type":"file", "path":"${WORKSPACE}/.aether/mcp.json", "optional":true}));
-    }
-
-    #[test]
-    fn optional_prompt_source_serializes_as_typed_object() {
-        let source = PromptSource::file("${WORKSPACE}/AGENTS.md").optional();
-        let value = serde_json::to_value(&source).unwrap();
-        assert_eq!(value, serde_json::json!({"type":"file", "path":"${WORKSPACE}/AGENTS.md", "optional":true}));
     }
 
     #[test]
@@ -1762,12 +1129,10 @@ mod tests {
                     ]
                 }),
             )]
-        })
-        .to_string();
+        });
 
-        let settings = AetherSettings::try_from(original.as_str()).unwrap();
-        let reserialized = serde_json::to_string(&settings).unwrap();
-        let reparsed = AetherSettings::try_from(reserialized.as_str()).unwrap();
+        let settings: AetherSettings = serde_json::from_value(original).unwrap();
+        let reparsed: AetherSettings = serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
 
         assert_eq!(settings, reparsed, "settings should round-trip losslessly through serde");
     }
@@ -1775,8 +1140,9 @@ mod tests {
     #[test]
     fn user_settings_relative_paths_absolutize_at_load_but_workspace_token_is_preserved() {
         let project = project().file("AGENTS.md", "agents");
-        let home = home().file(".aether/agents/planner/SYSTEM.md", "system").settings(
-            &json!({
+        let home = home().file(".aether/agents/planner/SYSTEM.md", "system").file(
+            ".aether/settings.json",
+            json!({
                 "agents": [agent_json_with(
                     "planner",
                     "Plans",
@@ -1786,7 +1152,7 @@ mod tests {
             .to_string(),
         );
 
-        let aether_home = home.aether();
+        let aether_home = home.path(".aether");
         let settings = load_default_from_home(project.root(), &aether_home).unwrap();
 
         let expected_user = aether_home.join("agents/planner/SYSTEM.md").to_string_lossy().to_string();
@@ -1798,49 +1164,29 @@ mod tests {
     }
 
     fn load_default_from_home(project_root: &Path, aether_home: &Path) -> Result<AetherSettings, SettingsError> {
-        load_default_from_home_with_policy(project_root, aether_home, UnknownKeyPolicy::Reject)
-    }
-
-    fn load_default_from_home_with_policy(
-        project_root: &Path,
-        aether_home: &Path,
-        policy: UnknownKeyPolicy,
-    ) -> Result<AetherSettings, SettingsError> {
-        AetherSettings::load_with_policy(
-            project_root,
-            default_sources_for_home(project_root, Some(aether_home)),
-            policy,
-        )
+        AetherSettings::load(project_root, default_sources_for_home(project_root, Some(aether_home)))
     }
 
     #[test]
-    fn parses_credentials_store_keyring() {
-        let config = AetherSettings::try_from(
-            json!({
-                "credentialsStore": { "type": "keyring" },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
+    fn parses_credentials_store_variants() {
+        let encrypted_file = CredentialsStoreConfig::EncryptedFile {
+            path: Some(PathBuf::from("/custom/creds.enc")),
+            password_env: Some("MY_SECRET".to_string()),
+        };
+        let cases = [
+            (json!({ "type": "keyring" }), CredentialsStoreConfig::Keyring),
+            (json!({ "type": "memory" }), CredentialsStoreConfig::Memory),
+            (
+                json!({ "type": "encryptedFile", "path": "/custom/creds.enc", "passwordEnv": "MY_SECRET" }),
+                encrypted_file,
+            ),
+        ];
 
-        assert_eq!(config.credentials_store, Some(CredentialsStoreConfig::Keyring));
-    }
-
-    #[test]
-    fn parses_credentials_store_memory() {
-        let config = AetherSettings::try_from(
-            json!({
-                "credentialsStore": { "type": "memory" },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        assert_eq!(config.credentials_store, Some(CredentialsStoreConfig::Memory));
+        for (store, expected) in cases {
+            let config: AetherSettings =
+                serde_json::from_value(json!({ "credentialsStore": store, "agents": [] })).unwrap();
+            assert_eq!(config.credentials_store, Some(expected));
+        }
     }
 
     #[test]
@@ -1876,493 +1222,5 @@ mod tests {
             settings.resolved_headers(&Vars::new().with_env_lookup(|_| None)),
             Err(VarError::NotFound(variable)) if variable == "POSTHOG_PROJECT_TOKEN"
         ));
-    }
-
-    #[test]
-    fn parses_credentials_store_encrypted_file_with_options() {
-        let config = AetherSettings::try_from(
-            json!({
-                "credentialsStore": {
-                    "type": "encryptedFile",
-                    "path": "/custom/creds.enc",
-                    "passwordEnv": "MY_SECRET"
-                },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            &config.credentials_store,
-            Some(CredentialsStoreConfig::EncryptedFile { path, password_env })
-            if path == &Some(PathBuf::from("/custom/creds.enc"))
-                && password_env == &Some("MY_SECRET".to_string())
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_tool_output_settings() {
-        let config = AetherSettings::try_from(
-            json!({
-                "toolOutput": { "maxBytes": 4096, "outputDir": "/tmp/aether-tool-out" },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        let tool_output = config.tool_output.expect("tool output parsed");
-        assert_eq!(tool_output.max_bytes, Some(4096));
-        assert_eq!(tool_output.output_dir, Some(PathBuf::from("/tmp/aether-tool-out")));
-    }
-
-    #[test]
-    fn parses_partial_tool_output_settings() {
-        // Only one field set; the other inherits from lower layers.
-        let config = AetherSettings::try_from(
-            json!({
-                "toolOutput": { "maxBytes": 0 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        let tool_output = config.tool_output.expect("tool output parsed");
-        assert_eq!(tool_output.max_bytes, Some(0));
-        assert!(tool_output.output_dir.is_none());
-    }
-
-    #[test]
-    fn tool_output_settings_merge_overrides_per_field() {
-        let mut base = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/base")) };
-        base.merge(ToolOutputSettings { max_bytes: Some(0), output_dir: None });
-        // max_bytes from the next layer wins, output_dir keeps the base value.
-        assert_eq!(base.max_bytes, Some(0));
-        assert_eq!(base.output_dir, Some(PathBuf::from("/from/base")));
-    }
-
-    #[test]
-    fn tool_output_settings_resolved_max_bytes_uses_default() {
-        let settings = ToolOutputSettings::default();
-        assert_eq!(settings.resolved_max_bytes(), DEFAULT_MAX_BYTES);
-    }
-
-    #[test]
-    fn tool_output_settings_resolved_output_dir_uses_default() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings::default();
-        assert_eq!(settings.resolved_output_dir(project), PathBuf::from("/repo/.prairie/out"));
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_uses_defaults() {
-        let project = Path::new("/repo");
-        let cap = resolve_tool_output_cap(project, None, None, None, None);
-        assert_eq!(cap.max_bytes(), DEFAULT_MAX_BYTES);
-        assert_eq!(cap.output_dir(), Path::new("/repo/.prairie/out"));
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_top_level_overrides_default() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let cap = resolve_tool_output_cap(project, Some(&settings), None, None, None);
-        assert_eq!(cap.max_bytes(), 4096);
-        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_agent_overrides_top_level() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let agent = ToolOutputSettings { max_bytes: Some(0), output_dir: Some(PathBuf::from("/from/agent")) };
-        let cap = resolve_tool_output_cap(project, Some(&settings), Some(&agent), None, None);
-        // Per-agent wins on every field it sets; the unset field
-        // (output_dir) is also overridden because the agent sets it.
-        assert_eq!(cap.max_bytes(), 0);
-        assert_eq!(cap.output_dir(), Path::new("/from/agent"));
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_agent_partial_override_inherits_rest() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let agent = ToolOutputSettings { max_bytes: Some(0), output_dir: None };
-        let cap = resolve_tool_output_cap(project, Some(&settings), Some(&agent), None, None);
-        assert_eq!(cap.max_bytes(), 0, "agent override wins for max_bytes");
-        assert_eq!(cap.output_dir(), Path::new("/from/settings"), "inherits from top-level");
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_env_wins_for_max_bytes() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let cap = resolve_tool_output_cap(project, Some(&settings), None, Some(8192), None);
-        assert_eq!(cap.max_bytes(), 8192, "env wins over settings for max_bytes");
-        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_env_wins_for_output_dir() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let cap = resolve_tool_output_cap(project, Some(&settings), None, None, Some(PathBuf::from("/from/env")));
-        assert_eq!(cap.max_bytes(), 4096);
-        assert_eq!(cap.output_dir(), Path::new("/from/env"), "env wins over settings for output_dir");
-    }
-
-    #[test]
-    fn resolve_tool_output_cap_env_zero_disables() {
-        let project = Path::new("/repo");
-        let settings = ToolOutputSettings { max_bytes: Some(4096), output_dir: Some(PathBuf::from("/from/settings")) };
-        let cap = resolve_tool_output_cap(project, Some(&settings), None, Some(0), None);
-        assert_eq!(cap.max_bytes(), 0, "env 0 disables the cap");
-        assert_eq!(cap.output_dir(), Path::new("/from/settings"));
-    }
-
-    #[test]
-    fn tool_output_settings_round_trip() {
-        // Both the JSON value and the typed value must produce equal settings
-        // for every legal combination so the public API can be used as the
-        // single source of truth.
-        let value = json!({
-            "maxBytes": 4096,
-            "outputDir": "/tmp/round-trip"
-        });
-        let parsed: ToolOutputSettings = serde_json::from_value(value.clone()).unwrap();
-        let serialized = serde_json::to_value(&parsed).unwrap();
-        assert_eq!(serialized, value);
-    }
-
-    #[test]
-    fn parses_run_provider_stall_warn_seconds() {
-        let config = AetherSettings::try_from(
-            json!({
-                "run": { "providerStallWarnSeconds": 5 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        let run = config.run.expect("run block parsed");
-        assert_eq!(run.provider_stall_warn_seconds, Some(5));
-        assert_eq!(run.provider_stall_warn(), Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn run_settings_absent_or_zero_disables_warning() {
-        // Absent: no warning.
-        let absent =
-            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
-        assert!(absent.run.is_none());
-        assert!(absent.run.as_ref().and_then(RunSettings::provider_stall_warn).is_none());
-
-        // Explicit 0 disables the warning, matching the "off" contract.
-        let zero = AetherSettings::try_from(
-            json!({
-                "run": { "providerStallWarnSeconds": 0 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-        assert_eq!(zero.run.unwrap().provider_stall_warn(), None);
-    }
-
-    #[test]
-    fn run_settings_overlay_overrides_base_value() {
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "providerStallWarnSeconds": 30 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "providerStallWarnSeconds": 5 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-            ],
-        )
-        .unwrap();
-
-        // Overlay wins for the only field, so each layer can tighten the
-        // warning without losing the merge surface to lower layers.
-        assert_eq!(config.run.unwrap().provider_stall_warn(), Some(Duration::from_secs(5)),);
-    }
-
-    #[test]
-    fn run_settings_merge_inherits_unspecified_field() {
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "providerStallWarnSeconds": 30 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.run.unwrap().provider_stall_warn(),
-            Some(Duration::from_secs(30)),
-            "empty overlay must inherit the base threshold",
-        );
-    }
-
-    #[test]
-    fn parses_run_heartbeat_seconds() {
-        // TASK-26-111: the interval is a config key (`run.heartbeatSeconds`).
-        // The camelCase rename lets the JSON match the existing settings-file
-        // convention while the Rust field stays snake_case.
-        let config = AetherSettings::try_from(
-            json!({
-                "run": { "heartbeatSeconds": 5 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        let run = config.run.expect("run block parsed");
-        assert_eq!(run.heartbeat_seconds, Some(5));
-        assert_eq!(run.heartbeat_interval(), Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn run_heartbeat_defaults_when_unset() {
-        // No `heartbeatSeconds` and no `run` block: the resolver still picks
-        // up the 30 s default so a wholly-absent `run` block emits a heartbeat
-        // out of the box.
-        let absent =
-            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
-        assert!(absent.run.is_none());
-        assert_eq!(
-            RunSettings::default().heartbeat_interval(),
-            Some(Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS)),
-            "the default interval is exposed as a constant and the resolver uses it",
-        );
-        assert_eq!(
-            RunSettings::default_heartbeat_interval(),
-            Some(Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS)),
-            "default_heartbeat_interval mirrors RunSettings::default().heartbeat_interval",
-        );
-    }
-
-    #[test]
-    fn run_heartbeat_zero_disables() {
-        // `0` is the explicit off switch; the resolver returns `None` so the
-        // CLI's `RunConfig` skips the heartbeat path.
-        let zero = AetherSettings::try_from(
-            json!({
-                "run": { "heartbeatSeconds": 0 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-        assert_eq!(zero.run.unwrap().heartbeat_interval(), None);
-    }
-
-    #[test]
-    fn run_heartbeat_overlay_overrides_base_value() {
-        // Explicit overlay value wins over the base layer so a project file
-        // can tighten the interval without losing the merge surface to lower
-        // layers. The same merge path is used for `providerStallWarnSeconds`
-        // (TASK-24-378), so a regression here would show up there too.
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "heartbeatSeconds": 60 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "heartbeatSeconds": 5 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.run.unwrap().heartbeat_interval(), Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn run_heartbeat_overlay_zero_disables_over_nonzero_base() {
-        // A non-zero base is overwritten by an explicit `0` overlay so the
-        // "zero disables" rule survives merging — a regression that left the
-        // base value in place would silently keep heartbeating after the
-        // caller opted out.
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "heartbeatSeconds": 60 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "heartbeatSeconds": 0 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.run.unwrap().heartbeat_interval(), None);
-    }
-
-    #[test]
-    fn run_heartbeat_merge_inherits_unspecified_field() {
-        // An overlay that omits `heartbeatSeconds` inherits the base value,
-        // mirroring the existing `providerStallWarnSeconds` merge semantics.
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "heartbeatSeconds": 15 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.run.unwrap().heartbeat_interval(), Some(Duration::from_secs(15)));
-    }
-
-    #[test]
-    fn parses_run_shell_command_timeout_seconds() {
-        // TASK-26-395: per-command shell timeout lives at
-        // `run.shellCommandTimeoutSeconds`. The camelCase rename keeps the
-        // JSON spelling aligned with the settings-file convention while the
-        // Rust field stays snake_case, mirroring `providerStallWarnSeconds`
-        // and `heartbeatSeconds`.
-        let config = AetherSettings::try_from(
-            json!({
-                "run": { "shellCommandTimeoutSeconds": 1 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-
-        let run = config.run.expect("run block parsed");
-        assert_eq!(run.shell_command_timeout_seconds, Some(1));
-        assert_eq!(run.shell_command_timeout(), Some(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn run_shell_command_timeout_unset_or_zero_disables() {
-        // Absent: no timeout, default-constructed `RunSettings` resolves to
-        // `None` so callers can take the "no limit" path.
-        let absent =
-            AetherSettings::try_from(json!({ "agents": [agent_json("alpha", "Alpha")] }).to_string().as_str()).unwrap();
-        assert!(absent.run.is_none());
-        assert!(absent.run.as_ref().and_then(RunSettings::shell_command_timeout).is_none());
-        assert_eq!(RunSettings::default().shell_command_timeout(), None);
-
-        // Explicit `0` disables the limit, matching the `providerStallWarnSeconds`
-        // and `heartbeatSeconds` "zero is off" contract.
-        let zero = AetherSettings::try_from(
-            json!({
-                "run": { "shellCommandTimeoutSeconds": 0 },
-                "agents": [agent_json("alpha", "Alpha")]
-            })
-            .to_string()
-            .as_str(),
-        )
-        .unwrap();
-        assert_eq!(zero.run.unwrap().shell_command_timeout(), None);
-    }
-
-    #[test]
-    fn run_shell_command_timeout_overlay_overrides_base_value() {
-        // Explicit overlay value wins over the base layer so a project file
-        // can tighten (or relax) the limit without losing the merge surface
-        // to lower layers. The same merge path is used for the existing
-        // `run` fields, so a regression here would show up there too.
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "shellCommandTimeoutSeconds": 60 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "shellCommandTimeoutSeconds": 1 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.run.unwrap().shell_command_timeout(), Some(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn run_shell_command_timeout_merge_inherits_unspecified_field() {
-        // An overlay that omits `shellCommandTimeoutSeconds` inherits the
-        // base value, mirroring the existing `providerStallWarnSeconds` and
-        // `heartbeatSeconds` merge semantics.
-        let config = AetherSettings::load(
-            Path::new("/project"),
-            [
-                AetherSettingsSource::Json(
-                    json!({
-                        "run": { "shellCommandTimeoutSeconds": 60 },
-                        "agents": []
-                    })
-                    .to_string(),
-                ),
-                AetherSettingsSource::Json(json!({ "agents": [] }).to_string()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.run.unwrap().shell_command_timeout(), Some(Duration::from_secs(60)));
     }
 }

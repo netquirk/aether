@@ -6,7 +6,7 @@ use thiserror::Error;
 
 const FALLBACK_MODEL: &str = "anthropic:claude-sonnet-4-5";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum InitialSessionSelection {
     #[default]
     Default,
@@ -17,13 +17,27 @@ pub(crate) enum InitialSessionSelection {
     },
 }
 
-impl InitialSessionSelection {
-    pub(crate) fn agent(name: String) -> Self {
-        Self::Agent(name)
-    }
+#[derive(Debug, Error)]
+pub enum SelectionConflict {
+    #[error("an agent and a model cannot both be selected")]
+    AgentAndModel,
+    #[error("a reasoning effort requires a model")]
+    ReasoningEffortWithoutModel,
+}
 
-    pub(crate) fn model(model: String, reasoning_effort: Option<ReasoningEffort>) -> Self {
-        Self::Model { model, reasoning_effort }
+impl InitialSessionSelection {
+    pub(crate) fn from_flags(
+        agent: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, SelectionConflict> {
+        match (agent, model) {
+            (Some(_), Some(_)) => Err(SelectionConflict::AgentAndModel),
+            (_, None) if reasoning_effort.is_some() => Err(SelectionConflict::ReasoningEffortWithoutModel),
+            (Some(agent), None) => Ok(Self::Agent(agent)),
+            (None, Some(model)) => Ok(Self::Model { model, reasoning_effort }),
+            (None, None) => Ok(Self::Default),
+        }
     }
 }
 
@@ -33,7 +47,7 @@ pub(crate) struct ResolvedAgentSelection {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum AgentSelectionError {
+pub enum AgentSelectionError {
     #[error(transparent)]
     Settings(#[from] SettingsError),
     #[error("{0}")]
@@ -76,10 +90,5 @@ pub fn resolve_agent_spec(
 ) -> Result<AgentSpec, crate::error::CliError> {
     let selection =
         agent_name.map_or(InitialSessionSelection::Default, |name| InitialSessionSelection::Agent(name.to_string()));
-    resolve_agent_from_catalog(catalog.clone(), &selection).map(|resolved| resolved.spec).map_err(|error| match error {
-        AgentSelectionError::Settings(error) | AgentSelectionError::Agent(error) => {
-            crate::error::CliError::AgentError(error.to_string())
-        }
-        AgentSelectionError::Model(error) => crate::error::CliError::ModelError(error),
-    })
+    Ok(resolve_agent_from_catalog(catalog.clone(), &selection)?.spec)
 }

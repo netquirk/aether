@@ -4,39 +4,17 @@ use super::support::*;
 fn remote_resume_preserves_server_path_without_local_resolution() {
     let cwd =
         std::env::var_os("HOME").map_or_else(|| "/server".into(), std::path::PathBuf::from).join("remote-project");
-    let mut ui = TestUiBuilder::new().remote_workspace().dimensions(160, 24).build();
-    ui.deliver_result(sessions_listed(vec![acp::SessionInfo::new("saved", cwd.clone())]));
-    ui.key(key(KeyCode::Enter));
-    assert!(matches!(ui.next_agent_command(), Some(AgentCommand::ResumeSession { .. })));
-    ui.deliver_result(CommandResult::ResumeSession {
-        session_id: "saved".into(),
-        result: Ok(acp::ResumeSessionResponse::new()),
-    });
-    assert!(
-        ui.take_commands()
-            .iter()
-            .any(|command| matches!(command, Command::Agent(AgentCommand::FetchWorkspaceStatus { .. }))),
-        "remote resume fetches agent-side workspace status"
+    let mut ui = TestUiBuilder::new().session(SessionCoreConfigBuilder::remote_workspace).dimensions(160, 24).build();
+    ui.begin_resume("saved", &cwd.display().to_string());
+    ui.answer::<Resume>(Ok(acp::ResumeSessionResponse::new()));
+    assert_eq!(
+        ui.app().core().session().workspace_status().display_dir,
+        cwd.display().to_string(),
+        "remote resume shows the agent's status of the resumed session's workspace"
     );
-    ui.settle_tasks();
     ui.assert_viewport_contains(&cwd.display().to_string());
-    ui.type_text("/clear");
-    ui.key(key(KeyCode::Tab));
-    assert!(matches!(ui.next_agent_command(), Some(AgentCommand::NewSession { cwd: actual }) if actual == cwd));
-}
-
-#[test]
-fn clear_is_builtin_and_issues_new_session_command() {
-    let mut app = make_app();
-
-    app.type_text("/clear");
-    app.key(key(KeyCode::Tab));
-
-    let cmd = app.next_agent_command();
-    assert!(
-        matches!(cmd, Some(AgentCommand::NewSession { .. })),
-        "expected NewSession command after /clear, got {cmd:?}"
-    );
+    ui.run_command("/clear");
+    assert_eq!(ui.held::<NewSession>().0.cwd.0, cwd);
 }
 
 #[test]
@@ -44,298 +22,132 @@ fn clear_creates_new_session_and_resets_state() {
     let mut ui = TestUi::new();
 
     ui.submit("old message");
-    ui.next_agent_command().unwrap();
     ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
     ui.assert_viewport_contains("old message");
 
-    let old_conversation = ui.app().conversation_id();
-    ui.type_text("/clear");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    let old_conversation = ui.app().core().conversation().id();
+    ui.run_command("/clear");
 
-    ui.deliver_result(new_session_created("new-session", vec![select_option("model", "sonnet")]));
+    new_session_created(&mut ui, "new-session", vec![select_option("model", "sonnet")]);
 
-    assert_ne!(ui.app().conversation_id(), old_conversation);
-    assert!(!ui.app().conversation_items().iter().any(|item| {
+    assert_ne!(ui.app().core().conversation().id(), old_conversation);
+    assert!(!ui.app().core().conversation().items().iter().any(|item| {
         matches!(item.content(), ConversationContent::Notice(notice) if notice.text.contains("New session created"))
     }));
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(!viewport.contains("old message"), "old message should be gone after clear:\n{viewport}");
-}
-
-#[test]
-fn clear_restores_compatible_config_selections() {
-    let options = vec![select_option("model", "opus"), mode_option("code", &["code", "plan", "ask"])];
-    let mut app = TestUiBuilder::new().config_options(options).build();
-
-    app.type_text("/clear");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.acp_event(AcpEvent::SessionUpdate(Box::new(acp::UpdateSessionNotification::new(
-        "new-session",
-        acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(vec![select_option("model", "haiku")])),
-    ))));
-    app.deliver_result(new_session_created(
-        "new-session",
-        vec![select_option("model", "haiku"), mode_option("ask", &["code", "plan", "ask"])],
-    ));
-
-    let restore_cmd = app.next_agent_command().unwrap();
-    assert!(
-        matches!(&restore_cmd, AgentCommand::SetConfigOption { config_id, value, .. } if config_id == "model" && value == &acp::SessionConfigOptionValue::id("opus")),
-        "expected model restored to opus, got {restore_cmd:?}"
-    );
-}
-
-#[test]
-fn resume_is_builtin_and_lists_sessions() {
-    let mut app = make_app();
-
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-
-    let cmd = app.next_agent_command();
-    assert!(
-        matches!(cmd, Some(AgentCommand::ListSessions)),
-        "expected ListSessions command after /resume, got {cmd:?}"
-    );
+    ui.assert_viewport_not_contains("old message");
 }
 
 #[test]
 fn session_list_excludes_active_session() {
-    let mut app = make_app();
+    let mut app = TestUi::new();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![
+    app.open_session_picker(vec![
         session_info("test-session", "/tmp/current", "Current", "2025-01-01T00:00:00Z"),
         session_info("other-session", "/tmp/other", "Other", "2025-01-02T00:00:00Z"),
-    ]));
+    ]);
 
-    assert!(app.app().has_session_picker());
+    assert!(app.app().has_modal());
 }
 
 #[test]
 fn resume_loads_selected_session() {
-    let mut app = make_app();
+    let mut app = TestUi::new();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![session_info("old", "/tmp/old", "Old Session", "2025-01-01T00:00:00Z")]));
+    app.open_session_picker(vec![session_info("old", "/tmp/old", "Old Session", "2025-01-01T00:00:00Z")]);
 
     app.key(key(KeyCode::Enter));
 
-    let cmd = app.next_agent_command().unwrap();
-    assert!(
-        matches!(&cmd, AgentCommand::ResumeSession { session_id, cwd } if session_id.0.as_ref() == "old" && cwd == &std::path::PathBuf::from("/tmp/old")),
-        "expected LoadSession for old session, got {cmd:?}"
-    );
+    let (request, _) = app.held::<Resume>();
+    assert_eq!((request.session_id.0.as_ref(), request.cwd.0.as_path()), ("old", Path::new("/tmp/old")));
 }
 
 #[test]
 fn empty_session_list_shows_no_sessions() {
     let mut ui = TestUi::new();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    ui.open_session_picker(vec![]);
 
-    ui.deliver_result(sessions_listed(vec![]));
-
-    assert!(ui.app().has_session_picker());
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("No previous sessions"), "expected empty state:\n{viewport}");
+    assert!(ui.app().has_modal());
+    ui.assert_viewport_contains("No previous sessions");
 }
 
 #[test]
 fn esc_closes_session_picker() {
-    let mut app = make_app();
+    let mut app = TestUi::new();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![session_info("old", "/tmp/old", "Old", "2025-01-01T00:00:00Z")]));
-    assert!(app.app().has_session_picker());
+    app.open_session_picker(vec![session_info("old", "/tmp/old", "Old", "2025-01-01T00:00:00Z")]);
+    assert!(app.app().has_modal());
 
     app.key(key(KeyCode::Esc));
-    assert!(!app.app().has_session_picker());
-}
-
-#[test]
-fn new_session_send_failure_shows_transcript_error() {
-    let mut app = TestUiBuilder::new().build();
-
-    app.type_text("/clear");
-    app.key(key(KeyCode::Tab));
-    assert!(matches!(app.next_command(), Some(Command::Agent(AgentCommand::NewSession { .. }))));
-    app.deliver_result(CommandResult::NewSession(Err("send failed".to_string())));
-
-    let messages: Vec<_> = message_texts(&app).collect();
-    let has_error = messages.iter().any(|message| message.contains("new session") && message.contains("fail"));
-    assert!(has_error, "expected visible transcript error for new_session failure, got {messages:?}");
-
-    assert!(!app.app().exit_requested(), "app should remain interactive after new_session failure");
-}
-
-#[test]
-fn list_sessions_send_failure_shows_transcript_error() {
-    let mut app = TestUiBuilder::new().build();
-
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    assert!(matches!(app.next_command(), Some(Command::Agent(AgentCommand::ListSessions))));
-    app.deliver_result(CommandResult::SessionsListed(Err("send failed".to_string())));
-
-    let messages: Vec<_> = message_texts(&app).collect();
-    let has_error = messages.iter().any(|message| message.contains("list sessions") && message.contains("fail"));
-    assert!(has_error, "expected visible transcript error for list_sessions failure, got {messages:?}");
-
-    assert!(!app.app().exit_requested(), "app should remain interactive after list_sessions failure");
-}
-
-#[test]
-fn load_session_send_failure_cleans_up_buffer_and_shows_error() {
-    let mut app = TestUiBuilder::new().build();
-
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![session_info("old", "/tmp/old", "Old Session", "2025-01-01T00:00:00Z")]));
-    assert!(app.app().has_session_picker());
-
-    app.key(key(KeyCode::Enter));
-    assert!(matches!(app.next_command(), Some(Command::Agent(AgentCommand::ResumeSession { .. }))));
-    app.deliver_result(CommandResult::ResumeSession { session_id: "old".into(), result: Err("send failed".into()) });
-
-    let messages: Vec<_> = message_texts(&app).collect();
-    let has_error = messages.iter().any(|message| message.contains("resume session") && message.contains("fail"));
-    assert!(has_error, "expected visible transcript error for load_session failure, got {messages:?}");
-
-    assert!(!app.app().exit_requested(), "app should remain interactive after load_session failure");
-    app.submit("retry");
-    assert!(matches!(app.next_agent_command(), Some(AgentCommand::Prompt { .. })));
+    assert!(!app.app().has_modal());
 }
 
 #[test]
 fn session_preview_loaded_for_selected_session() {
-    let mut app = make_app_with_session_preview();
+    let mut app = TestUiBuilder::new().session(SessionCoreConfigBuilder::session_preview).build();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![
+    app.open_session_picker(vec![
         session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z"),
         session_info("sess-2", "/tmp/two", "Session Two", "2025-01-02T00:00:00Z"),
-    ]));
+    ]);
 
-    let preview_cmd = app.next_agent_command().unwrap();
-    assert!(
-        matches!(&preview_cmd, AgentCommand::SessionPreview { session_id } if session_id == "sess-1"),
-        "expected preview for first session, got {preview_cmd:?}"
-    );
+    assert_eq!(app.held::<Preview>().0.session_id, "sess-1");
 }
 
 #[test]
 fn session_preview_updated_when_selection_changes() {
-    let mut app = make_app_with_session_preview();
+    let mut app = TestUiBuilder::new().session(SessionCoreConfigBuilder::session_preview).build();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![
+    app.open_session_picker(vec![
         session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z"),
         session_info("sess-2", "/tmp/two", "Session Two", "2025-01-02T00:00:00Z"),
-    ]));
-    let _ = app.next_agent_command().unwrap();
+    ]);
 
     app.key(key(KeyCode::Down));
 
-    let preview_cmd = app.next_agent_command().unwrap();
-    assert!(
-        matches!(&preview_cmd, AgentCommand::SessionPreview { session_id } if session_id == "sess-2"),
-        "expected preview for second session after moving down, got {preview_cmd:?}"
-    );
+    let previewed: Vec<_> =
+        std::iter::from_fn(|| app.try_held::<Preview>()).map(|(request, _)| request.session_id).collect();
+    assert_eq!(previewed, ["sess-1", "sess-2"]);
 }
 
 #[test]
 fn stale_preview_does_not_replace_current() {
-    let mut ui = TestUiBuilder::new().session_preview().build();
+    let mut ui = TestUiBuilder::new().session(SessionCoreConfigBuilder::session_preview).build();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
-
-    ui.deliver_result(sessions_listed(vec![
+    ui.open_session_picker(vec![
         session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z"),
         session_info("sess-2", "/tmp/two", "Session Two", "2025-01-02T00:00:00Z"),
-    ]));
-    let _ = ui.next_agent_command().unwrap();
+    ]);
 
     ui.key(key(KeyCode::Down));
-    let _ = ui.next_agent_command().unwrap();
 
-    ui.deliver_result(CommandResult::SessionPreviewLoaded {
-        session_id: "sess-1".into(),
-        result: Ok(session_preview_response("sess-1")),
-    });
+    ui.answer::<Preview>(Ok(session_preview("sess-1", "/tmp/project")));
 
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(!viewport.contains("hello"), "stale preview should not be shown:\n{viewport}");
+    ui.assert_viewport_not_contains("hello");
 }
 
 #[test]
 fn session_preview_failure_shows_error() {
-    let mut ui = TestUiBuilder::new().session_preview().dimensions(160, 15).build();
+    let mut ui = TestUiBuilder::new().session(SessionCoreConfigBuilder::session_preview).dimensions(160, 15).build();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    ui.open_session_picker(vec![session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z")]);
 
-    ui.deliver_result(sessions_listed(vec![session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z")]));
-    let _ = ui.next_agent_command().unwrap();
+    ui.answer::<Preview>(Err(agent_error("server unreachable")));
 
-    ui.deliver_result(CommandResult::SessionPreviewLoaded {
-        session_id: "sess-1".to_string(),
-        result: Err("server unreachable".to_string()),
-    });
-
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("server unreachable"), "expected error in preview:\n{viewport}");
+    ui.assert_viewport_contains("server unreachable");
 }
 
 #[test]
 fn loaded_session_replays_typed_notifications_in_order() {
     let mut ui = TestUi::new();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    ui.begin_resume("loaded", "/tmp/loaded");
 
-    ui.deliver_result(sessions_listed(vec![session_info("loaded", "/tmp/loaded", "Loaded", "2025-01-01T00:00:00Z")]));
-    ui.key(key(KeyCode::Enter));
-    let _ = ui.next_agent_command().unwrap();
-
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(!viewport.contains("buffered message"), "buffered updates should not render yet:\n{viewport}");
-    assert!(!viewport.contains("buffered agent"), "buffered updates should not render yet:\n{viewport}");
+    ui.assert_viewport_not_contains("buffered message");
+    ui.assert_viewport_not_contains("buffered agent");
 
     for event in [
-        acp::UpdateSessionNotification::new(SessionId::new("loaded"), user_message_chunk("buffered message")).into(),
+        on_session("loaded", user_message("user-message", vec!["buffered message".into()])),
         acp::UpdateSessionNotification::new(
             SessionId::new("loaded"),
             acp::SessionUpdate::AgentMessage(
@@ -348,88 +160,39 @@ fn loaded_session_replays_typed_notifications_in_order() {
         ui.acp_event(event);
     }
     ui.assert_conversation_contains("buffered message");
-    ui.deliver_result(session_loaded("loaded", vec![select_option("model", "sonnet")]));
+    session_loaded(&mut ui, vec![select_option("model", "sonnet")]);
 
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("buffered message"), "buffered updates should be replayed:\n{viewport}");
-    assert!(viewport.contains("buffered agent"), "buffered updates should be replayed:\n{viewport}");
+    ui.assert_viewport_contains("buffered message");
+    ui.assert_viewport_contains("buffered agent");
 }
 
 #[test]
 fn updates_from_the_abandoned_session_do_not_reach_the_loaded_one() {
     let mut ui = TestUi::new();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    ui.begin_resume("loaded", "/tmp/loaded");
+    session_loaded(&mut ui, Vec::new());
 
-    ui.deliver_result(sessions_listed(vec![session_info("loaded", "/tmp/loaded", "Loaded", "2025-01-01T00:00:00Z")]));
-    ui.key(key(KeyCode::Enter));
-    let _ = ui.next_agent_command().unwrap();
-    ui.deliver_result(session_loaded("loaded", Vec::new()));
+    ui.acp_event(on_session(
+        "test-session",
+        user_message("user-message", vec!["late message from the old session".into()]),
+    ));
 
-    ui.acp_event(session_update_for("test-session", user_message_chunk("late message from the old session")));
-
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(
-        !viewport.contains("late message"),
-        "an update for the session that was left behind must not land in the new one:\n{viewport}"
-    );
+    ui.assert_viewport_not_contains("late message");
 }
 
 #[test]
 fn loaded_session_uses_server_config_values() {
     let options = vec![select_option("model", "opus"), mode_option("plan", &["code", "plan", "ask"])];
-    let mut app = TestUiBuilder::new().config_options(options).build();
+    let mut app = TestUiBuilder::new().session(|session| session.config_options(options)).build();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
+    app.begin_resume("loaded", "/tmp/loaded");
 
-    app.deliver_result(sessions_listed(vec![session_info("loaded", "/tmp/loaded", "Loaded", "2025-01-01T00:00:00Z")]));
-    app.key(key(KeyCode::Enter));
-    let _ = app.next_agent_command().unwrap();
+    session_loaded(&mut app, vec![select_option("model", "sonnet"), mode_option("code", &["code", "plan", "ask"])]);
 
-    app.deliver_result(session_loaded(
-        "loaded",
-        vec![select_option("model", "sonnet"), mode_option("code", &["code", "plan", "ask"])],
-    ));
-
-    let config = app.app().config_options();
+    let config = app.app().core().session().config_options();
     assert_eq!(config[0].current_value(), Some("sonnet"));
     assert_eq!(config[1].current_value(), Some("code"));
-}
-
-#[test]
-fn connection_closed_cancels_session_picker() {
-    let mut app = make_app();
-
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
-
-    app.deliver_result(sessions_listed(vec![session_info("old", "/tmp/old", "Old", "2025-01-01T00:00:00Z")]));
-    assert!(app.app().has_session_picker());
-
-    app.acp_event(AcpEvent::ConnectionClosed);
-    assert!(!app.app().has_session_picker());
-    assert!(app.app().exit_requested());
-}
-
-#[test]
-fn session_list_error_shows_in_transcript() {
-    let mut app = make_app();
-
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-
-    app.deliver_result(CommandResult::SessionsListed(Err("list sessions failed".to_string())));
-
-    let messages: Vec<_> = message_texts(&app).collect();
-    let has_error = messages.iter().any(|message| message.contains("list sessions failed"));
-    assert!(has_error, "expected visible transcript error, got {messages:?}");
 }
 
 #[test]
@@ -439,72 +202,50 @@ fn builtin_clear_appears_in_command_picker() {
     ui.key(key(KeyCode::Char('/')));
     assert!(ui.app().composer().has_completion());
 
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("/clear"), "built-in /clear should be in command picker:\n{viewport}");
-    assert!(viewport.contains("/resume"), "built-in /resume should be in command picker:\n{viewport}");
+    ui.assert_viewport_contains("/clear");
+    ui.assert_viewport_contains("/resume");
 }
 
 #[test]
 fn narrow_terminal_renders_session_picker_without_preview_pane() {
-    let mut ui = TestUiBuilder::new().session_preview().dimensions(60, 15).build();
+    let mut ui = TestUiBuilder::new().session(SessionCoreConfigBuilder::session_preview).dimensions(60, 15).build();
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
+    ui.open_session_picker(vec![session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z")]);
 
-    ui.deliver_result(sessions_listed(vec![session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z")]));
-
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("Session One"), "narrow picker should show session list:\n{viewport}");
-    assert!(!viewport.contains("Session preview"), "narrow picker should hide preview pane:\n{viewport}");
+    ui.assert_viewport_contains("Session One");
+    ui.assert_viewport_not_contains("Session preview");
 }
 
 #[test]
 fn composed_chars_do_not_filter_the_session_picker() {
     let mut ui = TestUi::with_dimensions(60, 15);
 
-    ui.type_text("/resume");
-    ui.key(key(KeyCode::Tab));
-    let _ = ui.next_agent_command().unwrap();
-    ui.deliver_result(sessions_listed(vec![
+    ui.open_session_picker(vec![
         session_info("sess-1", "/tmp/one", "Session One", "2025-01-01T00:00:00Z"),
         session_info("sess-2", "/tmp/two", "Session Two", "2025-01-02T00:00:00Z"),
-    ]));
+    ]);
 
     // Composed characters must not reach the picker's filter query.
     ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
     ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(!viewport.contains("'o'"), "composed chars must not filter the picker:\n{viewport}");
-    assert!(
-        viewport.contains("Session One") && viewport.contains("Session Two"),
-        "both rows should still show:\n{viewport}"
-    );
+    ui.assert_viewport_not_contains("'o'");
+    ui.assert_viewport_contains("Session One");
+    ui.assert_viewport_contains("Session Two");
 
     // The plain character still filters.
     ui.key(key(KeyCode::Char('o')));
-    ui.draw();
-    let viewport = ui.viewport_text();
-    assert!(viewport.contains("'o'"), "plain char should set the filter query:\n{viewport}");
+    ui.assert_viewport_contains("'o'");
 }
 
 #[test]
 fn new_modal_replaces_session_picker() {
-    let mut app = make_app();
+    let mut app = TestUi::new();
 
-    app.type_text("/resume");
-    app.key(key(KeyCode::Tab));
-    let _ = app.next_agent_command().unwrap();
+    app.open_session_picker(vec![session_info("old", "/tmp/old", "Old Session", "2025-01-01T00:00:00Z")]);
+    app.assert_viewport_contains("Old Session");
 
-    app.deliver_result(sessions_listed(vec![session_info("old", "/tmp/old", "Old", "2025-01-01T00:00:00Z")]));
-    assert!(app.app().has_session_picker());
+    app.elicit(form_elicitation("test", "Approve?", ElicitationSchema::new()));
 
-    block_on_local(async {
-        with_elicitation(&mut app, form_elicitation("test", "", ElicitationSchema::new())).await;
-    });
-
-    assert!(!app.app().has_session_picker());
+    app.assert_viewport_contains("Approve?");
+    app.assert_viewport_not_contains("Old Session");
 }

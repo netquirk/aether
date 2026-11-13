@@ -2,6 +2,104 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.64](https://github.com/contextbridge/aether/compare/aether-project-v0.5.63...aether-project-v0.5.64) - 2026-11-03
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.63](https://github.com/contextbridge/aether/compare/aether-project-v0.5.62...aether-project-v0.5.63) - 2026-10-20
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.62](https://github.com/contextbridge/aether/compare/aether-project-v0.5.61...aether-project-v0.5.62) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.5.61](https://github.com/contextbridge/aether/compare/aether-project-v0.5.60...aether-project-v0.5.61) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm, aether-agent-core
+
+## [0.5.60](https://github.com/contextbridge/aether/compare/aether-project-v0.5.59...aether-project-v0.5.60) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.5.59](https://github.com/contextbridge/aether/compare/aether-project-v0.5.58...aether-project-v0.5.59) - 2026-10-12
+
+### Other
+
+- Simplify MCP code around Client, Server and Gateway concepts  ([#595](https://github.com/contextbridge/aether/pull/595))
+
+## [0.5.58](https://github.com/contextbridge/aether/compare/aether-project-v0.5.57...aether-project-v0.5.58) - 2026-10-10
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.5.57](https://github.com/contextbridge/aether/compare/aether-project-v0.5.56...aether-project-v0.5.57) - 2026-10-08
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.56](https://github.com/contextbridge/aether/compare/aether-project-v0.5.55...aether-project-v0.5.56) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-agent-core
+
+## [0.5.55](https://github.com/contextbridge/aether/compare/aether-project-v0.5.54...aether-project-v0.5.55) - 2026-10-04
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.54](https://github.com/contextbridge/aether/compare/aether-project-v0.5.53...aether-project-v0.5.54) - 2026-10-03
+
+### Other
+
+- Oversized coding tool output handling ([#560](https://github.com/contextbridge/aether/pull/560))
+- scheduled code-cleanup ([#525](https://github.com/contextbridge/aether/pull/525))
+
+## [0.5.53](https://github.com/contextbridge/aether/compare/aether-project-v0.5.52...aether-project-v0.5.53) - 2026-10-01
+
+### Fixed
+
+- support bedrock gpt-6.1-sol routing and clean up dependencies ([#553](https://github.com/contextbridge/aether/pull/553))
+
+## [0.5.52](https://github.com/contextbridge/aether/compare/aether-project-v0.5.51...aether-project-v0.5.52) - 2026-09-28
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-mcp-utils
+
+## [0.5.51](https://github.com/contextbridge/aether/compare/aether-project-v0.5.50...aether-project-v0.5.51) - 2026-09-27
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.50](https://github.com/contextbridge/aether/compare/aether-project-v0.5.49...aether-project-v0.5.50) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-agent-core
+
+## [0.5.49](https://github.com/contextbridge/aether/compare/aether-project-v0.5.48...aether-project-v0.5.49) - 2026-09-23
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.5.48](https://github.com/contextbridge/aether/compare/aether-project-v0.5.47...aether-project-v0.5.48) - 2026-09-21
 
 ### Other

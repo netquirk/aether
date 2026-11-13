@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.20...aether-auth-v0.1.21) - 2026-11-03
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.1.20](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.19...aether-auth-v0.1.20) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.1.19](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.18...aether-auth-v0.1.19) - 2026-10-19
+
+### Fixed
+
+- share provider connections and credentials across agents ([#607](https://github.com/contextbridge/aether/pull/607))
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.1.18](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.17...aether-auth-v0.1.18) - 2026-10-12
+
+### Added
+
+- Support sigv4 auth mechanism for MCP servers. ([#597](https://github.com/contextbridge/aether/pull/597))
+
+## [0.1.17](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.16...aether-auth-v0.1.17) - 2026-10-08
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.16](https://github.com/contextbridge/aether/compare/aether-auth-v0.1.15...aether-auth-v0.1.16) - 2026-09-20
 
 ### Other

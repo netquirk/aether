@@ -1,67 +1,52 @@
+use crate::server_config;
 use aether_project::PromptCatalog;
 use clap::Parser;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{
         router::tool::ToolRouter,
-        tool::{ToolCallContext, parse_json_object},
-        wrapper::{Json, Parameters},
+        tool::{ToolCallContext, parse_json_object, schema_for_output},
+        wrapper::Parameters,
     },
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
-        ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema, EnumSchema,
-        GetTaskParams, GetTaskResult, Implementation, InputRequest, InputRequests, InputRequiredResult,
-        ProgressNotificationParam, ServerCapabilities, ServerConfig, UpdateTaskParams,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CreateTaskResult, ElicitRequest,
+        ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema, EnumSchema, InputRequest,
+        InputRequests, InputRequiredResult, ProgressNotificationParam, ServerCapabilities, ServerConfig,
     },
-    service::RequestContext,
-    task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
+    service::{ElicitationMode, RequestContext},
     tool, tool_handler, tool_router,
 };
+use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::fs::try_exists;
 
-pub mod default_tools;
 pub mod error;
 pub mod prompt_rule_matcher;
 pub mod tools;
-pub mod tools_trait;
 
-pub use default_tools::DefaultCodingTools;
-pub use tools_trait::CodingTools;
-
+use crate::Displayed;
+use crate::background_tasks::{BackgroundTasks, delegate_background_tasks};
 use crate::coding::error::CodingError;
+use crate::coding::prompt_rule_matcher::PromptRuleMatcher;
+use crate::lsp::registry::LspRegistry;
 use crate::lsp::tools::check_errors::{LspDiagnosticsOutput, LspDiagnosticsRequest, execute_lsp_diagnostics};
+use crate::lsp::tools::rename::{LspRenameInput, LspRenameOutput, execute_lsp_rename};
 use crate::lsp::tools::symbol_lookup::{LspSymbolInput, LspSymbolOutput, execute_lsp_symbol};
-use crate::lsp::tools::workspace_search::{
-    LspWorkspaceSearchInput, LspWorkspaceSearchOutput, execute_lsp_workspace_search,
-};
-use crate::{coding::prompt_rule_matcher::PromptRuleMatcher, lsp::registry::LspRegistry};
-use crate::{
-    error::ServerInitError,
-    lsp::tools::rename::{LspRenameInput, LspRenameOutput, execute_lsp_rename},
-};
-use crate::{
-    lsp::tools::document_info::{LspDocumentInput, LspDocumentOutput, execute_lsp_document},
-    workspace_paths::WorkspacePaths,
-};
-use mcp_utils::server::mrtr::{input_requests_supported, parse_response};
-use mcp_utils::server::tasks::{BACKGROUND_TASK_TTL_MS, require_tasks_capability};
+use crate::request_context::{CLIENT_CANNOT_ELICIT, parse_response, require_tasks, supports_elicitation};
+use crate::workspace_paths::{resolve_file, resolve_path, resolve_root};
 
-use mcp_utils::display_meta::{ToolDisplayMeta, ToolResultMeta, basename, truncate};
-use tools::ast_grep::{AstGrepInput, AstGrepOutput, perform_ast_grep};
-use tools::bash::{BashInput, BashOutput, validate_args};
+use tools::bash::{BashEnvironment, BashInput, BashOutput, execute_command, validate_args};
 use tools::edit_file::{EditFileArgs, EditFileResponse, edit_file_contents};
-use tools::find::{FindInput, FindOutput, find_files};
-use tools::grep::{GrepInput, GrepOutput, perform_grep};
-use tools::list_files::{ListFilesArgs, ListFilesResult, list_files};
 use tools::read_file::{ReadFileArgs, ReadFileResult, read_file_contents};
 use tools::web_fetch::{WebFetchInput, WebFetchOutput, WebFetcher};
-use tools::web_search::search_client::BraveSearchClient;
 use tools::web_search::{WebSearchInput, WebSearchOutput, WebSearcher};
 use tools::write_file::{WriteFileArgs, WriteFileResponse, write_file_contents};
+use utils::display_meta::{ToolDisplayMeta, ToolLocation, ToolResultMeta, basename, truncate};
+use utils::temp_dir::TempDir;
+use utils::tool_result_truncator::ToolResultTruncator;
 
 #[doc = include_str!("../docs/permission_mode.md")]
 #[derive(Debug, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -77,7 +62,8 @@ pub enum PermissionMode {
 }
 
 /// CLI arguments for `CodingMcp` server
-#[derive(Debug, Clone, Default, Parser)]
+#[derive(Debug, Clone, Parser)]
+#[command(name = "coding", no_binary_name = true)]
 pub struct CodingMcpArgs {
     /// Root directory for path resolution and LSP initialization.
     #[arg(long = "root-dir")]
@@ -97,41 +83,34 @@ pub struct CodingMcpArgs {
     pub disable_lsp: bool,
 }
 
-impl CodingMcpArgs {
-    pub fn from_args(args: Vec<String>) -> Result<Self, ServerInitError> {
-        let mut full_args = vec!["coding-mcp".to_string()];
-        full_args.extend(args);
-
-        Self::try_parse_from(full_args).map_err(ServerInitError::InvalidArgs)
-    }
-}
-
 #[doc = include_str!("../docs/coding_mcp.md")]
-pub struct CodingMcp<T: CodingTools = DefaultCodingTools> {
+pub struct CodingMcp {
     tool_router: ToolRouter<Self>,
-    task_manager: TaskManager,
+    tasks: BackgroundTasks,
     read_state: Mutex<ReadState>,
-    tools: Arc<T>,
+    bash_environment: BashEnvironment,
     /// Optional LSP operations (enabled with `.with_lsp()`)
     lsp: Option<Arc<LspRegistry>>,
     web_fetcher: WebFetcher,
-    web_searcher: Option<WebSearcher<BraveSearchClient>>,
+    web_searcher: Option<WebSearcher>,
     /// Root directory used for path resolution and tool instructions.
     root_dir: PathBuf,
-    /// Configured prompt directories used to build read rules.
-    configured_rules_dirs: Vec<PathBuf>,
     /// Permission mode controlling user approval for tool calls
     permission_mode: PermissionMode,
+    spill_dir: Arc<TempDir>,
+    bash_truncator: ToolResultTruncator,
+    web_truncator: ToolResultTruncator,
 }
 
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
-impl<T: CodingTools + 'static> ServerHandler for CodingMcp<T> {
+impl ServerHandler for CodingMcp {
     fn get_info(&self) -> ServerConfig {
-        let instructions = self.build_instructions();
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tasks().build())
-            .with_server_info(Implementation::new("coding-mcp", "0.1.0"))
-            .with_instructions(instructions)
+        server_config(
+            "coding-mcp",
+            ServerCapabilities::builder().enable_tools().enable_tasks().build(),
+            self.build_instructions(),
+        )
     }
 
     async fn call_tool(
@@ -141,12 +120,16 @@ impl<T: CodingTools + 'static> ServerHandler for CodingMcp<T> {
     ) -> Result<CallToolResponse, ErrorData> {
         let background_args = background_bash_args(&request);
         if let Some(args) = &background_args {
-            require_tasks_capability(&context)?;
+            require_tasks(&context)?;
             validate_args(args).map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
 
         if let Some(prompt) = self.permission_prompt(&request) {
             let Some(responses) = request.input_responses.clone() else {
+                if !supports_elicitation(&context, ElicitationMode::Form) {
+                    let message = permission_unsupported(&prompt.tool_name);
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+                }
                 let requests = InputRequests::from([(
                     "permission".to_string(),
                     InputRequest::Elicitation(ElicitRequest::new(decision_form(
@@ -154,10 +137,6 @@ impl<T: CodingTools + 'static> ServerHandler for CodingMcp<T> {
                         &prompt.description,
                     ))),
                 )]);
-                if !input_requests_supported(context.client_capabilities().as_ref(), &requests) {
-                    let message = permission_unsupported(&prompt.tool_name);
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
-                }
                 return Ok(InputRequiredResult::from_input_requests(requests).into());
             };
 
@@ -177,121 +156,69 @@ impl<T: CodingTools + 'static> ServerHandler for CodingMcp<T> {
         self.tool_router.call(ToolCallContext::new(self, request, context)).await
     }
 
-    fn get_task(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetTaskResult, ErrorData>> + Send + '_ {
-        std::future::ready(self.task_manager.get_task(&request.task_id).map(GetTaskResult::new))
-    }
-
-    fn update_task(
-        &self,
-        request: UpdateTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
-        std::future::ready(self.task_manager.update_task(&request.task_id, request.input_responses))
-    }
-
-    fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
-        std::future::ready(self.task_manager.cancel_task(&request.task_id))
-    }
-}
-
-impl CodingMcp<DefaultCodingTools> {
-    /// Create a new `CodingMcp` with default (local filesystem) tools
-    pub fn new() -> Self {
-        Self::with_tools(DefaultCodingTools::new())
-    }
-}
-
-async fn notify_preview(context: &RequestContext<RoleServer>, meta: ToolDisplayMeta) {
-    if let Some(token) = context.meta.get_progress_token() {
-        let result_meta = ToolResultMeta::from(meta);
-        let message = serde_json::to_string(&result_meta).unwrap_or_default();
-        let _ = context.peer.notify_progress(ProgressNotificationParam::new(token, 0.0).with_message(message)).await;
-    }
-}
-
-/// Returns `true` if the command looks destructive (deletes files, force-pushes, etc.).
-///
-/// Uses simple substring matching — conservative by design.
-fn is_dangerous_cmd(command: &str) -> bool {
-    const PATTERNS: &[&str] = &[
-        "rm ",
-        "rm\t",
-        "rmdir ",
-        "git push",
-        "git reset",
-        "git checkout --",
-        "git clean",
-        "chmod ",
-        "chown ",
-        "kill ",
-        "pkill ",
-        "mv ",
-        "dd ",
-        "--force",
-        "--hard",
-    ];
-
-    // Check simple substring patterns
-    if PATTERNS.iter().any(|p| command.contains(p)) {
-        return true;
-    }
-
-    // Check redirect operators: only match >/>> that aren't inside quotes or part of =>
-    // Simple heuristic: look for "> " or ">> " not preceded by '='
-    for (i, _) in command.match_indices("> ") {
-        if i == 0 || command.as_bytes()[i - 1] != b'=' {
-            return true;
-        }
-    }
-
-    false
+    delegate_background_tasks!(tasks);
 }
 
 #[tool_router]
-impl<T: CodingTools + 'static> CodingMcp<T> {
-    /// Create a `CodingMcp` with custom tool implementation
-    pub fn with_tools(tools: T) -> Self {
+impl CodingMcp {
+    pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
-            tool_router: Self::tool_router(),
-            task_manager: TaskManager::new(),
+            tool_router: LSP_TOOLS
+                .into_iter()
+                .chain([WEB_SEARCH_TOOL])
+                .fold(Self::tool_router(), ToolRouter::with_disabled),
+            tasks: BackgroundTasks::new(),
             read_state: Mutex::new(ReadState::default()),
-            tools: Arc::new(tools),
+            bash_environment: BashEnvironment::new().with_current_exe_dir_on_path(),
             lsp: None,
             web_fetcher: WebFetcher::new(),
-            web_searcher: WebSearcher::try_new().ok(),
-            root_dir: crate::workspace_paths::current_dir(),
-            configured_rules_dirs: Vec::new(),
+            web_searcher: None,
+            root_dir: root_dir.into(),
             permission_mode: PermissionMode::AlwaysAllow,
+            spill_dir: Arc::new(TempDir::new()),
+            bash_truncator: ToolResultTruncator { head: 4_000, tail: 12_000 },
+            web_truncator: ToolResultTruncator { head: 24_000, tail: 8_000 },
         }
     }
 
-    /// Enable LSP code intelligence for the given project root.
-    ///
-    /// LSP servers for detected project languages are spawned immediately
-    /// in the background, allowing indexing to start right away.
-    pub fn with_lsp(mut self, root_path: PathBuf) -> Self {
-        self.lsp = Some(LspRegistry::new_and_spawn(root_path));
+    pub fn from_args(args: CodingMcpArgs, base_dir: &Path) -> Self {
+        let CodingMcpArgs { root_dir, rules_dirs, permission_mode, disable_lsp } = args;
+        let root_dir = resolve_root(base_dir, root_dir);
+        let rules_dirs: Vec<_> = rules_dirs.into_iter().map(|path| resolve_path(&root_dir, path)).collect();
+        let mut server = Self::new(root_dir).with_rules_dirs(&rules_dirs).with_permission_mode(permission_mode);
+        if let Ok(searcher) = WebSearcher::try_new() {
+            server = server.with_web_searcher(searcher);
+        }
+        if disable_lsp { server } else { server.with_lsp() }
+    }
+
+    pub fn with_bash_environment(mut self, environment: BashEnvironment) -> Self {
+        self.bash_environment = environment;
         self
     }
 
-    /// Set the root directory.
-    pub fn with_root_dir(mut self, root_dir: PathBuf) -> Self {
-        self.root_dir = root_dir;
+    /// Enable LSP code intelligence for the server's root directory.
+    ///
+    /// LSP servers for detected project languages are spawned immediately
+    /// in the background, allowing indexing to start right away.
+    pub fn with_lsp(mut self) -> Self {
+        self.lsp = Some(LspRegistry::new_and_spawn(self.root_dir.clone()));
+        for tool in LSP_TOOLS {
+            self.tool_router.enable_route(tool);
+        }
+        self
+    }
+
+    /// Enable the `web_search` tool, backed by `searcher`.
+    pub fn with_web_searcher(mut self, searcher: WebSearcher) -> Self {
+        self.web_searcher = Some(searcher);
+        self.tool_router.enable_route(WEB_SEARCH_TOOL);
         self
     }
 
     /// Set prompt directories used for read-triggered rule activation.
-    pub fn with_rules_dirs(mut self, rules_dirs: Vec<PathBuf>) -> Self {
-        self.configured_rules_dirs = rules_dirs;
-        let catalog = build_rule_catalog(&self.configured_rules_dirs);
+    pub fn with_rules_dirs(mut self, rules_dirs: &[PathBuf]) -> Self {
+        let catalog = PromptCatalog::from_dirs(rules_dirs);
         self.read_state.get_mut().expect("read state lock poisoned").rule_matcher = PromptRuleMatcher::new(catalog);
         self
     }
@@ -302,43 +229,195 @@ impl<T: CodingTools + 'static> CodingMcp<T> {
         self
     }
 
-    fn create_background_bash_task(&self, args: BashInput) -> rmcp::model::Task {
-        let tools = Arc::clone(&self.tools);
-        let cwd = self.root_dir.clone();
-        let description = args.description.clone().unwrap_or_else(|| truncate(&args.command, 80));
-        let options = TaskOptions::new().with_ttl_ms(BACKGROUND_TASK_TTL_MS).with_status_message(description);
-
-        self.task_manager.spawn(options, move |task_context: TaskContext| {
-            Box::pin(async move {
-                tokio::select! {
-                    () = task_context.cancelled() => Err(TaskExit::Cancelled),
-                    result = tools.bash(args, Some(cwd)) => Ok(match result {
-                        Ok(output) => serde_json::to_value(output).map_or_else(
-                            |error| CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-                            CallToolResult::structured,
-                        ),
-                        Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-                    }),
-                }
-            })
-        })
+    #[doc = include_str!("tools/read_file/description.md")]
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<ReadFileResult>()
+    )]
+    pub async fn read_file(
+        &self,
+        Parameters(mut args): Parameters<ReadFileArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<ReadFileResult>, CodingError> {
+        args.file_path = self.resolve_file_arg(&args.file_path)?;
+        notify_preview(&context, file_preview("Read file", read_location(&args))).await;
+        self.read_and_track(args).await
     }
 
-    fn workspace_paths(&self) -> WorkspacePaths {
-        WorkspacePaths::new(self.root_dir.clone())
+    #[doc = include_str!("tools/write_file/description.md")]
+    #[tool(
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<WriteFileResponse>()
+    )]
+    pub async fn write_file(
+        &self,
+        Parameters(mut args): Parameters<WriteFileArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<WriteFileResponse>, CodingError> {
+        args.file_path = self.resolve_file_arg(&args.file_path)?;
+        notify_preview(&context, file_preview("Write file", ToolLocation::new(&args.file_path, None))).await;
+
+        self.ensure_read_before_overwrite(&args.file_path).await?;
+
+        let response = write_file_contents(args).await?;
+
+        self.mark_read(&response.output.file_path);
+        self.spawn_diagnostic_refresh(&response.output.file_path);
+
+        Ok(response)
+    }
+
+    #[doc = include_str!("tools/edit_file/description.md")]
+    #[tool(
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<EditFileResponse>()
+    )]
+    pub async fn edit_file(
+        &self,
+        Parameters(mut args): Parameters<EditFileArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<EditFileResponse>, CodingError> {
+        args.file_path = self.resolve_file_arg(&args.file_path)?;
+        notify_preview(&context, file_preview("Edit file", ToolLocation::new(&args.file_path, None))).await;
+
+        self.ensure_read_before_edit(&args.file_path)?;
+
+        let file_path = args.file_path.clone();
+        let result = edit_file_contents(args).await;
+        self.spawn_diagnostic_refresh(&file_path);
+        Ok(result?)
+    }
+
+    #[doc = include_str!("tools/bash/description.md")]
+    #[tool(
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        output_schema = schema_for_output::<BashOutput>()
+    )]
+    pub async fn bash(
+        &self,
+        Parameters(args): Parameters<BashInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<BashOutput>, CodingError> {
+        notify_preview(&context, ToolDisplayMeta::new("Run command", truncate(&args.command, 40))).await;
+
+        run_bash(args, &self.root_dir, &self.bash_environment, self.bash_truncator, &self.spill_dir).await
+    }
+
+    #[doc = include_str!("tools/web_fetch/description.md")]
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<WebFetchOutput>()
+    )]
+    pub async fn web_fetch(
+        &self,
+        Parameters(args): Parameters<WebFetchInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<WebFetchOutput>, CodingError> {
+        notify_preview(&context, ToolDisplayMeta::new("Fetch URL", truncate(&args.url, 60))).await;
+        let output = self.web_fetcher.fetch(args).await?;
+        let page = output.title.clone().unwrap_or_else(|| truncate(&output.final_url, 60));
+        let content = self.web_truncator.truncate(output.content, &self.spill_dir, "web-fetch");
+        Ok(Displayed::new(WebFetchOutput { content, ..output }, ToolDisplayMeta::new("Fetch URL", page)))
+    }
+
+    #[doc = include_str!("tools/web_search/description.md")]
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<WebSearchOutput>()
+    )]
+    pub async fn web_search(
+        &self,
+        Parameters(args): Parameters<WebSearchInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<WebSearchOutput>, CodingError> {
+        notify_preview(&context, ToolDisplayMeta::new("Web search", format!("'{}'", args.query))).await;
+
+        let searcher = self.web_searcher.as_ref().ok_or(CodingError::NotConfigured("Web search"))?;
+        let output = searcher
+            .search(args, |delay| {
+                notify(&context, format!("Search rate limited; retrying in {} seconds.", delay.as_secs()))
+            })
+            .await?;
+        let summary = format!("'{}' ({} results)", output.query, output.results.len());
+        Ok(Displayed::new(output, ToolDisplayMeta::new("Web search", summary)))
+    }
+
+    #[doc = include_str!("../lsp/tools/symbol_lookup/description.md")]
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<LspSymbolOutput>()
+    )]
+    pub async fn lsp_symbol(
+        &self,
+        Parameters(input): Parameters<LspSymbolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<LspSymbolOutput>, CodingError> {
+        notify_preview(&context, ToolDisplayMeta::new("LSP symbol", &input.symbol)).await;
+        execute_lsp_symbol(input, self.lsp()?).await.map_err(CodingError::from)
+    }
+
+    #[doc = include_str!("../lsp/tools/check_errors/description.md")]
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<LspDiagnosticsOutput>()
+    )]
+    pub async fn lsp_check_errors(
+        &self,
+        Parameters(request): Parameters<LspDiagnosticsRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<LspDiagnosticsOutput>, CodingError> {
+        let preview_value = request.file_path.as_ref().map_or_else(|| "workspace".to_string(), |path| basename(path));
+        notify_preview(&context, ToolDisplayMeta::new("LSP errors", preview_value)).await;
+        execute_lsp_diagnostics(request, self.lsp()?).await.map_err(CodingError::from)
+    }
+
+    #[doc = include_str!("../lsp/tools/rename/description.md")]
+    #[tool(
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<LspRenameOutput>()
+    )]
+    pub async fn lsp_rename(
+        &self,
+        Parameters(input): Parameters<LspRenameInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Displayed<LspRenameOutput>, CodingError> {
+        notify_preview(&context, ToolDisplayMeta::new("LSP rename", &input.symbol)).await;
+        execute_lsp_rename(input, self.lsp()?).await.map_err(CodingError::from)
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl CodingMcp {
+    pub fn with_web_fetcher(mut self, web_fetcher: WebFetcher) -> Self {
+        self.web_fetcher = web_fetcher;
+        self
+    }
+}
+
+impl CodingMcp {
+    fn create_background_bash_task(&self, args: BashInput) -> rmcp::model::Task {
+        let cwd = self.root_dir.clone();
+        let environment = self.bash_environment.clone();
+        let spill_dir = Arc::clone(&self.spill_dir);
+        let truncator = self.bash_truncator;
+        let description = args.description.clone().unwrap_or_else(|| truncate(&args.command, 80));
+
+        self.tasks.spawn(description, async move {
+            let result = run_bash(args, &cwd, &environment, truncator, &spill_dir).await.map_err(|e| e.to_string());
+            let result = result.and_then(|output| output.into_result().map_err(|e| e.to_string()));
+            Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![ContentBlock::text(error)])))
+        })
     }
 
     fn build_instructions(&self) -> String {
         let mut base = String::from(
             r"# Coding MCP Server
 
-File I/O, search, shell, and optional LSP code intelligence tools for coding workflows.
+File I/O, shell, and optional LSP code intelligence tools for coding workflows.
 
 ## Quick Reference
 
-- **Text patterns** (TODOs, logs, strings): `grep`
-- **Structural code patterns** (AST search): `ast_grep`
-- **File names** (find *.test.ts): `find`
+- **Search, symbol lookup by name, file outlines, and directory listings**: run `rg`, `ast-grep`, and other shell commands with `bash`
 - **Read/write/edit** files: `read_file`, `write_file`, `edit_file`
 - **Shell commands**: `bash`
 ",
@@ -348,8 +427,6 @@ File I/O, search, shell, and optional LSP code intelligence tools for coding wor
             base.push_str(
                 r"- **Errors & warnings** (instant check without build): `lsp_check_errors`
 - **Code symbols** (definitions, usages, types): `lsp_symbol`
-- **Find symbol across workspace** (don't know the file?): `lsp_workspace_search`
-- **File structure** (what's in this file?): `lsp_document`
 - **Rename symbol** (refactor across codebase): `lsp_rename`
 ",
             );
@@ -378,51 +455,24 @@ When using tools that take file paths, always use absolute paths from:
             .and_then(|tool| tool.annotations.as_ref())
             .and_then(|annotations| annotations.destructive_hint)
             .unwrap_or(false);
-        if !destructive {
+        if !destructive || self.permission_mode == PermissionMode::AlwaysAllow {
             return None;
         }
 
-        match self.permission_mode {
-            PermissionMode::AlwaysAllow => None,
-            PermissionMode::Auto => {
-                if name != "bash" {
-                    return None;
-                }
-                let command = request
-                    .arguments
-                    .clone()
-                    .and_then(|arguments| parse_json_object::<BashInput>(arguments).ok())?
-                    .command;
-
-                is_dangerous_cmd(&command)
-                    .then(|| PermissionPrompt { tool_name: name.to_string(), description: command })
+        let description = match name {
+            "bash" => parse_arguments::<BashInput>(request)?.command,
+            "write_file" | "edit_file" => {
+                let file_path = parse_arguments::<FilePathArg>(request)?.file_path;
+                self.resolve_file_arg(&file_path).unwrap_or(file_path)
             }
-            PermissionMode::AlwaysAsk => {
-                let description = match name {
-                    "bash" => {
-                        request
-                            .arguments
-                            .clone()
-                            .and_then(|arguments| parse_json_object::<BashInput>(arguments).ok())?
-                            .command
-                    }
-                    "write_file" | "edit_file" => {
-                        let file_path = request
-                            .arguments
-                            .clone()
-                            .and_then(|arguments| parse_json_object::<FilePathArg>(arguments).ok())?
-                            .file_path;
-
-                        self.resolve_file_arg(&file_path).unwrap_or(file_path)
-                    }
-                    _ => {
-                        let args = request.arguments.as_ref().and_then(|a| serde_json::to_string(a).ok());
-                        truncate(&args.unwrap_or_default(), 80)
-                    }
-                };
-                Some(PermissionPrompt { tool_name: name.to_string(), description })
+            _ => {
+                let args = request.arguments.as_ref().and_then(|a| serde_json::to_string(a).ok());
+                truncate(&args.unwrap_or_default(), 80)
             }
-        }
+        };
+        let gated =
+            self.permission_mode == PermissionMode::AlwaysAsk || (name == "bash" && is_dangerous_cmd(&description));
+        gated.then(|| PermissionPrompt { tool_name: name.to_string(), description })
     }
 
     fn spawn_diagnostic_refresh(&self, file_path: &str) {
@@ -438,34 +488,41 @@ When using tools that take file paths, always use absolute paths from:
     /// Resolves a required file-path argument against the root directory,
     /// returning the normalized absolute path as a string.
     fn resolve_file_arg(&self, raw: &str) -> Result<String, CodingError> {
-        let path = self.workspace_paths().resolve_file(raw)?;
+        let path = resolve_file(&self.root_dir, raw)?;
         Ok(path.to_string_lossy().to_string())
+    }
+
+    fn lsp(&self) -> Result<&LspRegistry, CodingError> {
+        self.lsp.as_deref().ok_or(CodingError::NotConfigured("LSP"))
     }
 
     /// Reads `args.file_path` (already resolved against the root directory),
     /// records it in the read set, and appends any matching read-rule reminders.
-    async fn read_and_track(&self, args: ReadFileArgs) -> Result<Json<ReadFileResult>, CodingError> {
+    async fn read_and_track(&self, args: ReadFileArgs) -> Result<Displayed<ReadFileResult>, CodingError> {
         let file_path = args.file_path.clone();
-        let mut result = self.tools.read_file(args).await?;
+        let location = read_location(&args);
+        let mut result = read_file_contents(args).await?;
         let matched = {
             let mut state = self.read_state.lock().expect("read state lock poisoned");
             state.files_read.insert(file_path.clone());
             state.rule_matcher.get_matched_rules(&self.root_dir, &file_path)
         };
 
-        let total_lines = result.total_lines;
         for rule in &matched {
             write!(result.content, "\n\n<system-reminder>\n{}\n</system-reminder>", rule.body).unwrap();
         }
 
+        let mut summary = format!("{}, {} lines", basename(&file_path), result.total_lines);
         if !matched.is_empty() {
             let rule_names: Vec<&str> = matched.iter().map(|r| r.name.as_str()).collect();
-            let base = format!("{}, {total_lines} lines", basename(&file_path));
-            let value = format!("{base} +rules: {}", rule_names.join(", "));
-            result.meta = Some(ToolDisplayMeta::new("Read file", value).into());
+            write!(summary, " +rules: {}", rule_names.join(", ")).unwrap();
         }
 
-        Ok(Json(result))
+        Ok(Displayed::new(result, ToolResultMeta::new(ToolDisplayMeta::new("Read file", summary)).located(location)))
+    }
+
+    fn mark_read(&self, file_path: &str) {
+        self.read_state.lock().expect("read state lock poisoned").files_read.insert(file_path.to_string());
     }
 
     /// Read-before-overwrite safety check: an existing file must have been read
@@ -487,268 +544,20 @@ When using tools that take file paths, always use absolute paths from:
         }
         Ok(())
     }
+}
 
-    #[doc = include_str!("tools/grep/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn grep(
-        &self,
-        request: Parameters<GrepInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<GrepOutput>, CodingError> {
-        let Parameters(mut args) = request;
-        let normalized_path = self.workspace_paths().resolve_dir(args.path.as_deref());
-        args.path = Some(normalized_path.to_string_lossy().to_string());
-        notify_preview(&context, ToolDisplayMeta::new("Grep", format!("'{}'", args.pattern))).await;
-        self.tools.grep(args).await.map(Json)
-    }
-
-    #[doc = include_str!("tools/ast_grep/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn ast_grep(
-        &self,
-        request: Parameters<AstGrepInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<AstGrepOutput>, CodingError> {
-        let Parameters(mut args) = request;
-        let normalized_path = self.workspace_paths().resolve_dir(args.path.as_deref());
-        args.path = Some(normalized_path.to_string_lossy().to_string());
-        notify_preview(&context, ToolDisplayMeta::new("AST grep", format!("'{}'", args.pattern))).await;
-        self.tools.ast_grep(args).await.map(Json)
-    }
-
-    #[doc = include_str!("tools/find/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn find(
-        &self,
-        request: Parameters<FindInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<FindOutput>, CodingError> {
-        let Parameters(mut args) = request;
-        let normalized_path = self.workspace_paths().resolve_dir(args.path.as_deref());
-        args.path = Some(normalized_path.to_string_lossy().to_string());
-        notify_preview(&context, ToolDisplayMeta::new("Find", format!("'{}'", args.pattern))).await;
-        self.tools.find(args).await.map(Json)
-    }
-
-    #[doc = include_str!("tools/read_file/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn read_file(
-        &self,
-        request: Parameters<ReadFileArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<ReadFileResult>, CodingError> {
-        let Parameters(mut args) = request;
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        notify_preview(&context, ToolDisplayMeta::new("Read file", basename(&args.file_path))).await;
-        self.read_and_track(args).await
-    }
-
-    #[doc = include_str!("tools/write_file/description.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = false
-    ))]
-    pub async fn write_file(
-        &self,
-        request: Parameters<WriteFileArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<WriteFileResponse>, CodingError> {
-        let Parameters(mut args) = request;
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        notify_preview(&context, ToolDisplayMeta::new("Write file", basename(&args.file_path))).await;
-
-        self.ensure_read_before_overwrite(&args.file_path).await?;
-
-        let response = self.tools.write_file(args).await?;
-
-        self.spawn_diagnostic_refresh(&response.file_path);
-
-        Ok(Json(response))
-    }
-
-    #[doc = include_str!("tools/edit_file/description.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = false
-    ))]
-    pub async fn edit_file(
-        &self,
-        request: Parameters<EditFileArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<EditFileResponse>, CodingError> {
-        let Parameters(mut args) = request;
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        notify_preview(&context, ToolDisplayMeta::new("Edit file", basename(&args.file_path))).await;
-
-        self.ensure_read_before_edit(&args.file_path)?;
-
-        let response = self.tools.edit_file(args).await?;
-
-        self.spawn_diagnostic_refresh(&response.file_path);
-
-        Ok(Json(response))
-    }
-
-    #[doc = include_str!("tools/list_files/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn list_files(
-        &self,
-        request: Parameters<ListFilesArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<ListFilesResult>, CodingError> {
-        let Parameters(mut args) = request;
-        let normalized_path = self.workspace_paths().resolve_dir(args.path.as_deref());
-        let preview_value = basename(&normalized_path.to_string_lossy());
-        args.path = Some(normalized_path.to_string_lossy().to_string());
-        notify_preview(&context, ToolDisplayMeta::new("List files", preview_value)).await;
-        self.tools.list_files(args).await.map(Json)
-    }
-
-    #[doc = include_str!("tools/bash/description.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
-    pub async fn bash(
-        &self,
-        request: Parameters<BashInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<BashOutput>, CodingError> {
-        let Parameters(args) = request;
-        notify_preview(&context, ToolDisplayMeta::new("Run command", truncate(&args.command, 40))).await;
-
-        let cwd = self.root_dir.clone();
-        let result = self.tools.bash(args, Some(cwd)).await?;
-        Ok(Json(result))
-    }
-
-    #[doc = include_str!("tools/web_fetch/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = true))]
-    pub async fn web_fetch(
-        &self,
-        request: Parameters<WebFetchInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<WebFetchOutput>, CodingError> {
-        let Parameters(args) = request;
-        notify_preview(&context, ToolDisplayMeta::new("Fetch URL", truncate(&args.url, 60))).await;
-        self.web_fetcher.fetch(args).await.map(Json).map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("tools/web_search/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = true))]
-    pub async fn web_search(
-        &self,
-        request: Parameters<WebSearchInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<WebSearchOutput>, CodingError> {
-        let Parameters(args) = request;
-        notify_preview(&context, ToolDisplayMeta::new("Web search", format!("'{}'", args.query))).await;
-
-        let searcher = self.web_searcher.as_ref().ok_or_else(|| {
-            CodingError::NotConfigured(
-                "Web search not available: BRAVE_SEARCH_API_KEY environment variable not set. \
-                 Get a free API key from https://api.search.brave.com/app/keys"
-                    .to_string(),
-            )
-        })?;
-
-        let peer = context.peer.clone();
-        let progress_token = context.meta.get_progress_token();
-        searcher
-            .search(args, move |delay| {
-                let peer = peer.clone();
-                let progress_token = progress_token.clone();
-                async move {
-                    if let Some(token) = progress_token {
-                        let message = format!("Search rate limited; retrying in {} seconds.", delay.as_secs());
-                        let _ = peer
-                            .notify_progress(ProgressNotificationParam::new(token, 0.0).with_message(message))
-                            .await;
-                    }
-                }
-            })
-            .await
-            .map(Json)
-            .map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("../lsp/tools/symbol_lookup/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn lsp_symbol(
-        &self,
-        request: Parameters<LspSymbolInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<LspSymbolOutput>, CodingError> {
-        let Parameters(input) = request;
-        notify_preview(&context, ToolDisplayMeta::new("LSP symbol", &input.symbol)).await;
-        let lsp = self.lsp.as_ref().ok_or_else(|| CodingError::NotConfigured("LSP not configured".to_string()))?;
-        execute_lsp_symbol(input, lsp.as_ref()).await.map(Json).map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("../lsp/tools/workspace_search/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn lsp_workspace_search(
-        &self,
-        request: Parameters<LspWorkspaceSearchInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<LspWorkspaceSearchOutput>, CodingError> {
-        let Parameters(input) = request;
-        notify_preview(&context, ToolDisplayMeta::new("LSP search", format!("'{}'", input.query))).await;
-        let lsp = self.lsp.as_ref().ok_or_else(|| CodingError::NotConfigured("LSP not configured".to_string()))?;
-        execute_lsp_workspace_search(input, lsp.as_ref()).await.map(Json).map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("../lsp/tools/document_info/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn lsp_document(
-        &self,
-        request: Parameters<LspDocumentInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<LspDocumentOutput>, CodingError> {
-        let Parameters(input) = request;
-        notify_preview(&context, ToolDisplayMeta::new("LSP document", basename(&input.file_path))).await;
-        let lsp = self.lsp.as_ref().ok_or_else(|| CodingError::NotConfigured("LSP not configured".to_string()))?;
-        execute_lsp_document(input, lsp.as_ref()).await.map(Json).map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("../lsp/tools/check_errors/description.md")]
-    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
-    pub async fn lsp_check_errors(
-        &self,
-        request: Parameters<LspDiagnosticsRequest>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<LspDiagnosticsOutput>, CodingError> {
-        let Parameters(request) = request;
-        let preview_value = request.file_path.as_ref().map_or_else(|| "workspace".to_string(), |path| basename(path));
-        notify_preview(&context, ToolDisplayMeta::new("LSP errors", preview_value)).await;
-        let lsp = self.lsp.as_ref().ok_or_else(|| CodingError::NotConfigured("LSP not configured".to_string()))?;
-        execute_lsp_diagnostics(request, lsp.as_ref()).await.map(Json).map_err(CodingError::from)
-    }
-
-    #[doc = include_str!("../lsp/tools/rename/description.md")]
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = false
-    ))]
-    pub async fn lsp_rename(
-        &self,
-        request: Parameters<LspRenameInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<Json<LspRenameOutput>, CodingError> {
-        let Parameters(input) = request;
-        notify_preview(&context, ToolDisplayMeta::new("LSP rename", &input.symbol)).await;
-        let lsp = self.lsp.as_ref().ok_or_else(|| CodingError::NotConfigured("LSP not configured".to_string()))?;
-        execute_lsp_rename(input, lsp.as_ref()).await.map(Json).map_err(CodingError::from)
+impl Debug for CodingMcp {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodingMcp")
+            .field("root_dir", &self.root_dir)
+            .field("permission_mode", &self.permission_mode)
+            .finish_non_exhaustive()
     }
 }
+
+const LSP_TOOLS: [&str; 3] = ["lsp_check_errors", "lsp_rename", "lsp_symbol"];
+const WEB_SEARCH_TOOL: &str = "web_search";
 
 /// A pending user-approval prompt for a gated tool call.
 struct PermissionPrompt {
@@ -765,6 +574,62 @@ struct FilePathArg {
     file_path: String,
 }
 
+#[derive(Default)]
+struct ReadState {
+    files_read: HashSet<String>,
+    rule_matcher: PromptRuleMatcher,
+}
+
+async fn notify_preview(context: &RequestContext<RoleServer>, meta: impl Into<ToolResultMeta>) {
+    notify(context, serde_json::to_string(&meta.into()).unwrap_or_default()).await;
+}
+
+fn file_preview(title: &str, location: ToolLocation) -> ToolResultMeta {
+    ToolResultMeta::new(ToolDisplayMeta::new(title, basename(&location.path))).located(location)
+}
+
+fn read_location(args: &ReadFileArgs) -> ToolLocation {
+    ToolLocation::new(&args.file_path, args.offset.and_then(|offset| u32::try_from(offset).ok()))
+}
+
+async fn notify(context: &RequestContext<RoleServer>, message: String) {
+    if let Some(token) = context.meta.get_progress_token() {
+        let _ = context.peer.notify_progress(ProgressNotificationParam::new(token, 0.0).with_message(message)).await;
+    }
+}
+
+fn is_dangerous_cmd(command: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "rm ",
+        "rm\t",
+        "rmdir ",
+        "git push",
+        "git reset",
+        "git checkout --",
+        "git clean",
+        "chmod ",
+        "chown ",
+        "kill ",
+        "pkill ",
+        "mv ",
+        "dd ",
+        "--force",
+        "--hard",
+    ];
+
+    if PATTERNS.iter().any(|p| command.contains(p)) {
+        return true;
+    }
+
+    for (i, _) in command.match_indices("> ") {
+        if i == 0 || command.as_bytes()[i - 1] != b'=' {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn permission_granted(result: &ElicitResult) -> bool {
     result.action == ElicitationAction::Accept
         && result.content.as_ref().and_then(|c| c.get("decision")).and_then(|v| v.as_str()) == Some("allow")
@@ -772,9 +637,8 @@ fn permission_granted(result: &ElicitResult) -> bool {
 
 fn permission_unsupported(tool_name: &str) -> String {
     format!(
-        "Permission required for {tool_name}, but the connected client cannot prompt the user \
-         (MCP elicitation over protocol 2026-07-28 or newer). Use --permission-mode always-allow \
-         or an elicitation-capable client."
+        "Permission required for {tool_name}, but {CLIENT_CANNOT_ELICIT}. \
+         Use --permission-mode always-allow or an elicitation-capable client."
     )
 }
 
@@ -796,74 +660,29 @@ fn decision_form(tool_name: &str, description: &str) -> ElicitRequestParams {
     }
 }
 
+async fn run_bash(
+    args: BashInput,
+    cwd: &Path,
+    environment: &BashEnvironment,
+    truncator: ToolResultTruncator,
+    spill_dir: &TempDir,
+) -> Result<Displayed<BashOutput>, CodingError> {
+    let command = truncate(&args.command, 40);
+    let output = execute_command(args, Some(cwd), environment).await?;
+    let timed_out = if output.killed { ", timed out" } else { "" };
+    let meta = ToolDisplayMeta::new("Ran", format!("{command} (exit {}{timed_out})", output.exit_code));
+    Ok(Displayed::new(BashOutput { output: truncator.truncate(output.output, spill_dir, "bash"), ..output }, meta))
+}
+
 fn background_bash_args(request: &CallToolRequestParams) -> Option<BashInput> {
     if request.name.as_ref() != "bash" {
         return None;
     }
-
-    let args = request.arguments.clone().and_then(|arguments| parse_json_object::<BashInput>(arguments).ok())?;
-    args.run_in_background.is_some_and(|background| background).then_some(args)
+    parse_arguments::<BashInput>(request).filter(|args| args.run_in_background == Some(true))
 }
 
-// TaskManager has no Drop of its own: aborting the tasks here drops their
-// in-flight command futures, whose kill_on_drop reaps the child processes.
-impl<T: CodingTools> Drop for CodingMcp<T> {
-    fn drop(&mut self) {
-        self.task_manager.shutdown();
-    }
-}
-
-impl<T: CodingTools> Debug for CodingMcp<T> {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CodingMcp")
-            .field("root_dir", &self.root_dir)
-            .field("permission_mode", &self.permission_mode)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for CodingMcp<DefaultCodingTools> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(feature = "test-helpers")]
-impl<T: CodingTools + 'static> CodingMcp<T> {
-    /// Read a file and track it in the read set (test helper, no MCP context needed).
-    pub async fn test_read_file(&self, mut args: ReadFileArgs) -> Result<Json<ReadFileResult>, CodingError> {
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        self.read_and_track(args).await
-    }
-
-    /// Write a file with read-before-write safety check (test helper, no MCP context needed).
-    pub async fn test_write_file(&self, mut args: WriteFileArgs) -> Result<Json<WriteFileResponse>, CodingError> {
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        self.ensure_read_before_overwrite(&args.file_path).await?;
-        self.tools.write_file(args).await.map(Json)
-    }
-
-    /// Edit a file with read-before-edit safety check (test helper, no MCP context needed).
-    pub async fn test_edit_file(&self, mut args: EditFileArgs) -> Result<Json<EditFileResponse>, CodingError> {
-        args.file_path = self.resolve_file_arg(&args.file_path)?;
-        self.ensure_read_before_edit(&args.file_path)?;
-        self.tools.edit_file(args).await.map(Json)
-    }
-}
-
-#[derive(Default)]
-struct ReadState {
-    files_read: HashSet<String>,
-    rule_matcher: PromptRuleMatcher,
-}
-
-fn build_rule_catalog(configured_rules_dirs: &[PathBuf]) -> PromptCatalog {
-    if configured_rules_dirs.is_empty() {
-        return PromptCatalog::empty();
-    }
-
-    PromptCatalog::from_dirs(configured_rules_dirs)
+fn parse_arguments<T: DeserializeOwned>(request: &CallToolRequestParams) -> Option<T> {
+    request.arguments.clone().and_then(|arguments| parse_json_object(arguments).ok())
 }
 
 #[cfg(test)]
@@ -871,165 +690,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_default_permission_mode_is_always_allow() {
-        let args = CodingMcpArgs::from_args(vec![]).unwrap();
-        assert_eq!(args.permission_mode, PermissionMode::AlwaysAllow);
-    }
+    fn args_parse_permission_mode_lsp_and_rules_dirs() {
+        let cases: [(&[&str], PermissionMode, bool); 5] = [
+            (&[], PermissionMode::AlwaysAllow, false),
+            (&["--permission-mode", "always-allow"], PermissionMode::AlwaysAllow, false),
+            (&["--permission-mode", "auto"], PermissionMode::Auto, false),
+            (&["--permission-mode", "always-ask"], PermissionMode::AlwaysAsk, false),
+            (&["--disable-lsp"], PermissionMode::AlwaysAllow, true),
+        ];
+        for (argv, permission_mode, disable_lsp) in cases {
+            let args = CodingMcpArgs::try_parse_from(argv).unwrap();
+            assert_eq!((args.permission_mode, args.disable_lsp), (permission_mode, disable_lsp), "{argv:?}");
+        }
 
-    #[test]
-    fn args_default_lsp_enabled() {
-        let args = CodingMcpArgs::from_args(vec![]).unwrap();
-        assert!(!args.disable_lsp);
-    }
-
-    #[test]
-    fn args_parses_disable_lsp() {
-        let args = CodingMcpArgs::from_args(vec!["--disable-lsp".into()]).unwrap();
-        assert!(args.disable_lsp);
-    }
-
-    #[test]
-    fn disabled_lsp_instructions_omit_lsp_tools() {
-        let instructions = CodingMcp::new().build_instructions();
-        assert!(!instructions.contains("lsp_check_errors"));
-        assert!(!instructions.contains("lsp_symbol"));
-    }
-
-    #[test]
-    fn args_parses_always_allow() {
-        let args = CodingMcpArgs::from_args(vec!["--permission-mode".into(), "always-allow".into()]).unwrap();
-        assert_eq!(args.permission_mode, PermissionMode::AlwaysAllow);
-    }
-
-    #[test]
-    fn args_parses_auto() {
-        let args = CodingMcpArgs::from_args(vec!["--permission-mode".into(), "auto".into()]).unwrap();
-        assert_eq!(args.permission_mode, PermissionMode::Auto);
-    }
-
-    #[test]
-    fn args_parses_always_ask() {
-        let args = CodingMcpArgs::from_args(vec!["--permission-mode".into(), "always-ask".into()]).unwrap();
-        assert_eq!(args.permission_mode, PermissionMode::AlwaysAsk);
-    }
-
-    #[test]
-    fn args_rejects_invalid_permission_mode() {
-        assert!(CodingMcpArgs::from_args(vec!["--permission-mode".into(), "yolo".into()]).is_err());
-    }
-
-    #[test]
-    fn args_parses_repeated_rules_dirs() {
-        let args = CodingMcpArgs::from_args(vec![
-            "--rules-dir".into(),
-            ".aether/skills".into(),
-            "--rules-dir".into(),
-            ".claude/rules".into(),
-        ])
-        .unwrap();
-
-        assert_eq!(args.rules_dirs, vec![PathBuf::from(".aether/skills"), PathBuf::from(".claude/rules")]);
-    }
-
-    #[test]
-    fn with_permission_mode_stores_mode() {
-        let mcp = CodingMcp::new().with_permission_mode(PermissionMode::AlwaysAsk);
-        assert_eq!(mcp.permission_mode, PermissionMode::AlwaysAsk);
-    }
-
-    #[test]
-    fn default_permission_mode_is_always_allow() {
-        let mcp = CodingMcp::new();
-        assert_eq!(mcp.permission_mode, PermissionMode::AlwaysAllow);
-    }
-
-    #[test]
-    fn detects_rm() {
-        assert!(is_dangerous_cmd("rm -rf /tmp/foo"));
-        assert!(is_dangerous_cmd("rm\tfoo.txt"));
-    }
-
-    #[test]
-    fn detects_git_push() {
-        assert!(is_dangerous_cmd("git push origin main"));
-    }
-
-    #[test]
-    fn detects_git_reset() {
-        assert!(is_dangerous_cmd("git reset --hard HEAD~1"));
-    }
-
-    #[test]
-    fn detects_git_checkout_discard() {
-        assert!(is_dangerous_cmd("git checkout -- ."));
-    }
-
-    #[test]
-    fn detects_git_clean() {
-        assert!(is_dangerous_cmd("git clean -fd"));
-    }
-
-    #[test]
-    fn detects_redirect() {
-        assert!(is_dangerous_cmd("echo x > file.txt"));
-        assert!(is_dangerous_cmd("echo x >> file.txt"));
-    }
-
-    #[test]
-    fn does_not_flag_fat_arrow() {
-        assert!(!is_dangerous_cmd("grep '=> ' file.txt"));
-    }
-
-    #[test]
-    fn detects_chmod_chown() {
-        assert!(is_dangerous_cmd("chmod 777 /etc/passwd"));
-        assert!(is_dangerous_cmd("chown root:root /tmp/x"));
-    }
-
-    #[test]
-    fn detects_kill_signals() {
-        assert!(is_dangerous_cmd("kill -9 1234"));
-        assert!(is_dangerous_cmd("pkill node"));
-    }
-
-    #[test]
-    fn does_not_flag_kill_substring() {
-        assert!(!is_dangerous_cmd("echo skillset"));
-    }
-
-    #[test]
-    fn detects_mv() {
-        assert!(is_dangerous_cmd("mv old.txt new.txt"));
-    }
-
-    #[test]
-    fn detects_force_flags() {
-        assert!(is_dangerous_cmd("npm install --force"));
-        assert!(is_dangerous_cmd("git reset --hard"));
-    }
-
-    #[test]
-    fn detects_dd() {
-        assert!(is_dangerous_cmd("dd if=/dev/zero of=/dev/sda"));
-    }
-
-    #[test]
-    fn detects_rmdir() {
-        assert!(is_dangerous_cmd("rmdir empty_dir"));
-    }
-
-    #[test]
-    fn does_not_flag_redirect_in_output() {
-        assert!(is_dangerous_cmd("> file.txt"));
-    }
-
-    #[test]
-    fn allows_safe_commands() {
-        assert!(!is_dangerous_cmd("ls -la"));
-        assert!(!is_dangerous_cmd("cat foo.txt"));
-        assert!(!is_dangerous_cmd("git status"));
-        assert!(!is_dangerous_cmd("git diff"));
-        assert!(!is_dangerous_cmd("cargo test"));
-        assert!(!is_dangerous_cmd("grep -r pattern ."));
+        assert!(CodingMcpArgs::try_parse_from(["--permission-mode", "yolo"]).is_err());
+        let args = CodingMcpArgs::try_parse_from(["--rules-dir", ".aether/skills", "--rules-dir", ".claude/rules"]);
+        assert_eq!(args.unwrap().rules_dirs, [PathBuf::from(".aether/skills"), PathBuf::from(".claude/rules")]);
     }
 }

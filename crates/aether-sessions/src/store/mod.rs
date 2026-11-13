@@ -1,14 +1,16 @@
 mod prompt_history;
 
+use acp_utils::content::first_line;
 use acp_utils::notifications::{PromptSearchResponse, SessionPreviewResponse, SessionPreviewRole, SessionPreviewTurn};
 use aether_core::events::{AgentEvent, MessageEvent, ToolEvent};
 use serde::Serialize;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tracing::warn;
-use utils::settings::aether_home;
+use utils::fs::{append_line, write_atomic};
+use utils::path::aether_home;
 
 use crate::error::SessionStoreError;
 use crate::{SessionEvent, SessionLog, SessionLogEntry, SessionMeta, UserEvent};
@@ -83,10 +85,26 @@ pub struct SessionStore {
     prompt_history: PromptHistoryIndex,
 }
 
+#[derive(Debug, Default)]
+pub struct SummaryCache {
+    summaries: HashMap<PathBuf, (FileFingerprint, Option<SessionSummary>)>,
+}
+
+pub fn prompt_title(text: Option<&str>) -> String {
+    truncate_for_preview(text.and_then(first_line).unwrap_or("Media prompt"))
+}
+
+pub fn sessions_dir() -> Option<PathBuf> {
+    aether_home().map(|home| home.join("sessions"))
+}
+
+pub fn session_index_path() -> Option<PathBuf> {
+    aether_home().map(|home| home.join("session-index.sqlite"))
+}
+
 impl SessionStore {
     pub fn new() -> Result<Self, SessionStoreError> {
-        let home = aether_home().ok_or(SessionStoreError::MissingAetherHome)?;
-        Ok(Self::from_path(home.join("sessions")))
+        sessions_dir().map(Self::from_path).ok_or(SessionStoreError::MissingAetherHome)
     }
 
     pub fn from_path(dir: PathBuf) -> Self {
@@ -95,14 +113,14 @@ impl SessionStore {
     }
 
     pub fn append_meta(&self, session_id: &str, meta: &SessionMeta) -> Result<(), SessionStoreError> {
-        self.append_line(session_id, meta)
+        self.append_json(session_id, meta)
     }
 
     pub fn append_event(&self, session_id: &str, event: &SessionEvent) -> Result<(), SessionStoreError> {
         if !event.is_persisted() {
             return Ok(());
         }
-        self.append_line(session_id, event)?;
+        self.append_json(session_id, event)?;
         if let Some(prompt) = event.user_content()
             && let Some(meta) = self.session_meta(session_id)
         {
@@ -133,20 +151,27 @@ impl SessionStore {
         let mut meta: SessionMeta = serde_json::from_str(first.trim())
             .map_err(|source| SessionStoreError::InvalidMetadata { line_number: 1, source })?;
         meta.cwd = new_cwd.to_path_buf();
-        let meta_line = serde_json::to_string(&meta)?;
-
-        let tmp_path = path.with_extension("jsonl.tmp");
-        {
-            let mut file = File::create(&tmp_path)?;
-            writeln!(file, "{meta_line}")?;
-            for line in lines {
-                writeln!(file, "{line}")?;
-            }
+        let mut rewritten = serde_json::to_string(&meta)?;
+        rewritten.push('\n');
+        for line in lines {
+            rewritten.push_str(line);
+            rewritten.push('\n');
         }
-        fs::rename(tmp_path, &path)?;
+        write_atomic(&path, rewritten.as_bytes())?;
 
         let _ = self.prompt_history.relocate_session(session_id, new_cwd);
         Ok(())
+    }
+
+    pub fn set_title(&self, session_id: &str, title: &str) -> Result<String, SessionStoreError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(SessionStoreError::InvalidTitle);
+        }
+        fs::metadata(self.session_path(session_id))?;
+        let title = truncate_for_preview(title);
+        write_atomic(&title_path(&self.session_path(session_id)), title.as_bytes())?;
+        Ok(title)
     }
 
     pub fn rebuild_prompt_history(&self) -> Result<(), SessionStoreError> {
@@ -157,12 +182,24 @@ impl SessionStore {
     }
 
     pub fn list(&self) -> Vec<SessionSummary> {
+        self.list_cached(&mut SummaryCache::default())
+    }
+
+    pub fn list_cached(&self, cache: &mut SummaryCache) -> Vec<SessionSummary> {
         let Ok(files) = discover_session_files(&self.dir) else {
             return Vec::new();
         };
 
-        let mut summaries: Vec<SessionSummary> =
-            files.into_iter().filter_map(|file| read_session_summary(&file.path).ok()).collect();
+        let mut previous = std::mem::take(&mut cache.summaries);
+        let mut summaries = Vec::with_capacity(files.len());
+        for file in files {
+            let summary = match previous.remove(&file.path) {
+                Some((fingerprint, summary)) if fingerprint == file.fingerprint => summary,
+                _ => read_session_summary(&file.path).ok(),
+            };
+            summaries.extend(summary.clone().map(|summary| with_stored_title(summary, &file.path)));
+            cache.summaries.insert(file.path, (file.fingerprint, summary));
+        }
 
         summaries.sort_by(|a, b| {
             b.meta.created_at.cmp(&a.meta.created_at).then_with(|| b.meta.session_id.cmp(&a.meta.session_id))
@@ -182,16 +219,8 @@ impl SessionStore {
         SessionLog::open(self.session_path(session_id)).ok().map(|log| log.meta)
     }
 
-    fn append_line<T: Serialize>(&self, session_id: &str, value: &T) -> Result<(), SessionStoreError> {
-        fs::create_dir_all(&self.dir)?;
-        let path = self.session_path(session_id);
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(value)?;
-        writeln!(file, "{line}")?;
-        // A crash mid-turn must not erase the turns that completed before it; flush
-        // each appended line to disk before returning to the actor.
-        file.sync_all()?;
-        Ok(())
+    fn append_json<T: Serialize>(&self, session_id: &str, value: &T) -> Result<(), SessionStoreError> {
+        Ok(append_line(&self.session_path(session_id), &serde_json::to_string(value)?)?)
     }
 
     fn session_path(&self, session_id: &str) -> PathBuf {
@@ -216,6 +245,17 @@ fn read_session_summary(path: &Path) -> Result<SessionSummary, SessionStoreError
     Ok(SessionSummary { meta: scan.meta, title })
 }
 
+fn with_stored_title(mut summary: SessionSummary, log_path: &Path) -> SessionSummary {
+    if let Ok(title) = fs::read_to_string(title_path(log_path)) {
+        summary.title = Some(title);
+    }
+    summary
+}
+
+fn title_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("title")
+}
+
 fn read_session_preview(path: &Path, limits: ScanLimits) -> Result<SessionPreviewResponse, SessionStoreError> {
     let scan = read_bounded_session(path, limits)?;
     let meta = scan.meta;
@@ -237,7 +277,7 @@ fn read_session_preview(path: &Path, limits: ScanLimits) -> Result<SessionPrevie
             {
                 truncated = true;
             }
-            SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Call { .. } | ToolEvent::Refused { .. })) => {
+            SessionEvent::Agent(AgentEvent::Tool(ToolEvent::Call { .. })) => {
                 tool_call_count += 1;
             }
             _ => {}
@@ -308,7 +348,5 @@ fn truncate_for_preview(text: &str) -> String {
 }
 
 fn extract_title(content: &[ContentBlock]) -> String {
-    let first_line =
-        ContentBlock::first_text(content).and_then(|text| text.lines().next()).unwrap_or("Media prompt").trim();
-    truncate_for_preview(first_line)
+    prompt_title(ContentBlock::first_text(content))
 }

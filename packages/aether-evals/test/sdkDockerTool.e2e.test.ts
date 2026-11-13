@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   Container,
   DockerAgent,
+  evalEnvVars,
   Image,
   Task,
   Transcript,
@@ -27,6 +28,7 @@ describe.skipIf(process.env.AETHER_EVALS_DOCKER_E2E !== "1")(
       const agent = new DockerAgent({
         container,
         command: ["node", "/app/dist/eval-agent.js"],
+        env: { ...evalEnvVars(MODEL), AETHER_EVAL_MODEL: MODEL },
       });
       process.stderr.write(
         "[e2e] building image + running agent (first run builds, ~1 min)…\n",
@@ -48,6 +50,8 @@ describe.skipIf(process.env.AETHER_EVALS_DOCKER_E2E !== "1")(
         event: { type: "ended" },
       });
       expect(getWeatherCall?.argumentsJson()).toMatchObject({ city: "Tokyo" });
-    }, 1_200_000);
+    });
   },
 );
+
+const MODEL = process.env.AETHER_EVAL_MODEL ?? "zai:glm-5.3";

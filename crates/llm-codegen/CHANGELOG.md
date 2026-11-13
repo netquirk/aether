@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.35](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.34...aether-llm-codegen-v0.2.35) - 2026-11-03
+
+### Added
+
+- add gpt-6.1-terra to codex subscription models ([#642](https://github.com/contextbridge/aether/pull/642))
+
+## [0.2.34](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.33...aether-llm-codegen-v0.2.34) - 2026-10-20
+
+### Fixed
+
+- *(llm)* send adaptive thinking to Claude and replay reasoning in order ([#622](https://github.com/contextbridge/aether/pull/622))
+
+## [0.2.33](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.32...aether-llm-codegen-v0.2.33) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.2.32](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.31...aether-llm-codegen-v0.2.32) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+
+## [0.2.31](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.30...aether-llm-codegen-v0.2.31) - 2026-10-08
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.2.30](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.29...aether-llm-codegen-v0.2.30) - 2026-10-03
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.2.29](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.28...aether-llm-codegen-v0.2.29) - 2026-10-01
+
+### Added
+
+- add gpt-6.1-sol to codex subscription models ([#548](https://github.com/contextbridge/aether/pull/548))
+
+### Fixed
+
+- support bedrock gpt-6.1-sol routing and clean up dependencies ([#553](https://github.com/contextbridge/aether/pull/553))
+
+## [0.2.28](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.27...aether-llm-codegen-v0.2.28) - 2026-09-27
+
+### Other
+
+- updated the following local packages: aether-utils
+
+## [0.2.27](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.26...aether-llm-codegen-v0.2.27) - 2026-09-24
+
+### Fixed
+
+- route Bedrock US GPT-6 profiles through Runtime Responses ([#517](https://github.com/contextbridge/aether/pull/517))
+
+## [0.2.26](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.25...aether-llm-codegen-v0.2.26) - 2026-09-23
+
+### Added
+
+- *(llm)* add Xiaomi provider ([#505](https://github.com/contextbridge/aether/pull/505))
+- add Codex GPT-6 subscription models ([#513](https://github.com/contextbridge/aether/pull/513))
+
 ## [0.2.25](https://github.com/contextbridge/aether/compare/aether-llm-codegen-v0.2.24...aether-llm-codegen-v0.2.25) - 2026-09-20
 
 ### Other

@@ -1,34 +1,33 @@
-use crate::screens::reviewer::{crossterm_event, theme_selection};
-use crate::surfaces::elicitation::ElicitationResponder;
-use crate::surfaces::input::{ArtifactReviewOutput, ReviewOutcome, UiEvent};
+use crate::screens::reviewer::{crossterm_event, theme_change};
+use crate::surfaces::input::UiOutput;
 use crate::surfaces::modal::frame::ModalFrame;
-use agent_client_protocol::schema::v2::ElicitationContentValue;
 use crate::view::generation::Generation;
+use crate::view::input::UiEvent;
 use crate::{renderer::DrawContext, settings::builtin_review_theme_choices};
 use clankerdiff_ratatui::ReviewCapabilities;
 use clankerdiff_ratatui::markdown::{MarkdownDocument, MarkdownReviewEvent};
 use clankerdiff_ratatui::{InputOutcome, MarkdownReviewState, MarkdownReviewWidget};
+use client_core::elicitation::{ElicitationAnswer, ElicitationId};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Position, Rect},
-    style::Style,
     widgets::{Clear, Paragraph, StatefulWidget, Widget},
 };
 use std::sync::Arc;
 use utils::artifact_review::{ArtifactReviewElicitationMeta, ArtifactReviewSubmission};
 
 pub struct ArtifactReviewScreen {
+    id: ElicitationId,
     title: String,
     state: MarkdownReviewState,
-    responder: ElicitationResponder,
     error: Option<String>,
     confirming_approval: bool,
     theme_generation: Option<Generation>,
 }
 
 impl ArtifactReviewScreen {
-    pub fn new(meta: ArtifactReviewElicitationMeta, responder: impl Into<ElicitationResponder>) -> Self {
+    pub fn new(id: ElicitationId, meta: ArtifactReviewElicitationMeta) -> Self {
         let document = MarkdownDocument::parse_with_metadata(
             meta.path.as_ref().map(|path| path.display().to_string()),
             Some(meta.title.clone()),
@@ -36,26 +35,20 @@ impl ArtifactReviewScreen {
         );
         let mut state = MarkdownReviewState::new(Arc::new(document));
         state.set_theme_choices(builtin_review_theme_choices());
-        state.set_capabilities(ReviewCapabilities {
-            repository: false,
-            refresh: false,
-            scope: false,
-            submit: true,
-            clipboard: false,
-        });
-        Self { title: meta.title, state, responder: responder.into(), error: None, confirming_approval: false, theme_generation: None }
+        state.set_capabilities(ReviewCapabilities { submit: true, ..ReviewCapabilities::NONE });
+        Self { id, title: meta.title, state, error: None, confirming_approval: false, theme_generation: None }
     }
 
     pub fn set_theme_choices(&mut self, choices: Vec<clankerdiff_ratatui::ThemeChoice>) {
         self.state.set_theme_choices(choices);
     }
 
-    pub fn on_ui_event(&mut self, event: UiEvent) -> Vec<ArtifactReviewOutput> {
+    pub fn on_ui_event(&mut self, event: &UiEvent) -> Vec<UiOutput> {
         self.handle_event(crossterm_event(event))
     }
 
-    pub fn cancel(&mut self) {
-        self.responder.cancel();
+    pub fn id(&self) -> ElicitationId {
+        self.id
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, cx: &mut DrawContext<'_>) -> Option<Position> {
@@ -67,9 +60,7 @@ impl ArtifactReviewScreen {
         MarkdownReviewWidget::new().title(&self.title).render(area, buf, &mut self.state);
         if let Some(error) = &self.error {
             let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, area.height.min(1));
-            Paragraph::new(error.as_str())
-                .style(Style::new().fg(cx.theme.error).bg(cx.theme.background))
-                .render(footer, buf);
+            Paragraph::new(error.as_str()).style((cx.theme.error, cx.theme.background)).render(footer, buf);
         }
         if self.confirming_approval {
             let frame = ModalFrame::new(
@@ -81,27 +72,25 @@ impl ArtifactReviewScreen {
             );
             (&frame).render(area, buf);
             Paragraph::new("Approve this artifact without feedback?")
-                .style(Style::new().fg(cx.theme.text_primary))
+                .style(cx.theme.text_primary)
                 .render(frame.inner(area), buf);
             return None;
         }
         self.state.cursor_position()
     }
 
-    fn submit(&mut self, submission: ArtifactReviewSubmission) -> Vec<ArtifactReviewOutput> {
-        self.responder.accept(Some(submission.fields().map(|(name, value)| {
-            (name.to_string(), ElicitationContentValue::String(value.to_string()))
-        }).collect()));
-        vec![match submission {
-            ArtifactReviewSubmission::Approved => ArtifactReviewOutput::Approved,
-            ArtifactReviewSubmission::Feedback { feedback } => ArtifactReviewOutput::Outcome(ReviewOutcome::Submitted(feedback)),
-        }]
+    fn submit(&self, submission: ArtifactReviewSubmission) -> Vec<UiOutput> {
+        let answer = ElicitationAnswer::accept_strings(submission.fields());
+        vec![
+            UiOutput::AnswerElicitation { id: self.id, answer },
+            UiOutput::ArtifactReviewed(match submission {
+                ArtifactReviewSubmission::Approved => "Artifact approved".to_string(),
+                ArtifactReviewSubmission::Feedback { feedback } => feedback,
+            }),
+        ]
     }
 
-    fn handle_event(&mut self, event: Event) -> Vec<ArtifactReviewOutput> {
-        if self.responder.is_answered() {
-            return Vec::new();
-        }
+    fn handle_event(&mut self, event: Event) -> Vec<UiOutput> {
         if self.confirming_approval {
             if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
@@ -123,15 +112,14 @@ impl ArtifactReviewScreen {
             }
         };
         match outcome {
-            InputOutcome::Ignored | InputOutcome::Consumed => Vec::new(),
-            InputOutcome::ThemeSelected(id) => vec![ArtifactReviewOutput::SetTheme(theme_selection(id))],
+            InputOutcome::Ignored | InputOutcome::Consumed | InputOutcome::ViewModeSelected(_) => Vec::new(),
+            InputOutcome::ThemeSelected(id) => vec![theme_change(id)],
             InputOutcome::Emitted(MarkdownReviewEvent::CopyFormatted(_)) => {
                 self.error = Some("Clipboard is disabled".into());
                 Vec::new()
             }
             InputOutcome::Emitted(MarkdownReviewEvent::Cancel) => {
-                self.cancel();
-                vec![ArtifactReviewOutput::Outcome(ReviewOutcome::Cancelled)]
+                vec![UiOutput::AnswerElicitation { id: self.id, answer: ElicitationAnswer::Cancel }, UiOutput::Close]
             }
             InputOutcome::Emitted(MarkdownReviewEvent::Submit(submission)) => {
                 if submission.comments.is_empty() {

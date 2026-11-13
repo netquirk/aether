@@ -3,19 +3,22 @@ use crate::acp::session::git_diff::GitDiffService;
 use acp_utils::elicitation;
 use acp_utils::notifications::{GitDiffEventPayload, McpNotification};
 use aether_auth::OAuthCredentialStorage;
-use aether_core::events::{AgentCommand, AgentEvent, Command, MessageEvent, TurnOutcome};
-use aether_core::mcp::McpHandle;
-use aether_sessions::model::{SessionControlEvent, SessionEvent, UserEvent, last_session_usage};
+use aether_core::core::AgentDeps;
+use aether_core::events::{AgentCommand, AgentEvent, Command, TurnEvent, TurnOutcome};
+use aether_core::mcp::McpCatalog;
+use aether_sessions::model::{SessionControlEvent, SessionEvent, last_session_usage};
 use aether_sessions::transcript::conversation_messages_from_events;
-use agent_client_protocol::schema::v2::{self as acp, PromptResponse, SessionId, SetSessionConfigOptionResponse};
+use agent_client_protocol::v2::schema::{
+    self as acp, IdleStateUpdate, PromptResponse, RunningStateUpdate, SessionId, SessionUpdate,
+    SetSessionConfigOptionResponse, StateUpdate, StopReason,
+};
 use agent_client_protocol::{Client, ConnectionTo, Error, Responder};
 use clankerdiff_protocol::client::ClientCommand;
 use clankerdiff_protocol::shared::{DocumentUpdate, Event};
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use llm::catalog::LlmModel;
-use llm::parser::ModelProviderParser;
-use llm::{ChatMessage, ContentBlock, ProviderConnectionOverrides};
-use mcp_utils::client::{ElicitationRequest, McpClientEvent, McpServerStatusEntry, cancel_result};
+use llm::{ChatMessage, ContentBlock, MessageId, ProviderConnectionOverrides};
+use mcp_utils::client::{Elicitation, ElicitationRequest};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -23,30 +26,31 @@ use std::sync::Arc;
 use tokio::process::Command as ProcessCommand;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Duration, Instant, sleep_until};
+use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use utils::mcp_status::{McpServerStatus, McpServerStatusEntry};
 
 use super::agent_key::AgentKey;
 use super::agents::SessionAgents;
 use super::config::{SessionConfigState, Switch};
 use super::config_setting::ConfigSetting;
 use super::error::SessionError;
+use super::hooks::SessionHooks;
 use super::model::Modes;
+use super::prompts::{PromptQueue, SubmittedPrompt};
 use super::runtime::{AgentRuntime, RuntimeFactory};
-use super::slash_commands::{expand_slash_command_in_content, send_available_commands};
-use crate::acp::protocol::commands::map_mcp_prompt_to_available_command;
-use crate::acp::protocol::content::map_user_message;
-use crate::acp::protocol::events::{NotificationMode, project_agent_event};
+use crate::acp::protocol::commands::available_commands;
+use crate::acp::protocol::events::{NotificationMode, project_agent_event, stop_reason};
 use crate::acp::protocol::replay::replay_to_client;
-use crate::acp::server::DetachedArgs;
 use crate::acp::state::validate_prompt_support;
 use crate::output::print_message;
-use crate::slash_commands::dedupe_commands_by_name;
+use crate::slash_commands::{expand_slash_command_in_content, prompt_commands};
 use aether_sessions::SessionStore;
 
 /// Capacity of the per-session command channel feeding the actor loop.
 const SESSION_COMMAND_CHANNEL_CAPACITY: usize = 50;
+const ELICITATION_CHANNEL_CAPACITY: usize = 32;
 
 /// A command routed to a single session's actor. The actor is the only consumer
 /// of these, so per-session state never needs an additional lock.
@@ -60,7 +64,6 @@ pub(crate) enum SessionCommand {
     Attach {
         connection: ConnectionTo<Client>,
         replay: bool,
-        available: Vec<LlmModel>,
         cwd: PathBuf,
         mcp_servers: Vec<acp::McpServer>,
         reply: oneshot::Sender<Result<Vec<acp::SessionConfigOption>, Error>>,
@@ -70,7 +73,6 @@ pub(crate) enum SessionCommand {
     },
     SetConfig {
         setting: ConfigSetting,
-        available: Vec<LlmModel>,
         responder: Responder<SetSessionConfigOptionResponse>,
     },
     GitDiff {
@@ -80,9 +82,29 @@ pub(crate) enum SessionCommand {
     AuthenticateMcp {
         server_name: String,
     },
-    RefreshConfigOptions {
-        available: Vec<LlmModel>,
-    },
+    RefreshConfigOptions,
+}
+
+impl SessionCommand {
+    pub(crate) fn reject(self, error: Error) {
+        match self {
+            Self::Prompt { client_connection, .. } => client_connection.respond_with_error(error),
+            Self::SetConfig { responder, .. } => {
+                let _ = responder.respond_with_error(error);
+            }
+            Self::Attach { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Detach { reply } => {
+                let _ = reply.send(());
+            }
+            Self::Cancel
+            | Self::GitDiff { .. }
+            | Self::GitDiffClose
+            | Self::AuthenticateMcp { .. }
+            | Self::RefreshConfigOptions => {}
+        }
+    }
 }
 
 pub(crate) enum ClientConnection {
@@ -146,12 +168,20 @@ impl SessionIo {
         Self { connection, session_id }
     }
 
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) fn for_session(&self, session_id: SessionId) -> Self {
+        Self { connection: self.connection.clone(), session_id }
+    }
+
     pub(crate) fn send_update(&self, update: acp::SessionUpdate) {
         self.send(acp::UpdateSessionNotification::new(self.session_id.clone(), update));
     }
 
     pub(crate) fn send_git_diff_event(&self, event: Event<DocumentUpdate>) {
-        self.send(GitDiffEventPayload { session_id: self.session_id.0.to_string(), event });
+        self.send(GitDiffEventPayload { session_id: self.session_id.clone(), event });
     }
 
     pub(crate) fn send(&self, notification: impl agent_client_protocol::JsonRpcNotification) {
@@ -168,14 +198,16 @@ pub(crate) struct SessionActorInit {
     pub connection: Option<ConnectionTo<Client>>,
     pub repository: Arc<SessionStore>,
     pub oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
+    pub agent_deps: AgentDeps,
     pub active_agent: AgentKey,
     pub specs: SessionAgents,
     pub runtime_factory: Arc<dyn RuntimeFactory>,
     pub transcript: Vec<SessionEvent>,
     pub replay: bool,
     pub modes: Modes,
+    pub available: Arc<[LlmModel]>,
     pub config: SessionConfigState,
-    pub detached: DetachedArgs,
+    pub hooks: SessionHooks,
 }
 
 /// The mutable per-session state. The actor loop is the only owner; all mutation
@@ -187,40 +219,24 @@ pub(crate) struct SessionActor {
     mcp_servers: Vec<acp::McpServer>,
     repository: Arc<SessionStore>,
     oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
+    agent_deps: AgentDeps,
     cancel: CancellationToken,
     active_agent: AgentKey,
     specs: SessionAgents,
     runtimes: HashMap<AgentKey, AgentRuntime>,
     runtime_factory: Arc<dyn RuntimeFactory>,
+    elicitation_tx: mpsc::Sender<Elicitation>,
+    elicitation_rx: mpsc::Receiver<Elicitation>,
     transcript: Vec<SessionEvent>,
     config: SessionConfigState,
     modes: Modes,
-    turn: TurnState,
-    preparation: JoinSet<Vec<ContentBlock>>,
-    command_refresh: Option<BoxFuture<'static, Result<Vec<acp::AvailableCommand>, SessionError>>>,
-    authentications: FuturesUnordered<BoxFuture<'static, Result<(), SessionError>>>,
+    available: Arc<[LlmModel]>,
+    prompts: PromptQueue,
+    command_refresh: Option<BoxFuture<'static, Vec<acp::AvailableCommand>>>,
+    advertised_servers: Option<Vec<String>>,
     idle_commands: JoinSet<()>,
-    detached: DetachedArgs,
+    hooks: SessionHooks,
     idle_deadline: Option<Instant>,
-}
-
-#[derive(Default)]
-enum TurnState {
-    #[default]
-    Idle,
-    Preparing {
-        responder: ClientConnection,
-        display_content: Vec<ContentBlock>,
-    },
-    Running,
-}
-
-/// List a runtime's MCP prompts as ACP available commands, de-duplicated by
-/// name. Used at actor startup and after agent switches.
-async fn available_commands_for(mcp: McpHandle) -> Result<Vec<acp::AvailableCommand>, SessionError> {
-    let prompts = mcp.list_prompts().await.map_err(SessionError::McpOperation)?;
-    let prompt_commands = prompts.iter().map(map_mcp_prompt_to_available_command).collect();
-    Ok(dedupe_commands_by_name(prompt_commands))
 }
 
 impl SessionActor {
@@ -228,6 +244,7 @@ impl SessionActor {
         let cancel = CancellationToken::new();
         let io = SessionIo::new(init.connection, init.session_id.clone());
         let git_diff = GitDiffService::new(init.cwd.clone(), io.clone());
+        let (elicitation_tx, elicitation_rx) = mpsc::channel(ELICITATION_CHANNEL_CAPACITY);
         let mut actor = SessionActor {
             io,
             git_diff,
@@ -235,24 +252,29 @@ impl SessionActor {
             mcp_servers: init.mcp_servers,
             repository: init.repository,
             oauth_credential_store: init.oauth_credential_store,
+            agent_deps: init.agent_deps,
             cancel: cancel.clone(),
             active_agent: init.active_agent,
             specs: init.specs,
             runtimes: HashMap::new(),
             runtime_factory: init.runtime_factory,
+            elicitation_tx,
+            elicitation_rx,
             transcript: init.transcript,
             config: init.config,
             modes: init.modes,
-            turn: TurnState::Idle,
-            preparation: JoinSet::new(),
+            available: init.available,
+            prompts: PromptQueue::default(),
             command_refresh: None,
-            authentications: FuturesUnordered::new(),
+            advertised_servers: None,
             idle_commands: JoinSet::new(),
-            detached: init.detached,
+            hooks: init.hooks,
             idle_deadline: None,
         };
         actor.reset_idle_deadline();
-        actor.ensure_active_running().await?;
+        let active = actor.active_agent.clone();
+        let messages = conversation_messages_from_events(&actor.transcript);
+        actor.ensure_running_with(&active, messages).await?;
         if init.replay {
             replay_to_client(&actor.transcript, &actor.io);
         }
@@ -263,25 +285,22 @@ impl SessionActor {
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<SessionCommand>) {
-        if let Ok(runtime) = self.active_runtime() {
-            send_mcp_server_status(&self.io, runtime.mcp_server_statuses());
-        }
-        self.refresh_available_commands();
+        self.publish_active_mcps();
         let shutdown = self.cancel.clone();
         loop {
             let runtime = self.runtimes.get_mut(&self.active_agent).expect("active runtime is running");
+            let (agent_events, mcp_changes) = runtime.events();
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
-                    self.cancel_turn().await;
-                    self.git_diff.close().await;
+                    self.shutdown().await;
                     break;
                 }
                 Some(cmd) = cmd_rx.recv() => {
                     self.on_session_command(cmd).await;
                 }
                 () = sleep_until(self.idle_deadline.unwrap_or_else(Instant::now)),
-                    if self.idle_deadline.is_some() && matches!(self.turn, TurnState::Idle) =>
+                    if self.idle_deadline.is_some() && self.prompts.is_idle() =>
                 {
                     self.idle_deadline = None;
                     self.spawn_idle_command();
@@ -291,43 +310,21 @@ impl SessionActor {
                         warn!(%error, "Idle command task failed");
                     }
                 }
-                Some(content) = self.preparation.join_next(), if !self.preparation.is_empty() => {
-                    match content {
-                        Ok(content) => self.accept_prompt(content).await,
-                        Err(error) => {
-                            error!("Prompt preparation task failed: {error}");
-                            if let TurnState::Preparing { responder, .. } = self.take_turn() {
-                                responder.respond_with_error(Error::internal_error());
-                            }
-                        }
-                    }
+                Some((message_id, content)) = self.prompts.next_prepared(), if self.prompts.is_preparing() => {
+                    self.submit_prompt(message_id, content).await;
                 }
-                Some(result) = self.authentications.next(), if !self.authentications.is_empty() => {
-                    if let Err(error) = result {
-                        error!("MCP server authentication failed: {error}");
-                    }
-                }
-                result = async { self.command_refresh.as_mut().unwrap().await }, if self.command_refresh.is_some() => {
+                commands = async { self.command_refresh.as_mut().unwrap().await }, if self.command_refresh.is_some() => {
                     self.command_refresh = None;
-                    match result {
-                        Ok(commands) => send_available_commands(&self.io, commands),
-                        Err(error) => error!("Failed to refresh available commands: {error}"),
-                    }
+                    let update = acp::AvailableCommandsUpdate::new(commands);
+                    self.io.send_update(SessionUpdate::AvailableCommandsUpdate(update));
                 }
-                Some(message) = runtime.agent_rx.recv() => {
-                    self.record_agent_event(&message);
-                    if matches!(self.turn, TurnState::Running)
-                        && let Some(outcome) = message.turn_outcome()
-                    {
-                        self.finish_turn(turn_result(outcome)).await;
-                    }
+                Some(event) = agent_events.recv() => {
+                    self.on_agent_event(event).await;
                 }
-                Some(event) = runtime.event_rx.recv() => {
-                    let refresh_commands = matches!(event, McpClientEvent::ConnectionReady(_));
-                    on_mcp_client_event(&self.io, event);
-                    if refresh_commands {
-                        self.refresh_available_commands();
-                    }
+                Some(elicitation) = self.elicitation_rx.recv() => on_elicitation(&self.io, elicitation),
+                Some(()) = mcp_changes.next() => {
+                    let statuses = self.active_runtime().mcp().statuses();
+                    self.publish_mcps(statuses);
                 }
                 else => break,
             }
@@ -338,14 +335,22 @@ impl SessionActor {
         }
     }
 
-    fn refresh_available_commands(&mut self) {
-        if let Ok(runtime) = self.active_runtime() {
-            self.command_refresh = Some(available_commands_for(runtime.mcp().clone()).boxed());
+    fn refresh_available_commands(&mut self, servers: &[McpServerStatusEntry]) {
+        let connected = servers
+            .iter()
+            .filter(|server| matches!(server.status, McpServerStatus::Connected { .. }))
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        if self.advertised_servers.as_ref() == Some(&connected) {
+            return;
         }
+        let mcp = self.active_runtime().mcp().clone();
+        self.command_refresh = Some(async move { available_commands(&prompt_commands(&mcp).await) }.boxed());
+        self.advertised_servers = Some(connected);
     }
 
-    fn active_runtime(&self) -> Result<&AgentRuntime, SessionError> {
-        self.runtimes.get(&self.active_agent).ok_or(SessionError::ActiveRuntimeNotRunning)
+    fn active_runtime(&self) -> &AgentRuntime {
+        self.runtimes.get(&self.active_agent).expect("the active agent's runtime runs for the whole session")
     }
 
     fn active_provider_connections(&self) -> ProviderConnectionOverrides {
@@ -371,20 +376,11 @@ impl SessionActor {
 
     async fn sync_active_conversation(&mut self) -> Result<(), SessionError> {
         let messages = conversation_messages_from_events(&self.transcript);
-        self.active_runtime()?.replace_conversation(messages).await
+        self.active_runtime().replace_conversation(messages).await
     }
 
     async fn send_active_command(&mut self, command: Command) -> Result<(), SessionError> {
-        self.active_runtime()?.send_agent_command(command).await
-    }
-
-    async fn ensure_active_running(&mut self) -> Result<(), SessionError> {
-        if self.runtimes.contains_key(&self.active_agent) {
-            return Ok(());
-        }
-        let active = self.active_agent.clone();
-        let messages = conversation_messages_from_events(&self.transcript);
-        self.ensure_running_with(&active, messages).await
+        self.active_runtime().send_agent_command(command).await
     }
 
     async fn ensure_running_with(&mut self, target: &AgentKey, messages: Vec<ChatMessage>) -> Result<(), SessionError> {
@@ -397,46 +393,33 @@ impl SessionActor {
         let runtime = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return Err(SessionError::Cancelled),
-            runtime = self.runtime_factory.spawn(target.clone(), spec, messages, usage_seed) => runtime?,
+            runtime = self.runtime_factory.spawn(spec, messages, usage_seed, self.elicitation_tx.clone()) => runtime?,
         };
         self.runtimes.insert(target.clone(), runtime);
         Ok(())
     }
 
-    fn record_event(&mut self, event: SessionEvent) {
-        self.transcript.push(event);
-    }
-
     fn reset_idle_deadline(&mut self) {
-        self.idle_deadline = if self.io.connection.is_none() && matches!(self.turn, TurnState::Idle) {
-            self.detached.idle_after.and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)))
+        self.idle_deadline = if self.io.connection.is_none() && self.prompts.is_idle() {
+            self.hooks.idle.as_ref().and_then(|idle| Instant::now().checked_add(idle.after))
         } else {
             None
         };
     }
 
-    fn take_turn(&mut self) -> TurnState {
-        let turn = std::mem::take(&mut self.turn);
-        self.reset_idle_deadline();
-        turn
-    }
-
     fn spawn_idle_command(&mut self) {
-        let Some(command) = self.detached.on_idle.clone() else { return };
-        self.idle_commands.spawn(run_idle_command(self.cwd.clone(), command));
+        let Some(idle) = &self.hooks.idle else { return };
+        self.idle_commands.spawn(run_idle_command(self.cwd.clone(), idle.command.clone()));
     }
 }
 
 impl SessionActor {
     async fn on_session_command(&mut self, cmd: SessionCommand) {
         match cmd {
-            SessionCommand::Prompt { client_connection: responder, .. } if !matches!(self.turn, TurnState::Idle) => {
-                responder.respond_with_error(Error::invalid_request());
-            }
             SessionCommand::Prompt { content, display_content, client_connection: responder } => {
                 self.start_prompt(content, display_content, responder).await;
             }
-            SessionCommand::Attach { connection, cwd, mcp_servers, replay, available, reply } => {
+            SessionCommand::Attach { connection, cwd, mcp_servers, replay, reply } => {
                 if self.cwd != cwd || self.mcp_servers != mcp_servers {
                     let _ = reply
                         .send(Err(Error::invalid_params().data("live session cwd and MCP servers cannot be changed")));
@@ -447,16 +430,14 @@ impl SessionActor {
                 if replay {
                     replay_to_client(&self.transcript, &self.io);
                 }
-                let state = match self.turn {
-                    TurnState::Running => acp::StateUpdate::Running(acp::RunningStateUpdate::new()),
-                    TurnState::Idle | TurnState::Preparing { .. } => {
-                        acp::StateUpdate::Idle(acp::IdleStateUpdate::new())
-                    }
+                let state = if self.prompts.is_running() {
+                    StateUpdate::Running(RunningStateUpdate::new())
+                } else {
+                    StateUpdate::Idle(IdleStateUpdate::new())
                 };
                 self.io.send_update(acp::SessionUpdate::StateUpdate(state));
-                let _ = self.publish_active_mcps();
-                let options = self.config.config_options(&self.modes, &available, self.oauth_credential_store.as_ref());
-                let _ = reply.send(Ok(options));
+                self.publish_active_mcps();
+                let _ = reply.send(Ok(self.config_options()));
             }
             SessionCommand::Detach { reply } => {
                 self.io.connection = None;
@@ -464,26 +445,20 @@ impl SessionActor {
                 let _ = reply.send(());
             }
             SessionCommand::Cancel => self.cancel_turn().await,
-            SessionCommand::SetConfig { setting, available, responder } => {
-                let result = if matches!(self.turn, TurnState::Idle) {
-                    self.apply_idle_config_change(&setting, &available).await
-                } else {
-                    self.apply_config_change(&setting, &available)
-                };
-                let _ = responder.respond_with_result(result);
+            SessionCommand::SetConfig { setting, responder } => {
+                let _ = responder.respond_with_result(self.set_config(&setting).await);
             }
-            SessionCommand::RefreshConfigOptions { available } => {
-                let options = self.config.config_options(&self.modes, &available, self.oauth_credential_store.as_ref());
+            SessionCommand::RefreshConfigOptions => {
+                let options = self.config_options();
                 self.io.send_update(acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(options)));
             }
             SessionCommand::AuthenticateMcp { server_name } => {
-                if let Ok(runtime) = self.active_runtime() {
-                    let mcp = runtime.mcp().clone();
-                    self.authentications.push(
-                        async move { mcp.authenticate_server(&server_name).await.map_err(SessionError::McpOperation) }
-                            .boxed(),
-                    );
-                }
+                let mcp = self.active_runtime().mcp().clone();
+                tokio::spawn(async move {
+                    if let Err(error) = mcp.authenticate(&server_name).await {
+                        warn!(%error, server = server_name, "MCP server authentication failed");
+                    }
+                });
             }
             SessionCommand::GitDiff { command } => self.git_diff.command(command).await,
             SessionCommand::GitDiffClose => self.git_diff.close().await,
@@ -496,14 +471,20 @@ impl SessionActor {
         display_content: Vec<ContentBlock>,
         responder: ClientConnection,
     ) {
-        if let Err(error) = validate_prompt_support(&self.config.effective_model(&self.modes), &content) {
+        let idle = self.prompts.is_idle();
+        let model = if idle { self.config.effective_model(&self.modes) } else { self.config.active_model.clone() };
+        if let Err(error) = validate_prompt_support(&model, &content) {
             responder.respond_with_error(error);
             return;
         }
-        match self.prepare_prompt_runtime().await {
+        match self.prepare_prompt_runtime(idle).await {
             Ok(mcp) => {
-                self.preparation.spawn(async move { expand_slash_command_in_content(&mcp, content).await });
-                self.turn = TurnState::Preparing { responder, display_content };
+                self.prompts.prepare(
+                    display_content,
+                    responder,
+                    async move { expand_slash_command_in_content(&mcp, content).await }.boxed(),
+                );
+                self.reset_idle_deadline();
             }
             Err(error) => {
                 error!("Prompt preparation failed: {error}");
@@ -512,77 +493,95 @@ impl SessionActor {
         }
     }
 
-    async fn cancel_turn(&mut self) {
-        if matches!(self.turn, TurnState::Running) {
-            let _ = self.send_active_command(Command::cancel()).await;
-            if self.cancel.is_cancelled() {
-                self.finish_turn(Ok(acp::StopReason::Cancelled)).await;
-            }
-        } else if let TurnState::Preparing { responder, .. } = self.take_turn() {
-            self.preparation.shutdown().await;
-            responder.respond(PromptResponse::new());
-            self.finish_turn(Ok(acp::StopReason::Cancelled)).await;
-        }
-    }
-
-    async fn accept_prompt(&mut self, content: Vec<ContentBlock>) {
-        let TurnState::Preparing { responder, display_content } = self.take_turn() else { return };
-        let message_id = llm::MessageId::new();
-        let user = map_user_message(message_id.to_string().into(), &display_content);
-        let event = SessionEvent::User(UserEvent::Message {
-            message_id: message_id.clone(),
-            display_content: (display_content != content).then_some(display_content),
-            content: content.clone(),
-        });
-        if let Err(error) = self.repository.append_event(&self.io.session_id.0, &event) {
-            error!("Failed to persist prompt: {error}");
-            responder.respond_with_error(Error::internal_error());
-            return;
-        }
-        self.record_event(event);
-        responder.respond(PromptResponse::new());
-        self.io.send_update(acp::SessionUpdate::UserMessage(user));
-        self.io.send_update(acp::SessionUpdate::StateUpdate(acp::StateUpdate::Running(acp::RunningStateUpdate::new())));
-        self.turn = TurnState::Running;
-        if let Err(error) = self.send_active_command(Command::with_message_id(message_id, content)).await {
-            self.finish_turn(Err(error)).await;
-        }
-    }
-
-    async fn finish_turn(&mut self, result: Result<acp::StopReason, SessionError>) {
-        self.take_turn();
-        let reason = match result {
-            Ok(reason) => {
-                info!("Turn completed, stop reason: {reason:?}");
-                reason
-            }
+    async fn submit_prompt(&mut self, message_id: MessageId, content: Vec<ContentBlock>) {
+        let command = Command::with_message_id(message_id.clone(), content.clone());
+        match self.send_active_command(command).await {
+            Ok(()) => self.prompts.submit(message_id, content),
             Err(error) => {
-                error!("Accepted prompt failed: {error}");
-                let message = AgentEvent::Message(MessageEvent::Text {
-                    message_id: llm::MessageId::new(),
-                    chunk: format!("Error: {error}"),
-                    is_complete: true,
-                });
-                self.record_agent_event(&message);
-                acp::StopReason::EndTurn
+                error!("Failed to submit prompt: {error}");
+                self.prompts.reject(&message_id, Error::internal_error());
+                self.settle().await;
             }
-        };
-        self.io.send_update(acp::SessionUpdate::StateUpdate(acp::StateUpdate::Idle(
-            acp::IdleStateUpdate::new().stop_reason(reason),
-        )));
-        if !self.cancel.is_cancelled() {
+        }
+    }
+
+    async fn cancel_turn(&mut self) {
+        self.prompts.cancel_preparing();
+        if self.prompts.has_agent_work() {
+            let _ = self.send_active_command(Command::cancel()).await;
+        } else {
+            self.settle().await;
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        self.cancel_turn().await;
+        self.prompts.cancel_submitted();
+        if self.prompts.is_running() {
+            self.finish_turn(StopReason::Cancelled).await;
+        }
+        self.git_diff.close().await;
+    }
+
+    async fn on_agent_event(&mut self, event: AgentEvent) {
+        match &event {
+            AgentEvent::Turn(TurnEvent::Started { .. }) => self.begin_turn(),
+            AgentEvent::Turn(TurnEvent::UserMessageInserted { message_id }) => self.insert_prompt(message_id),
+            AgentEvent::Turn(TurnEvent::UserMessageDiscarded { message_id }) => self.discard_prompt(message_id),
+            _ => {}
+        }
+        self.record_agent_event(&event);
+        if self.prompts.is_running()
+            && let Some(outcome) = event.turn_outcome()
+        {
+            if let TurnOutcome::Failed { error, .. } = outcome {
+                error!("Turn failed: {error}");
+            }
+            self.finish_turn(stop_reason(outcome)).await;
+        }
+    }
+
+    fn begin_turn(&mut self) {
+        self.prompts.turn_started();
+        self.reset_idle_deadline();
+        self.io.send_update(SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())));
+    }
+
+    fn insert_prompt(&mut self, message_id: &MessageId) {
+        let Some(SubmittedPrompt { responder, event, echo }) = self.prompts.take_submitted(message_id) else { return };
+        self.persist_event(event);
+        self.io.send_update(SessionUpdate::UserMessage(echo));
+        responder.respond(PromptResponse::new(message_id.to_string()));
+    }
+
+    fn discard_prompt(&mut self, message_id: &MessageId) {
+        if let Some(prompt) = self.prompts.take_submitted(message_id) {
+            prompt.responder.respond_with_error(Error::request_cancelled());
+        }
+    }
+
+    async fn finish_turn(&mut self, reason: acp::StopReason) {
+        info!("Turn completed, stop reason: {reason:?}");
+        self.prompts.turn_ended();
+        self.io.send_update(SessionUpdate::StateUpdate(StateUpdate::Idle(IdleStateUpdate::new().stop_reason(reason))));
+        self.settle().await;
+    }
+
+    async fn settle(&mut self) {
+        self.reset_idle_deadline();
+        if !self.cancel.is_cancelled() && self.prompts.is_idle() {
             let _ = self.apply_deferred_agent_switch().await;
         }
     }
 
-    async fn prepare_prompt_runtime(&mut self) -> Result<McpHandle, SessionError> {
-        let switch = self.config.begin_prompt(&self.modes);
-        self.apply_switch(switch).await?;
-
-        self.send_active_command(Command::agent(AgentCommand::SetReasoningEffort(self.config.reasoning_effort)))
-            .await?;
-
-        Ok(self.active_runtime()?.mcp().clone())
+    async fn prepare_prompt_runtime(&mut self, idle: bool) -> Result<McpCatalog, SessionError> {
+        if idle {
+            let switch = self.config.begin_prompt(&self.modes);
+            self.apply_switch(switch).await?;
+            self.send_active_command(Command::agent(AgentCommand::SetReasoningEffort(self.config.reasoning_effort)))
+                .await?;
+        }
+        Ok(self.active_runtime().mcp().clone())
     }
 
     async fn apply_deferred_agent_switch(&mut self) -> Result<(), SessionError> {
@@ -590,26 +589,16 @@ impl SessionActor {
         self.apply_switch(switch).await.inspect_err(|error| error!("Failed to activate selected mode: {error}"))
     }
 
-    async fn apply_idle_config_change(
-        &mut self,
-        setting: &ConfigSetting,
-        available: &[LlmModel],
-    ) -> Result<SetSessionConfigOptionResponse, Error> {
-        self.apply_config_change(setting, available)?;
-        self.apply_deferred_agent_switch().await.map_err(|_| Error::internal_error())?;
-        let options = self.config.config_options(&self.modes, available, self.oauth_credential_store.as_ref());
-        Ok(SetSessionConfigOptionResponse::new(options))
+    async fn set_config(&mut self, setting: &ConfigSetting) -> Result<SetSessionConfigOptionResponse, Error> {
+        self.config.apply_config_change(&self.modes, &self.available, setting)?;
+        if self.prompts.is_idle() {
+            self.apply_deferred_agent_switch().await.map_err(|_| Error::internal_error())?;
+        }
+        Ok(SetSessionConfigOptionResponse::new(self.config_options()))
     }
 
-    fn apply_config_change(
-        &mut self,
-        setting: &ConfigSetting,
-        available: &[LlmModel],
-    ) -> Result<SetSessionConfigOptionResponse, Error> {
-        self.config.apply_config_change(&self.modes, available, setting)?;
-
-        let options = self.config.config_options(&self.modes, available, self.oauth_credential_store.as_ref());
-        Ok(SetSessionConfigOptionResponse::new(options))
+    fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+        self.config.config_options(&self.modes, &self.available, self.oauth_credential_store.as_ref())
     }
 
     async fn apply_switch(&mut self, switch: Switch) -> Result<(), SessionError> {
@@ -618,34 +607,37 @@ impl SessionActor {
                 if let Some(event) = self.select_agent(&agent_name).await? {
                     self.persist_event(event);
                 }
-                self.publish_active_mcps()
+                self.publish_active_mcps();
+                Ok(())
             }
             Switch::Model(model) => {
-                let parser = ModelProviderParser::default()
-                    .with_provider_connections(self.active_provider_connections())
-                    .with_codex_provider(Arc::clone(&self.oauth_credential_store));
-                let (provider, _) = parser.parse(&model).await?;
+                let (provider, _) =
+                    self.agent_deps.model_providers().parse(&model, &self.active_provider_connections()).await?;
                 self.send_active_command(Command::agent(AgentCommand::SwitchModel(provider))).await
             }
             Switch::None => Ok(()),
         }
     }
 
-    fn publish_active_mcps(&mut self) -> Result<(), SessionError> {
-        send_mcp_server_status(&self.io, self.active_runtime()?.mcp_server_statuses());
-        self.refresh_available_commands();
-        Ok(())
+    fn publish_active_mcps(&mut self) {
+        let statuses = self.active_runtime().mcp().statuses();
+        self.advertised_servers = None;
+        self.publish_mcps(statuses);
+    }
+
+    fn publish_mcps(&mut self, servers: Vec<McpServerStatusEntry>) {
+        self.refresh_available_commands(&servers);
+        self.io.send(McpNotification::ServerStatus { servers });
     }
 
     fn record_agent_event(&mut self, message: &AgentEvent) {
         self.persist_event(SessionEvent::Agent(message.clone()));
-        if self.io.connection.is_none()
-            && let Some(format) = self.detached.output
-            && let Err(error) = print_message(format, message, None)
+        if let Some(format) = self.hooks.echo
+            && let Err(error) = print_message(format, message)
         {
             error!(%error, "Failed to serialize server event");
         }
-        forward_notification(&self.io, message);
+        project_agent_event(message, NotificationMode::Live, &self.io);
     }
 
     fn persist_event(&mut self, event: SessionEvent) {
@@ -657,7 +649,7 @@ impl SessionActor {
             warn!("Failed to append session log entry: {e}");
         }
 
-        self.record_event(event);
+        self.transcript.push(event);
     }
 }
 
@@ -674,80 +666,44 @@ async fn run_idle_command(cwd: PathBuf, command: String) {
     }
 }
 
-fn turn_result(outcome: &TurnOutcome) -> Result<acp::StopReason, SessionError> {
-    match outcome {
-        TurnOutcome::Completed | TurnOutcome::MaxTurnsReached { .. } => Ok(acp::StopReason::EndTurn),
-        TurnOutcome::Cancelled => Ok(acp::StopReason::Cancelled),
-        TurnOutcome::Failed { error } => Err(SessionError::TurnFailed(error.clone())),
-    }
-}
-
-fn send_mcp_server_status(io: &SessionIo, servers: Vec<McpServerStatusEntry>) {
-    io.send(McpNotification::ServerStatus { servers });
-}
-
-fn forward_notification(io: &SessionIo, msg: &AgentEvent) {
-    project_agent_event(msg, NotificationMode::Live, io);
-}
-
-fn on_mcp_client_event(io: &SessionIo, event: McpClientEvent) {
-    match event {
-        McpClientEvent::Elicitation(elicitation) => {
+fn on_elicitation(io: &SessionIo, elicitation: Elicitation) {
+    match elicitation {
+        Elicitation::Request(elicitation) => {
             if let Some(connection) = &io.connection {
-                spawn_elicitation_request(connection, &io.session_id, *elicitation);
-            } else {
-                let _ = elicitation.response_sender.send(cancel_result());
+                spawn_elicitation_request(connection, &io.session_id, elicitation);
             }
         }
-        McpClientEvent::ElicitationComplete { server_name, elicitation_id } => {
-            io.send(elicitation::build_acp_elicitation_completion_notification(
-                &io.session_id,
-                &server_name,
-                &elicitation_id,
-            ));
+        Elicitation::Complete { server, id } => {
+            io.send(elicitation::build_acp_elicitation_completion_notification(&io.session_id, &server, &id));
         }
-        McpClientEvent::ServerStatusesChanged(servers) => send_mcp_server_status(io, servers),
-        McpClientEvent::ConnectionReady(snapshot) => send_mcp_server_status(io, snapshot.server_statuses()),
-        McpClientEvent::AuthenticationFailed { server, error } => {
-            error!("MCP server authentication failed for '{server}': {error}");
-        }
-    }
-}
-
-async fn on_elicitation_request(
-    connection: &ConnectionTo<Client>,
-    session_id: &SessionId,
-    elicitation: ElicitationRequest,
-) {
-    let result = async {
-        let request =
-            elicitation::map_mcp_elicitation_request_to_acp(&elicitation.server_name, session_id, &elicitation.request)
-                .map_err(|error| error.to_string())?;
-        let response = connection.send_request(request).block_task().await.map_err(|error| format!("{error:?}"))?;
-        elicitation::map_acp_elicitation_response_to_mcp(response).map_err(|error| error.to_string())
-    }
-    .await
-    .unwrap_or_else(|error| {
-        error!("ACP elicitation failed: {error}");
-        cancel_result()
-    });
-
-    if elicitation.response_sender.send(result).is_err() {
-        error!("Failed to send elicitation response: receiver dropped");
     }
 }
 
 fn spawn_elicitation_request(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,
-    elicitation: ElicitationRequest,
+    elicitation: Box<ElicitationRequest>,
 ) {
-    let connection = connection.clone();
+    let task_connection = connection.clone();
     let session_id = session_id.clone();
-    if let Err(e) = connection.clone().spawn(async move {
-        on_elicitation_request(&connection, &session_id, elicitation).await;
+    let spawned = connection.spawn(async move {
+        let result = async {
+            let request =
+                elicitation::map_mcp_elicitation_request_to_acp(&elicitation.server, &session_id, &elicitation.request)
+                    .map_err(|error| error.to_string())?;
+            let response =
+                task_connection.send_request(request).block_task().await.map_err(|error| format!("{error:?}"))?;
+            elicitation::map_acp_elicitation_response_to_mcp(response).map_err(|error| error.to_string())
+        }
+        .await;
+
+        match result {
+            Ok(result) => elicitation.respond(result),
+            Err(error) => error!("ACP elicitation failed: {error}"),
+        }
         Ok(())
-    }) {
+    });
+    if let Err(e) = spawned {
         error!("Failed to spawn elicitation request handler: {e:?}");
     }
 }
@@ -914,180 +870,5 @@ mod tests {
         assert_eq!(s.pending, Some(Pending::Model(DEEPSEEK.into())));
         assert_eq!(s.selected_mode.as_deref(), Some("Planner"));
         assert_eq!(s.effective_model(&validated_modes()), DEEPSEEK);
-    }
-
-    mod connection_tests {
-        use super::*;
-        use acp_utils::elicitation::source_mcp_server_name;
-        use acp_utils::testing::test_connection;
-        use rmcp::model::ElicitRequestParams;
-        use tokio::sync::oneshot;
-        use tokio::task::LocalSet;
-
-        fn dispatch_event(connection: &ConnectionTo<Client>, event: McpClientEvent) {
-            on_mcp_client_event(&SessionIo::new(Some(connection.clone()), SessionId::new("session-1")), event);
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn server_status_change_forwards_status_notification() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-                    let servers = vec![mcp_utils::client::McpServerStatusEntry::new(
-                        "github",
-                        mcp_utils::client::McpServerStatus::Connected { tool_count: 1 },
-                    )];
-
-                    dispatch_event(&cx, McpClientEvent::ServerStatusesChanged(servers));
-
-                    let received = peer.next_mcp_notification().await;
-                    assert!(matches!(received, McpNotification::ServerStatus { .. }));
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn auth_failure_after_status_change_still_forwards_status() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-                    let servers = vec![mcp_utils::client::McpServerStatusEntry::new(
-                        "github",
-                        mcp_utils::client::McpServerStatus::Failed {
-                            error: "authentication timed out after 3 minutes".to_string(),
-                        },
-                    )];
-
-                    dispatch_event(&cx, McpClientEvent::ServerStatusesChanged(servers));
-                    dispatch_event(
-                        &cx,
-                        McpClientEvent::AuthenticationFailed {
-                            server: "github".to_string(),
-                            error: "authentication timed out after 3 minutes".to_string(),
-                        },
-                    );
-
-                    assert!(matches!(peer.next_mcp_notification().await, McpNotification::ServerStatus { .. }));
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn empty_server_status_change_forwards_clear_notification() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-
-                    dispatch_event(&cx, McpClientEvent::ServerStatusesChanged(vec![]));
-
-                    let McpNotification::ServerStatus { servers } = peer.next_mcp_notification().await;
-                    assert!(servers.is_empty());
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn status_event_forwards_server_status() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-                    let servers = vec![mcp_utils::client::McpServerStatusEntry::new(
-                        "github",
-                        mcp_utils::client::McpServerStatus::Connected { tool_count: 1 },
-                    )];
-                    dispatch_event(&cx, McpClientEvent::ServerStatusesChanged(servers));
-
-                    let McpNotification::ServerStatus { servers } = peer.next_mcp_notification().await;
-                    assert_eq!(servers[0].name, "github");
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn elicitation_completion_forwards_native_acp_notification() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-
-                    dispatch_event(
-                        &cx,
-                        McpClientEvent::ElicitationComplete {
-                            server_name: "github".to_string(),
-                            elicitation_id: "el-1".to_string(),
-                        },
-                    );
-
-                    let completion = peer.next_elicitation_completion().await;
-                    assert_eq!(&*completion.elicitation_id.0, r#"["session-1","github","el-1"]"#);
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn elicitation_request_forwards_response_from_peer() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, mut peer) = test_connection().await;
-                    peer.queue_elicitation_response(
-                        serde_json::from_value(serde_json::json!({
-                            "action": "accept",
-                            "content": { "color": "red" }
-                        }))
-                        .unwrap(),
-                    );
-
-                    let (tx, rx) = oneshot::channel();
-                    let elicitation = ElicitationRequest {
-                        server_name: "test-server".to_string(),
-                        request: ElicitRequestParams::FormElicitationParams {
-                            meta: None,
-                            message: "Pick a color".to_string(),
-                            requested_schema: rmcp::model::ElicitationSchema::builder()
-                                .required_bool("approved")
-                                .build()
-                                .unwrap(),
-                        },
-                        response_sender: tx,
-                    };
-
-                    on_elicitation_request(&cx, &SessionId::new("session-1"), elicitation).await;
-
-                    let result = rx.await.expect("response forwarded");
-                    assert_eq!(result.action, rmcp::model::ElicitationAction::Accept);
-                    assert_eq!(result.content, Some(serde_json::json!({ "color": "red" })));
-
-                    let received = peer.next_elicitation_request().await;
-                    assert_eq!(source_mcp_server_name(received.meta.as_ref()), Some("test-server"));
-                    let acp::ElicitationMode::Form(form) = received.mode else { panic!("expected form") };
-                    let acp::ElicitationScope::Session(scope) = form.scope else { panic!("expected session scope") };
-                    assert_eq!(&*scope.session_id.0, "session-1");
-                })
-                .await;
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn elicitation_request_surfaces_cancel_on_transport_error() {
-            LocalSet::new()
-                .run_until(async {
-                    let (cx, _peer) = test_connection().await;
-                    let (tx, rx) = oneshot::channel();
-                    let elicitation = ElicitationRequest {
-                        server_name: "test-server".to_string(),
-                        request: ElicitRequestParams::UrlElicitationParams {
-                            meta: None,
-                            message: "Authorize".to_string(),
-                            url: "https://example.com".to_string(),
-                            elicitation_id: "el-1".to_string(),
-                        },
-                        response_sender: tx,
-                    };
-
-                    on_elicitation_request(&cx, &SessionId::new("session-1"), elicitation).await;
-
-                    let result = rx.await.expect("response forwarded");
-                    assert_eq!(result.action, rmcp::model::ElicitationAction::Cancel);
-                })
-                .await;
-        }
     }
 }

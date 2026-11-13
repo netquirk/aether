@@ -89,6 +89,7 @@ Aether supports multiple LLM providers using a `provider:model` string format:
 |----------|---------|-----------------|
 | Anthropic | `anthropic:claude-sonnet-4-5-20250929` | `ANTHROPIC_API_KEY` |
 | `OpenRouter` | `openrouter:moonshotai/kimi-k2-thinking` | `OPENROUTER_API_KEY` |
+| Xiaomi | `xiaomi:mimo-v2.6-pro` | `XIAOMI_API_KEY` |
 | ZAI | `zai:GLM-4.6` | `ZAI_API_KEY` |
 | Ollama | `ollama:llama3.2` | None (local) |
 | Llama.cpp | `llamacpp` | None (local) |
@@ -152,7 +153,7 @@ The `mcp.json` file configures MCP tool servers:
 - **coding** — Filesystem tools (read, write, bash, etc.) plus optional auto-read rules from configured `--rules-dir` paths
 - **skills** — Slash commands and reusable prompts loaded from the configured `--dir` paths
 
-Set `"deferTools": true` on a server to keep its schemas out of the model-visible tool definitions. Use `aether mcp --help` to discover deferred servers, then `aether mcp <server> --help` and `aether mcp <server> <tool> --help` to inspect tools and schemas. Invoke a tool with `--json '{...}'` or a JSON object on stdin. To partition tools, use `"deferTools": { "include": [...], "exclude": [...] }`; patterns are exact MCP-local names or trailing-`*` prefixes, and `exclude` wins.
+Set `"deferTools": true` on a server to keep its schemas out of the model-visible tool definitions. Use `aether mcp --help` to discover deferred servers, then `aether mcp <server> --help` and `aether mcp <server> <tool> --help` to inspect tools and schemas. Invoke a tool with `--json '{...}'` or a JSON object on stdin. To partition tools, use `"deferTools": { "include": [...], "exclude": [...] }`; entries are exact MCP-local names, trailing-`*` prefixes, or annotation matchers such as `{ "readOnly": true }`, and `exclude` wins.
 
 ## Slash Commands
 

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use aether_core::core::RetryConfig;
-use aether_core::events::{AgentEvent, AgentObserver, LlmCallOutcome, StreamState, ToolEvent, TurnEvent, TurnOutcome};
+use aether_core::events::{AgentEvent, AgentObserver, LlmCallOutcome, StreamState, TurnEvent, TurnOutcome};
 use aether_core::testing::{AgentTrace, TestScenario, test_agent};
 use aether_telemetry::ContentCaptureSettings;
 use aether_telemetry::{
@@ -29,10 +29,7 @@ async fn tool_span_exposes_w3c_parent_context() -> Result<(), Box<dyn Error>> {
     let mut harness = otel_test().redacting().build();
     let observer = harness.observer.as_mut().expect("observer still alive");
     observer.on_event(&AgentEvent::Turn(TurnEvent::Started { content: vec![] }));
-    observer.on_event(&AgentEvent::Tool(ToolEvent::ExecutionStarted {
-        tool_id: "call_1".to_string(),
-        tool_name: "subagents__spawn_subagent".to_string(),
-    }));
+    observer.on_event(&AgentEvent::tool_call("call_1", "subagents__spawn_subagent", "{}"));
     let context = observer.tool_trace_context("call_1").expect("tool span exposes trace context");
     harness.drop_observer();
     let spans = harness.spans();
@@ -276,6 +273,7 @@ async fn completed_llm_calls_emit_posthog_custom_pricing_and_token_properties() 
     chat.assert_attr("$ai_cache_read_token_price", 0.000_000_3);
     chat.assert_attr("$ai_cache_write_token_price", 0.000_003_75);
     chat.assert_attr("$ai_reasoning_tokens", 7);
+    chat.assert_attr("$ai_cache_reporting_exclusive", false);
     // PostHog derives these from the semconv cache token attributes; duplicating
     // them would be redundant.
     chat.assert_no_attr("$ai_cache_read_input_tokens");

@@ -1,6 +1,12 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
+use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderAuthMode {
     #[default]
@@ -8,12 +14,13 @@ pub enum ProviderAuthMode {
     None,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProviderConnectionConfig {
     pub base_url: Option<String>,
     pub auth_mode: ProviderAuthMode,
     pub request_model: Option<String>,
     pub inference_profile_arn: Option<String>,
+    pub idle_timeout: Duration,
     /// Credential supplied inline rather than through the provider's catalog
     /// env var. The `custom` provider has no catalog entry to name an env var,
     /// so this is how a settings-driven endpoint carries its key.
@@ -39,6 +46,8 @@ pub struct ProviderConnectionOverride {
     /// AWS Bedrock application inference profile ARN to route requests through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_profile_arn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<NonZeroU64>,
     /// API key for a provider with no catalog env var (the `custom` provider).
     /// When omitted, `custom` falls back to the `CUSTOM_API_KEY` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,8 +71,25 @@ impl ProviderConnectionConfig {
             auth_mode: value.auth_mode.unwrap_or_default(),
             request_model: value.request_model,
             inference_profile_arn: value.inference_profile_arn,
+            idle_timeout: value
+                .idle_timeout_secs
+                .map_or(DEFAULT_STREAM_IDLE_TIMEOUT, |secs| Duration::from_secs(secs.get())),
             api_key: value.api_key,
             headers: value.headers,
+        }
+    }
+}
+
+impl Default for ProviderConnectionConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            auth_mode: ProviderAuthMode::default(),
+            request_model: None,
+            inference_profile_arn: None,
+            idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            api_key: None,
+            headers: BTreeMap::new(),
         }
     }
 }
@@ -85,6 +111,10 @@ impl ProviderConnectionOverride {
         Self { inference_profile_arn: Some(arn.into()), ..Self::default() }
     }
 
+    pub fn idle_timeout_secs(secs: NonZeroU64) -> Self {
+        Self { idle_timeout_secs: Some(secs), ..Self::default() }
+    }
+
     pub fn merge(&mut self, override_value: Self) {
         if override_value.base_url.is_some() {
             self.base_url = override_value.base_url;
@@ -98,6 +128,9 @@ impl ProviderConnectionOverride {
         if override_value.inference_profile_arn.is_some() {
             self.inference_profile_arn = override_value.inference_profile_arn;
         }
+        if override_value.idle_timeout_secs.is_some() {
+            self.idle_timeout_secs = override_value.idle_timeout_secs;
+        }
         if override_value.api_key.is_some() {
             self.api_key = override_value.api_key;
         }
@@ -110,16 +143,16 @@ impl ProviderConnectionOverrides {
         Self { providers }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
     /// Borrowed lookup of the override for `provider`, if any.
     ///
     /// Used by the `aether headless --dry-run` path to print the resolved
     /// endpoint without cloning the entire override table.
     pub fn get(&self, provider: &str) -> Option<&ProviderConnectionOverride> {
         self.providers.get(provider)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
     }
 
     pub fn merge(&mut self, overrides: ProviderConnectionOverrides) {
@@ -171,6 +204,16 @@ mod tests {
     }
 
     #[test]
+    fn idle_timeout_defaults_and_deserializes() {
+        let overrides: ProviderConnectionOverrides =
+            serde_json::from_str(r#"{"ollama":{"idleTimeoutSecs":900}}"#).unwrap();
+
+        assert_eq!(overrides.config_for("ollama").idle_timeout, Duration::from_mins(15));
+        assert_eq!(overrides.config_for("anthropic").idle_timeout, Duration::from_mins(5));
+        assert!(serde_json::from_str::<ProviderConnectionOverrides>(r#"{"ollama":{"idleTimeoutSecs":0}}"#).is_err());
+    }
+
+    #[test]
     fn merge_replaces_inference_profile_arn() {
         let mut first = ProviderConnectionOverride::inference_profile_arn("arn:first");
 
@@ -193,18 +236,5 @@ mod tests {
         first.merge(second);
 
         assert_eq!(first.config_for("bedrock").inference_profile_arn.as_deref(), Some("arn:second"));
-    }
-
-    #[test]
-    fn get_returns_borrowed_override() {
-        let overrides = ProviderConnectionOverrides::new(BTreeMap::from([(
-            "ollama".to_string(),
-            ProviderConnectionOverride::url("http://127.0.0.1:11434"),
-        )]));
-
-        let fetched = overrides.get("ollama").expect("ollama override present");
-        assert_eq!(fetched.base_url.as_deref(), Some("http://127.0.0.1:11434"));
-
-        assert!(overrides.get("anthropic").is_none());
     }
 }

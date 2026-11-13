@@ -1,5 +1,5 @@
 use crate::events::{AgentEvent, StreamState, ToolEvent};
-use llm::{ToolCallError, ToolCallRequest, ToolCallResult};
+use crate::mcp::tool_bridge::encode_structured;
 use serde::Serialize;
 
 pub fn agent_event(message_id: &str) -> AgentEventBuilder {
@@ -34,20 +34,10 @@ impl AgentEventBuilder {
     ) -> Self {
         let request_json = serde_json::to_string(request).expect("Failed to serialize request");
         let result_value = serde_json::to_value(result).expect("Failed to serialize result");
-        let result_yaml = serde_yml::to_string(&result_value).unwrap_or_else(|_| result_value.to_string());
 
-        self.push_tool_call_start(tool_call_id, name);
-        self.push_tool_call_chunk(tool_call_id, &request_json);
+        self.push_tool_call(tool_call_id, name, &request_json);
 
-        self.chunks.push(AgentEvent::Tool(ToolEvent::Result {
-            result: ToolCallResult {
-                id: tool_call_id.to_string(),
-                name: name.to_string(),
-                arguments: request_json,
-                result: result_yaml,
-            },
-            result_meta: None,
-        }));
+        self.chunks.push(AgentEvent::tool_result(tool_call_id, name, &request_json, &encode_structured(&result_value)));
 
         self
     }
@@ -63,17 +53,9 @@ impl AgentEventBuilder {
 
         let error_result = format!("Tool execution error: {error_message}");
 
-        self.push_tool_call_start(tool_call_id, name);
-        self.push_tool_call_chunk(tool_call_id, &request_json);
+        self.push_tool_call(tool_call_id, name, &request_json);
 
-        self.chunks.push(AgentEvent::Tool(ToolEvent::Error {
-            error: ToolCallError {
-                id: tool_call_id.to_string(),
-                name: name.to_string(),
-                arguments: Some(request_json),
-                error: error_result,
-            },
-        }));
+        self.chunks.push(AgentEvent::tool_error(tool_call_id, name, &request_json, &error_result));
 
         self
     }
@@ -84,16 +66,11 @@ impl AgentEventBuilder {
         self.chunks
     }
 
-    fn push_tool_call_start(&mut self, tool_call_id: &str, name: &str) {
-        self.chunks.push(AgentEvent::Tool(ToolEvent::Call {
-            request: ToolCallRequest { id: tool_call_id.to_string(), name: name.to_string(), arguments: String::new() },
-        }));
-    }
-
-    fn push_tool_call_chunk(&mut self, tool_call_id: &str, chunk: &str) {
-        self.chunks.push(AgentEvent::Tool(ToolEvent::CallUpdate {
-            tool_call_id: tool_call_id.to_string(),
-            chunk: chunk.to_string(),
-        }));
+    fn push_tool_call(&mut self, tool_call_id: &str, name: &str, arguments: &str) {
+        self.chunks.extend([
+            AgentEvent::Tool(ToolEvent::InputStarted { id: tool_call_id.to_string(), name: name.to_string() }),
+            AgentEvent::Tool(ToolEvent::InputDelta { id: tool_call_id.to_string(), chunk: arguments.to_string() }),
+            AgentEvent::tool_call(tool_call_id, name, arguments),
+        ]);
     }
 }

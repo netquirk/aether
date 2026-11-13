@@ -1,20 +1,26 @@
 //! In-memory test harness for ACP connections.
 
 mod fake_agent;
-pub use fake_agent::{FakeAgent, FakeAgentRequests};
+pub use fake_agent::{FakeAgent, FakeAgentRequests, HeldRequests, Question, QueuedTurns};
 
-use crate::notifications::{GitDiffEventPayload, McpNotification};
+use crate::config_meta::{ConfigOptionMeta, SelectOptionMeta};
+use crate::notifications::{
+    AetherMeta, AuthMethodsUpdatedParams, GitDiffEventPayload, McpNotification, PromptSearchResponse,
+    PromptSearchResult, SessionPreviewResponse, SessionPreviewRole, SessionPreviewTurn, SubAgentMeta,
+};
 pub use agent_client_protocol::Channel;
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v2::{
-    CompleteElicitationNotification, CreateElicitationRequest, CreateElicitationResponse, ElicitationFormMode,
-    ElicitationSchema, ElicitationSessionScope, IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse,
-    PlanEntry, PlanId, PlanUpdate, PlanUpdateContent, RunningStateUpdate, SessionId, SessionUpdate, StateUpdate,
-    StopReason, UpdateSessionNotification,
+use agent_client_protocol::schema::{IntoOption, ProtocolVersion};
+use agent_client_protocol::v2::schema::{
+    CompleteElicitationNotification, ContentBlock, ContentChunk, CreateElicitationRequest, CreateElicitationResponse,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, IdleStateUpdate, Implementation,
+    InitializeRequest, InitializeResponse, PlanEntry, PlanId, PlanUpdate, PlanUpdateContent, RunningStateUpdate,
+    SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionUpdate, StateUpdate, StopReason, SubagentUpdate, ToolCallStatus, ToolCallUpdate, UpdateSessionNotification,
+    UserMessage,
 };
 use agent_client_protocol::{
     self as acp, Agent, Client, ConnectionTo, HandleConnectionClose, HandleDispatchFrom, NullRun, Responder,
-    RunWithConnectionTo, V2Builder,
+    RunWithConnectionTo, v2,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -25,6 +31,7 @@ pub struct TestPeer {
     session_notifications: mpsc::UnboundedReceiver<UpdateSessionNotification>,
     mcp_notifications: mpsc::UnboundedReceiver<McpNotification>,
     git_diff_notifications: mpsc::UnboundedReceiver<GitDiffEventPayload>,
+    auth_methods_updates: mpsc::UnboundedReceiver<AuthMethodsUpdatedParams>,
     elicitation_requests: mpsc::UnboundedReceiver<CreateElicitationRequest>,
     elicitation_completions: mpsc::UnboundedReceiver<CompleteElicitationNotification>,
     elicitation_responses: Arc<Mutex<VecDeque<CreateElicitationResponse>>>,
@@ -32,14 +39,14 @@ pub struct TestPeer {
 }
 
 impl TestPeer {
-    pub fn new() -> (Self, V2Builder<Client, impl HandleDispatchFrom<Agent>, NullRun>) {
-        let (sn_tx, sn_rx) = mpsc::unbounded_channel::<UpdateSessionNotification>();
-        let (mcp_tx, mcp_rx) = mpsc::unbounded_channel::<McpNotification>();
-        let (git_diff_tx, git_diff_rx) = mpsc::unbounded_channel::<GitDiffEventPayload>();
-        let (el_tx, el_rx) = mpsc::unbounded_channel::<CreateElicitationRequest>();
-        let (complete_tx, complete_rx) = mpsc::unbounded_channel::<CompleteElicitationNotification>();
-        let elicitation_responses: Arc<Mutex<VecDeque<CreateElicitationResponse>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+    pub fn new() -> (Self, v2::Builder<Client, impl HandleDispatchFrom<Agent>, NullRun>) {
+        let (session_tx, session_notifications) = mpsc::unbounded_channel();
+        let (mcp_tx, mcp_notifications) = mpsc::unbounded_channel();
+        let (git_diff_tx, git_diff_notifications) = mpsc::unbounded_channel();
+        let (auth_tx, auth_methods_updates) = mpsc::unbounded_channel();
+        let (elicitation_tx, elicitation_requests) = mpsc::unbounded_channel();
+        let (completion_tx, elicitation_completions) = mpsc::unbounded_channel();
+        let elicitation_responses = Arc::new(Mutex::new(VecDeque::new()));
         let responder_capture: Arc<Mutex<Option<oneshot::Sender<Responder<CreateElicitationResponse>>>>> =
             Arc::new(Mutex::new(None));
 
@@ -47,58 +54,37 @@ impl TestPeer {
             .v2()
             .name("test-client")
             .on_receive_notification(
-                {
-                    let tx = sn_tx;
-                    async move |n: UpdateSessionNotification, _cx| {
-                        let _ = tx.send(n);
-                        Ok(())
-                    }
-                },
+                async move |n: UpdateSessionNotification, _cx| forward(&session_tx, n),
                 acp::on_receive_notification!(),
             )
             .on_receive_notification(
-                {
-                    let tx = mcp_tx;
-                    async move |n: McpNotification, _cx| {
-                        let _ = tx.send(n);
-                        Ok(())
-                    }
-                },
+                async move |n: McpNotification, _cx| forward(&mcp_tx, n),
                 acp::on_receive_notification!(),
             )
             .on_receive_notification(
-                {
-                    let tx = git_diff_tx;
-                    async move |n: GitDiffEventPayload, _cx| {
-                        let _ = tx.send(n);
-                        Ok(())
-                    }
-                },
+                async move |n: GitDiffEventPayload, _cx| forward(&git_diff_tx, n),
                 acp::on_receive_notification!(),
             )
             .on_receive_notification(
-                {
-                    let tx = complete_tx;
-                    async move |notification: CompleteElicitationNotification, _cx| {
-                        let _ = tx.send(notification);
-                        Ok(())
-                    }
-                },
+                async move |n: AuthMethodsUpdatedParams, _cx| forward(&auth_tx, n),
+                acp::on_receive_notification!(),
+            )
+            .on_receive_notification(
+                async move |n: CompleteElicitationNotification, _cx| forward(&completion_tx, n),
                 acp::on_receive_notification!(),
             )
             .on_receive_request(
                 {
-                    let tx = el_tx;
                     let responses = elicitation_responses.clone();
                     let capture = responder_capture.clone();
-                    async move |req: CreateElicitationRequest, responder: Responder<CreateElicitationResponse>, _cx| {
+                    async move |req: CreateElicitationRequest,
+                                responder: v2::Responder<CreateElicitationResponse>,
+                                _cx| {
                         if let Some(capture_tx) = capture.lock().unwrap().take() {
-                            return match capture_tx.send(responder) {
-                                Ok(()) => Ok(()),
-                                Err(responder) => responder.respond_with_error(acp::Error::internal_error()),
-                            };
+                            let _ = capture_tx.send(responder.into_raw());
+                            return Ok(());
                         }
-                        let _ = tx.send(req);
+                        let _ = elicitation_tx.send(req);
                         let queued = responses.lock().unwrap().pop_front();
                         match queued {
                             Some(response) => responder.respond(response),
@@ -110,11 +96,12 @@ impl TestPeer {
             );
 
         let peer = Self {
-            session_notifications: sn_rx,
-            mcp_notifications: mcp_rx,
-            git_diff_notifications: git_diff_rx,
-            elicitation_requests: el_rx,
-            elicitation_completions: complete_rx,
+            session_notifications,
+            mcp_notifications,
+            git_diff_notifications,
+            auth_methods_updates,
+            elicitation_requests,
+            elicitation_completions,
             elicitation_responses,
             responder_capture,
         };
@@ -131,6 +118,10 @@ impl TestPeer {
 
     pub async fn next_git_diff_notification(&mut self) -> GitDiffEventPayload {
         self.git_diff_notifications.recv().await.expect("peer channel closed")
+    }
+
+    pub async fn next_auth_methods_update(&mut self) -> AuthMethodsUpdatedParams {
+        self.auth_methods_updates.recv().await.expect("peer channel closed")
     }
 
     pub async fn next_elicitation_request(&mut self) -> CreateElicitationRequest {
@@ -170,12 +161,88 @@ impl TestPeer {
     }
 }
 
+pub fn texts(conversation: &crate::conversation::Conversation) -> Vec<String> {
+    conversation.items().iter().filter_map(|item| item.text().map(std::borrow::Cow::into_owned)).collect()
+}
+
+pub fn message_chunk(message_id: &str, text: &str) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into(), message_id.to_owned()))
+}
+
+pub fn thought_chunk(message_id: &str, text: &str) -> SessionUpdate {
+    SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.into(), message_id.to_owned()))
+}
+
+pub fn user_message(message_id: &str, content: Vec<ContentBlock>) -> SessionUpdate {
+    SessionUpdate::UserMessage(UserMessage::new(message_id.to_owned()).content(content))
+}
+
+pub fn plan(plan_id: impl Into<PlanId>, entries: Vec<PlanEntry>) -> SessionUpdate {
+    SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(plan_id, entries)))
+}
+
+pub fn tool_call(id: &str, title: &str, status: ToolCallStatus) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_owned()).title(title).status(status))
+}
+
+pub fn select(id: &str, name: &str, current: &str, values: &[(&str, &str)]) -> SessionConfigOption {
+    SessionConfigOption::select(id.to_owned(), name.to_owned(), current.to_owned(), choices(values))
+}
+
+pub fn choices(values: &[(&str, &str)]) -> Vec<SessionConfigSelectOption> {
+    values.iter().map(|&(value, label)| SessionConfigSelectOption::new(value.to_owned(), label.to_owned())).collect()
+}
+
+pub fn model_picker(current: &str, choices: impl Into<SessionConfigSelectOptions>) -> SessionConfigOption {
+    SessionConfigOption::select("model", "Model", current.to_owned(), choices)
+        .meta(ConfigOptionMeta { multi_select: true }.into_meta())
+}
+
+pub fn model_choice(value: &str, name: &str, meta: SelectOptionMeta) -> SessionConfigSelectOption {
+    SessionConfigSelectOption::new(value.to_owned(), name.to_owned()).meta(meta.into_meta())
+}
+
+pub fn option_group(name: &str, options: Vec<SessionConfigSelectOption>) -> SessionConfigSelectGroup {
+    SessionConfigSelectGroup::new(name.to_owned(), name.to_owned(), options)
+}
+
+pub fn session_preview(session_id: &str, cwd: &str) -> SessionPreviewResponse {
+    SessionPreviewResponse {
+        session_id: session_id.to_owned(),
+        cwd: cwd.into(),
+        created_at: "2025-01-01T00:00:00Z".to_owned(),
+        model: "claude".to_owned(),
+        selected_mode: Some("code".to_owned()),
+        transcript: vec![
+            SessionPreviewTurn { role: SessionPreviewRole::User, text: "hello".to_owned() },
+            SessionPreviewTurn { role: SessionPreviewRole::Assistant, text: "hi there".to_owned() },
+        ],
+        tool_call_count: 1,
+        truncated: false,
+    }
+}
+
+pub fn prompt_search_hit(prompt: &str, match_start: usize, match_end: usize) -> PromptSearchResult {
+    PromptSearchResult {
+        session_id: "s1".to_owned(),
+        cwd: "/tmp/repo".into(),
+        session_created_at: "2026-05-17T00:00:00Z".to_owned(),
+        prompt: prompt.to_owned(),
+        match_start,
+        match_end,
+    }
+}
+
+pub fn prompt_search_response(query: &str, results: Vec<PromptSearchResult>) -> PromptSearchResponse {
+    PromptSearchResponse { query: query.to_owned(), results, truncated: false }
+}
+
 /// Build a live `ConnectionTo<Client>` over an in-memory duplex transport with
 /// a peer on the other end. Must be called inside a `LocalSet`.
 pub async fn test_connection() -> (ConnectionTo<Client>, TestPeer) {
     let (peer, client_builder) = TestPeer::new();
     let agent = Agent.v2().name("test-agent").on_receive_request(
-        async |_: InitializeRequest, responder: Responder<InitializeResponse>, _cx| {
+        async |_: InitializeRequest, responder: v2::Responder<InitializeResponse>, _cx| {
             responder.respond(initialize_response())
         },
         acp::on_receive_request!(),
@@ -193,8 +260,8 @@ pub struct ConnectedPair {
 }
 
 pub async fn connect_pair<T, U, V, X, Y, Z>(
-    agent: V2Builder<Agent, T, U, V>,
-    client: V2Builder<Client, X, Y, Z>,
+    agent: v2::Builder<Agent, T, U, V>,
+    client: v2::Builder<Client, X, Y, Z>,
 ) -> ConnectedPair
 where
     T: HandleDispatchFrom<Client> + 'static,
@@ -239,12 +306,17 @@ pub fn initialize_response() -> InitializeResponse {
     InitializeResponse::new(ProtocolVersion::V2, Implementation::new("test-agent", "0.0.0"))
 }
 
+pub fn running_state() -> StateUpdate {
+    StateUpdate::Running(RunningStateUpdate::new())
+}
+
+pub fn idle_state(stop_reason: impl IntoOption<StopReason>) -> StateUpdate {
+    StateUpdate::Idle(IdleStateUpdate::new().stop_reason(stop_reason))
+}
+
 /// A live foreground turn has started.
 pub fn running_notification(session_id: impl Into<SessionId>) -> UpdateSessionNotification {
-    UpdateSessionNotification::new(
-        session_id,
-        SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
-    )
+    UpdateSessionNotification::new(session_id, SessionUpdate::StateUpdate(running_state()))
 }
 
 /// Foreground work is idle, optionally with a reported stop reason.
@@ -252,10 +324,24 @@ pub fn idle_notification(
     session_id: impl Into<SessionId>,
     stop_reason: Option<StopReason>,
 ) -> UpdateSessionNotification {
-    UpdateSessionNotification::new(
-        session_id,
-        SessionUpdate::StateUpdate(StateUpdate::Idle(IdleStateUpdate::new().stop_reason(stop_reason))),
-    )
+    UpdateSessionNotification::new(session_id, SessionUpdate::StateUpdate(idle_state(stop_reason)))
+}
+
+pub fn announced(
+    parent: impl Into<SessionId>,
+    tool_call_id: &str,
+    update: SubagentUpdate,
+) -> UpdateSessionNotification {
+    let update = update.meta(SubAgentMeta::new(tool_call_id).to_meta());
+    UpdateSessionNotification::new(parent, SessionUpdate::SubagentUpdate(update))
+}
+
+pub fn on_session(session_id: impl Into<SessionId>, update: SessionUpdate) -> crate::client::AcpEvent {
+    UpdateSessionNotification::new(session_id, update).into()
+}
+
+pub fn sub_agent_tool_update(session_id: impl Into<SessionId>, update: ToolCallUpdate) -> crate::client::AcpEvent {
+    on_session(session_id, SessionUpdate::ToolCallUpdate(update))
 }
 
 /// Replace the entries of an agent-owned plan.
@@ -264,10 +350,13 @@ pub fn plan_notification(
     plan_id: impl Into<PlanId>,
     entries: Vec<PlanEntry>,
 ) -> UpdateSessionNotification {
-    UpdateSessionNotification::new(
-        session_id,
-        SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(plan_id, entries))),
-    )
+    UpdateSessionNotification::new(session_id, plan(plan_id, entries))
+}
+
+#[expect(clippy::unnecessary_wraps, reason = "notification handlers must return a Result")]
+fn forward<T>(tx: &mpsc::UnboundedSender<T>, value: T) -> Result<(), acp::Error> {
+    let _ = tx.send(value);
+    Ok(())
 }
 
 fn placeholder_params() -> CreateElicitationRequest {

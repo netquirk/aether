@@ -4,6 +4,127 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.9.21](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.20...aether-agent-cli-v0.9.21) - 2026-11-03
+
+### Added
+
+- add gpt-6.1-terra to codex subscription models ([#642](https://github.com/contextbridge/aether/pull/642))
+- *(desktop)* browse repository files and open where tools worked ([#637](https://github.com/contextbridge/aether/pull/637))
+- ACP native subagents ([#627](https://github.com/contextbridge/aether/pull/627))
+
+### Other
+
+- extract aether-client-core from wisp ([#634](https://github.com/contextbridge/aether/pull/634))
+- replace aether-lspd with clankerdiff-lspd ([#633](https://github.com/contextbridge/aether/pull/633))
+
+## [0.9.20](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.19...aether-agent-cli-v0.9.20) - 2026-10-20
+
+### Fixed
+
+- *(llm)* send adaptive thinking to Claude and replay reasoning in order ([#622](https://github.com/contextbridge/aether/pull/622))
+
+## [0.9.19](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.18...aether-agent-cli-v0.9.19) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-telemetry, aether-acp-utils, aether-agent-core, aether-project, aether-sessions, aether-mcp-servers, aether-wisp
+
+## [0.9.18](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.17...aether-agent-cli-v0.9.18) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-auth, aether-llm, aether-acp-utils, aether-mcp-utils, aether-agent-core, aether-lspd, aether-project, aether-sessions, aether-telemetry, aether-mcp-servers, aether-wisp
+
+## [0.9.17](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.16...aether-agent-cli-v0.9.17) - 2026-10-19
+
+### Fixed
+
+- share provider connections and credentials across agents ([#607](https://github.com/contextbridge/aether/pull/607))
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- *(deps)* bump agent-client-protocol from 2.2.0 to 3.1.0 ([#604](https://github.com/contextbridge/aether/pull/604))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.9.16](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.15...aether-agent-cli-v0.9.16) - 2026-10-12
+
+### Added
+
+- Support sigv4 auth mechanism for MCP servers. ([#597](https://github.com/contextbridge/aether/pull/597))
+
+### Other
+
+- Simplify MCP code around Client, Server and Gateway concepts  ([#595](https://github.com/contextbridge/aether/pull/595))
+
+## [0.9.15](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.14...aether-agent-cli-v0.9.15) - 2026-10-10
+
+### Fixed
+
+- Provider stream stalls hangs the agent loop ([#590](https://github.com/contextbridge/aether/pull/590))
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.9.14](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.13...aether-agent-cli-v0.9.14) - 2026-10-08
+
+### Fixed
+
+- report agent panics as failed turns ([#586](https://github.com/contextbridge/aether/pull/586))
+
+## [0.9.13](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.12...aether-agent-cli-v0.9.13) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-agent-core, aether-acp-utils, aether-project, aether-sessions, aether-telemetry, aether-mcp-servers, aether-wisp
+
+## [0.9.12](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.11...aether-agent-cli-v0.9.12) - 2026-10-04
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.9.11](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.10...aether-agent-cli-v0.9.11) - 2026-10-03
+
+### Fixed
+
+- ACP actor gets proper state when background tasks return  ([#559](https://github.com/contextbridge/aether/pull/559))
+
+## [0.9.10](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.9...aether-agent-cli-v0.9.10) - 2026-10-01
+
+### Fixed
+
+- Bash tool highlighting ([#551](https://github.com/contextbridge/aether/pull/551))
+
+## [0.9.9](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.8...aether-agent-cli-v0.9.9) - 2026-09-28
+
+### Other
+
+- Fix/aether server logs when detached ([#531](https://github.com/contextbridge/aether/pull/531))
+
+## [0.9.8](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.7...aether-agent-cli-v0.9.8) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
+### Other
+
+- release ([#519](https://github.com/contextbridge/aether/pull/519))
+
+## [0.9.7](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.6...aether-agent-cli-v0.9.7) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-acp-utils, aether-agent-core, aether-project, aether-sessions, aether-telemetry, aether-mcp-servers, aether-wisp
+
+## [0.9.6](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.5...aether-agent-cli-v0.9.6) - 2026-09-23
+
+### Added
+
+- *(llm)* add Xiaomi provider ([#505](https://github.com/contextbridge/aether/pull/505))
+
 ## [0.9.5](https://github.com/contextbridge/aether/compare/aether-agent-cli-v0.9.4...aether-agent-cli-v0.9.5) - 2026-09-21
 
 ### Other

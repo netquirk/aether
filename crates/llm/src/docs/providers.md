@@ -1,28 +1,21 @@
 Built-in LLM provider implementations.
 
-Each submodule implements [`StreamingModelProvider`](crate::StreamingModelProvider) and [`ProviderFactory`](crate::ProviderFactory) for a specific LLM service.
+Each provider implements [`StreamingModelProvider`](crate::StreamingModelProvider) for a specific LLM service.
 
 # Available providers
 
 | Module | Provider | Env var | Feature flag |
 |--------|----------|---------|-------------|
-| [`anthropic`] | Anthropic (Claude) | `ANTHROPIC_API_KEY` | -- |
-| [`openai`] | `OpenAI` (GPT) | `OPENAI_API_KEY` | -- |
-| [`openrouter`] | `OpenRouter` | `OPENROUTER_API_KEY` | -- |
-| [`gemini`] | Google Gemini | `GEMINI_API_KEY` | -- |
-| [`local::ollama`] | Ollama | -- (local) | -- |
-| [`local::llama_cpp`] | llama.cpp | -- (local) | -- |
-| [`openai_compatible`] | `DeepSeek`, Fireworks AI, Microsoft Foundry, Moonshot, ZAI | varies | -- |
+| [`generic`] | Anthropic, `OpenAI`, Xiaomi `MiMo`, `DeepSeek`, Fireworks AI, Microsoft Foundry, Moonshot, ZAI, Google Gemini, `OpenRouter`, Ollama, llama.cpp | varies (none for local) | -- |
 | [`bedrock`] | AWS Bedrock | AWS credentials | `bedrock` |
 | [`codex`] | `OpenAI` Codex (OAuth) | -- (OAuth) | `codex` |
 
-# OpenAI-compatible providers
+# Generic providers
 
-The [`openai_compatible`] module provides a shared [`GenericOpenAiProvider`](openai_compatible::generic::GenericOpenAiProvider) that works with any `OpenAI`-compatible API. `DeepSeek`, Fireworks AI, Microsoft Foundry, Moonshot, and ZAI use this with pre-configured [`ProviderConfig`](openai_compatible::generic::ProviderConfig) constants.
+The [`generic`] module provides a shared [`GenericProvider`](generic::GenericProvider) for endpoints that speak the `OpenAI` Chat Completions or Responses wire format, or the Anthropic Messages API. Anthropic, `OpenAI`, Xiaomi `MiMo`, `DeepSeek`, Fireworks AI, Microsoft Foundry, Moonshot, ZAI, Google Gemini, `OpenRouter`, and the local Ollama and llama.cpp servers are pre-configured [`ProviderConfig`](generic::ProviderConfig) constants; a new provider on any of these formats is one more constant. The [`local`] module discovers which models local servers have available.
 
 # Adding a new provider
 
-1. Create a submodule under `providers/`.
-2. Implement [`StreamingModelProvider`](crate::StreamingModelProvider) and [`ProviderFactory`](crate::ProviderFactory).
-3. Register it in [`ModelProviderParser::default()`](crate::parser::ModelProviderParser::default).
-4. Add model entries to `models.json` for the catalog.
+1. If it speaks one of the wire formats above, add a [`ProviderConfig`](generic::ProviderConfig) constant to `BUILT_INS` in [`generic`].
+2. Otherwise, create a submodule under `providers/`, implement [`StreamingModelProvider`](crate::StreamingModelProvider), and register it in [`ModelProviderParser::default()`](crate::parser::ModelProviderParser::default).
+3. Add model entries to `models.json` for the catalog.

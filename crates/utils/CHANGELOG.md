@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/contextbridge/aether/compare/aether-utils-v0.3.0...aether-utils-v0.3.1) - 2026-11-03
+
+### Added
+
+- *(desktop)* browse repository files and open where tools worked ([#637](https://github.com/contextbridge/aether/pull/637))
+- add aether-desktop gpui client ([#635](https://github.com/contextbridge/aether/pull/635))
+
+## [0.3.0](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.20...aether-utils-v0.3.0) - 2026-10-19
+
+### Added
+
+- *(evals)* [**breaking**] git workspaces without the gold commit, explicit agent env, abortable runs ([#609](https://github.com/contextbridge/aether/pull/609))
+
+## [0.2.20](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.19...aether-utils-v0.2.20) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.2.19](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.18...aether-utils-v0.2.19) - 2026-10-08
+
+### Fixed
+
+- report agent panics as failed turns ([#586](https://github.com/contextbridge/aether/pull/586))
+
+## [0.2.18](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.17...aether-utils-v0.2.18) - 2026-10-03
+
+### Other
+
+- Oversized coding tool output handling ([#560](https://github.com/contextbridge/aether/pull/560))
+
+## [0.2.17](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.16...aether-utils-v0.2.17) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
 ## [0.2.16](https://github.com/contextbridge/aether/compare/aether-utils-v0.2.15...aether-utils-v0.2.16) - 2026-09-20
 
 ### Other

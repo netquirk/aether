@@ -1,7 +1,8 @@
-use crate::common::{TestClient, TestResult, scripted_mcp_client, silent_mcp_client, test_error};
+use crate::common::{McpClientExt, TestResult, call_tool_error, cancels_prompts, connect, scripted, test_error};
 use axum::{Router, extract::Query, http::header::CONTENT_TYPE, response::Html, routing::get};
 use mcp_servers::review::ReviewMcp;
-use mcp_utils::{client::McpClient, testing::ElicitationScript};
+use mcp_utils::client::{ClientOptions, McpClient};
+use mcp_utils::testing::ElicitationScript;
 use reqwest::Url;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, ElicitRequestParams, ElicitResult,
@@ -51,7 +52,7 @@ async fn reviews_inline_markdown_without_creating_a_file() -> TestResult {
     let ElicitRequestParams::FormElicitationParams { meta: Some(meta), .. } = &captured[0].request else {
         return Err(test_error("expected artifact metadata in the review UI request").into());
     };
-    let meta = ArtifactReviewElicitationMeta::parse(Some(&meta.0))
+    let meta = ArtifactReviewElicitationMeta::from_meta(Some(&meta.0))
         .ok_or_else(|| test_error("invalid artifact metadata in the review UI request"))?;
     assert_eq!(meta.title, "Database choice");
     assert_eq!(meta.markdown, "# Pick one\n\n- A\n- B");
@@ -73,14 +74,77 @@ async fn inline_markdown_is_sent_directly_to_the_review_ui() -> TestResult {
 
 #[tokio::test]
 async fn malformed_inputs_are_rejected() -> TestResult {
-    let test = review_test().file("valid.md", "# Valid").build().await?;
-    for args in [
-        json!({"source": {"type": "file", "path": "valid.md"}}),
-        json!({"format": "markdown", "source": {"type": "url", "url": "http://127.0.0.1:1/"}}),
+    let test = review_test().file("valid.md", "# Valid").file("notes.txt", "notes").build().await?;
+    for (args, error) in [
+        (json!({"format": "markdown", "source": {"type": "url", "url": "http://127.0.0.1:1/"}}), "cannot be reviewed"),
+        (json!({"source": {"type": "content", "content": "# Valid"}}), "`format` is required"),
+        (json!({"source": {"type": "file", "path": "notes.txt"}}), "`format` is required"),
+        (json!({"format": "markdown", "source": "valid.md"}), "source"),
     ] {
-        let result = test.client.call_raw("review_artifact", args.clone()).await?;
-        assert_eq!(result.is_error, Some(true), "{args} must be rejected: {result:?}");
+        let message = call_tool_error(&test.client, "review_artifact", args.clone()).await;
+        assert!(message.contains(error), "{args}: unexpected error: {message}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn format_is_inferred_from_the_file_extension() -> TestResult {
+    let test = review_test()
+        .file("docs/plan.md", "# Plan")
+        .file("docs/notes.markdown", "# Notes")
+        .file("site/index.html", "<h1>Index</h1>")
+        .file("site/legacy.htm", "<h1>Legacy</h1>")
+        .build()
+        .await?;
+
+    for path in ["docs/plan.md", "docs/notes.markdown"] {
+        let request = test.request_form(json!({"source": {"type": "file", "path": path}})).await?;
+        assert_eq!(request.meta.path, Some(test.path(path)));
+    }
+    for path in ["site/index.html", "site/legacy.htm"] {
+        let review = test.request_url(json!({"source": {"type": "file", "path": path}})).await?;
+        let document = reqwest::get(&review.url).await?.error_for_status()?.text().await?;
+        assert!(document.contains(&fs::read_to_string(test.path(path))?), "{path} is served as HTML");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn url_sources_are_reviewed_as_html_without_a_format() -> TestResult {
+    let test = review_test().build().await?;
+
+    let review = test.request_url(json!({"source": {"type": "url", "url": "http://127.0.0.1:1/app"}})).await?;
+
+    assert!(review.url.ends_with("/app"), "{}", review.url);
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_encoded_as_a_json_string_is_accepted() -> TestResult {
+    let test = review_test().file(".aether/review.html", "<h1>Review</h1>").file("plan.md", "# Plan").build().await?;
+
+    let review = test.request_url(json!({"source": "{\"path\": \".aether/review.html\", \"type\": \"file\"}"})).await?;
+    let document = reqwest::get(&review.url).await?.error_for_status()?.text().await?;
+    assert!(document.contains("<h1>Review</h1>"));
+
+    let request = test
+        .request_form(json!({"format": "markdown", "source": "{\"type\": \"file\", \"path\": \"plan.md\"}"}))
+        .await?;
+    assert_eq!(request.meta.markdown, "# Plan");
+    Ok(())
+}
+
+#[tokio::test]
+async fn input_schema_only_requires_the_source() -> TestResult {
+    let test = review_test().build().await?;
+
+    let tools = test.client.list_tools().await?;
+    let tool = tools.iter().find(|tool| tool.name == "review_artifact").expect("review_artifact tool");
+    let schema = Value::Object((*tool.input_schema).clone());
+
+    assert_eq!(schema["required"], json!(["source"]), "{schema}");
+    assert_eq!(schema["properties"]["format"]["enum"], json!(["markdown", "html"]), "{schema}");
+    assert_eq!(schema["properties"]["source"]["oneOf"].as_array().map(Vec::len), Some(3), "{schema}");
     Ok(())
 }
 
@@ -98,8 +162,8 @@ async fn html_content_request_emits_a_url_elicitation_and_serves_the_artifact() 
     assert!(document.contains(&format!("data-token=\"{}\"", review.token)), "the overlay carries the submit token");
     assert!(document.contains("attachShadow"), "the overlay script is appended");
     assert!(
-        document.contains("data-mode=\"document\""),
-        "a static artifact opts into comment mode, so hovering and clicking annotate from the start"
+        !document.contains("data-origin"),
+        "a static artifact has no app origin, so hovering and clicking annotate from the start"
     );
     assert!(
         document.contains("hidden: true"),
@@ -162,7 +226,7 @@ async fn cancelling_the_tool_call_tears_down_the_review_server() -> TestResult {
     let second_round =
         response_request(args, ElicitResult::new(ElicitationAction::Accept)).with_request_state(review.token.clone());
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(second_round));
-    let handle = test.client.raw().send_cancellable_request(request, PeerRequestOptions::no_options()).await?;
+    let handle = test.client.peer().send_cancellable_request(request, PeerRequestOptions::no_options()).await?;
     handle.cancel(None).await?;
 
     while reqwest::get(&review.url).await.is_ok() {
@@ -191,11 +255,14 @@ async fn html_file_source_serves_the_document_and_its_sibling_assets() -> TestRe
     let document = reqwest::get(&review.url).await?.error_for_status()?.text().await?;
     assert!(document.contains(html), "the artifact is served verbatim");
     assert!(document.contains("attachShadow"), "the overlay is appended");
-    assert!(document.contains("data-mode=\"document\""), "a file artifact is a static document too");
+    assert!(!document.contains("data-origin"), "a file artifact is a static document too");
 
     let logo = reqwest::get(review.origin().join("logo.svg")?).await?.error_for_status()?;
     assert_eq!(logo.headers()[CONTENT_TYPE], "image/svg+xml");
     assert_eq!(logo.text().await?, "<svg></svg>", "relative URLs resolve against the file's directory");
+
+    let missing = reqwest::get(review.origin().join("missing.svg")?).await?;
+    assert_eq!(missing.status(), 404, "missing sibling assets return not found");
     Ok(())
 }
 
@@ -210,15 +277,28 @@ async fn html_url_source_proxies_the_app_and_injects_the_overlay() -> TestResult
     let page = reqwest::get(&review.url).await?.error_for_status()?.text().await?;
     assert!(page.contains("<h1>Dashboard: billing</h1>"), "the app's page is proxied: {page}");
     assert!(page.contains("attachShadow"), "the overlay is injected into the app's HTML");
-    assert!(page.contains("data-mode=\"app\""), "a live app stays interactive until the reviewer annotates on purpose");
+    assert!(
+        page.contains(&format!("data-origin=\"{}\"", app.origin)),
+        "a live app stays interactive until the reviewer annotates on purpose, and annotations point at the app: {page}"
+    );
 
     let script = reqwest::get(review.origin().join("/app.js")?).await?.error_for_status()?;
     assert_eq!(script.headers()[CONTENT_TYPE], "text/javascript");
     assert_eq!(script.text().await?, "console.log('app')", "non-HTML responses pass through untouched");
 
-    review.submit(&json!({"status": "approved"})).await?.error_for_status()?;
+    let submission = json!({
+        "status": "feedback",
+        "feedback": "",
+        "annotations": [{
+            "element": "<button>",
+            "excerpt": "Save",
+            "comment": "Rename to Publish.",
+            "url": format!("{}/iframe.html?id=button--primary&viewMode=story", app.origin)
+        }]
+    });
+    review.submit(&submission).await?.error_for_status()?;
     let output = test.submit(args, Some(&review.token), ElicitResult::new(ElicitationAction::Accept)).await?;
-    assert_eq!(output, json!({"status": "approved"}));
+    assert_eq!(output, submission, "annotations keep the app page they were made on");
     Ok(())
 }
 
@@ -250,11 +330,13 @@ async fn explicit_approval_returns_approved_without_feedback() -> TestResult {
 async fn clients_without_elicitation_support_are_rejected() -> TestResult {
     let root = TempDir::new()?;
     fs::write(root.path().join("valid.md"), "# Valid")?;
-    let mcp = TestClient::start(|| review_mcp_at(root.path())).await?;
+    let mcp = connect(review_mcp_at(root.path()), ClientOptions::default()).await;
 
     let result = mcp.call_raw("review_artifact", markdown_file("valid.md")).await?;
 
     assert_eq!(result.is_error, Some(true));
+    let text = result.content.first().and_then(|content| content.as_text()).expect("error text");
+    assert!(text.text.contains("cannot prompt the user"), "unexpected error: {}", text.text);
     Ok(())
 }
 
@@ -270,7 +352,7 @@ struct ReviewTestBuilder {
 
 struct ReviewTest {
     root: TempDir,
-    client: TestClient<ReviewMcp, McpClient>,
+    client: McpClient,
     script: Option<ElicitationScript>,
 }
 
@@ -314,14 +396,14 @@ impl ReviewTestBuilder {
             fs::write(path, content)?;
         }
 
-        let (client, script) = self.response.map_or_else(
-            || (silent_mcp_client("review-test-server"), None),
-            |response| {
-                let (client, script) = scripted_mcp_client("review-test-server", response);
-                (client, Some(script))
-            },
-        );
-        let client = TestClient::start_with(|| review_mcp_at(root.path()), client).await?;
+        let (options, script) = match self.response {
+            Some(response) => {
+                let (options, script) = scripted(response);
+                (options, Some(script))
+            }
+            None => (cancels_prompts(), None),
+        };
+        let client = connect(review_mcp_at(root.path()), options).await;
         Ok(ReviewTest { root, client, script })
     }
 }
@@ -342,12 +424,12 @@ impl ReviewTest {
 
     /// The first MRTR round of a Markdown review.
     async fn request_form(&self, args: Value) -> TestResult<FormReview> {
-        FormReview::from_response(self.client.raw().call_tool_once(tool_request(args)).await?)
+        FormReview::from_response(self.client.peer().call_tool_once(tool_request(args)).await?)
     }
 
     /// The first MRTR round of an HTML review.
     async fn request_url(&self, args: Value) -> TestResult<UrlReview> {
-        UrlReview::from_response(self.client.raw().call_tool_once(tool_request(args)).await?)
+        UrlReview::from_response(self.client.peer().call_tool_once(tool_request(args)).await?)
     }
 
     /// The second MRTR round: the client echoes the arguments, the review token
@@ -357,7 +439,7 @@ impl ReviewTest {
         if let Some(token) = token {
             request = request.with_request_state(token.to_string());
         }
-        structured_output(self.client.raw().call_tool_once(request).await?)
+        structured_output(self.client.peer().call_tool_once(request).await?)
     }
 
     /// A full review driven by the scripted elicitation response.
@@ -376,7 +458,7 @@ impl FormReview {
             .as_ref()
             .or_else(|| request.extensions.get::<RequestMetaObject>())
             .ok_or_else(|| test_error("expected artifact metadata"))?;
-        let meta = ArtifactReviewElicitationMeta::parse(Some(&meta.0))
+        let meta = ArtifactReviewElicitationMeta::from_meta(Some(&meta.0))
             .ok_or_else(|| test_error("invalid artifact metadata"))?;
         Ok(Self { meta, message: message.clone(), schema: serde_json::to_value(requested_schema)? })
     }
@@ -449,7 +531,7 @@ impl Drop for UpstreamApp {
 }
 
 fn review_mcp_at(root: &Path) -> ReviewMcp {
-    ReviewMcp::from_args_with_base_dir(Vec::new(), root).expect("empty review MCP arguments are valid")
+    ReviewMcp::new(root.to_path_buf())
 }
 
 fn accepted_response(content: Value) -> ElicitResult {
@@ -491,9 +573,8 @@ fn with_title(mut args: Value, title: Option<&str>) -> Value {
     args
 }
 
-fn tool_request(args: Value) -> CallToolRequestParams {
-    let Value::Object(arguments) = args else { panic!("tool arguments") };
-    CallToolRequestParams::new("review_artifact").with_arguments(arguments)
+fn tool_request(arguments: Value) -> CallToolRequestParams {
+    crate::common::tool_request("review_artifact", arguments)
 }
 
 fn response_request(args: Value, result: ElicitResult) -> CallToolRequestParams {

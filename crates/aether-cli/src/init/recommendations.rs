@@ -11,7 +11,7 @@ pub(crate) struct ModelWithReasoning {
 }
 
 impl ModelWithReasoning {
-    pub fn new(model: impl Into<LlmModel>, effort: Option<ReasoningEffort>) -> Self {
+    pub(super) fn new(model: impl Into<LlmModel>, effort: Option<ReasoningEffort>) -> Self {
         let model = model.into();
         let effort = effort.filter(|e| model.reasoning_levels().contains(e));
         Self { model, reasoning_effort: effort }
@@ -30,7 +30,7 @@ pub(crate) fn recommended_for_provider(provider: Provider) -> Option<ProviderRec
         Provider::Codex => Some(ProviderRecommendations {
             plan: ModelWithReasoning::new(CodexModel::Gpt55, Some(ReasoningEffort::Xhigh)),
             build: ModelWithReasoning::new(CodexModel::Gpt55, Some(ReasoningEffort::Medium)),
-            explore: ModelWithReasoning::new(CodexModel::Gpt54Mini, Some(ReasoningEffort::High)),
+            explore: ModelWithReasoning::new(CodexModel::Gpt6Luna, Some(ReasoningEffort::High)),
         }),
 
         Provider::Openai => Some(ProviderRecommendations {
@@ -77,8 +77,7 @@ pub(crate) fn recommended_for_provider(provider: Provider) -> Option<ProviderRec
         | Provider::Fireworks
         | Provider::Gemini
         | Provider::Moonshot
-        | Provider::OpencodeGo
-        | Provider::Custom
+        | Provider::Xiaomi
         | Provider::Ollama
         | Provider::LlamaCpp => None,
     }
@@ -116,6 +115,7 @@ mod tests {
         assert!(recommended_for_provider(Provider::Fireworks).is_none());
         assert!(recommended_for_provider(Provider::DeepSeek).is_none());
         assert!(recommended_for_provider(Provider::Moonshot).is_none());
+        assert!(recommended_for_provider(Provider::Xiaomi).is_none());
     }
 
     #[test]

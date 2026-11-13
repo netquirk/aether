@@ -6,8 +6,8 @@ mod error;
 mod prompt;
 mod prompt_cache_key;
 mod queued_input;
-mod repetition_config;
 mod retry_config;
+mod sub_agent_sessions;
 mod tool_execution;
 mod tool_policy;
 
@@ -18,9 +18,10 @@ pub use agent_deps::*;
 pub use agent_registry::*;
 pub use error::*;
 pub use prompt::*;
-pub use repetition_config::RepetitionConfig;
 pub use retry_config::RetryConfig;
 pub use tool_policy::{AllowAllTools, ToolPolicy};
+
+pub use sub_agent_sessions::{SubAgentSession, SubAgentSessions};
 
 use llm::StreamingModelProvider;
 use std::sync::Arc;

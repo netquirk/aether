@@ -4,8 +4,9 @@ use aether_sessions::testing::{
     DEFAULT_CREATED_AT, TestStore, agent_switched, assistant_text, partial_text, session_meta, tool_call, turn_ended,
     user_message, user_message_with,
 };
-use aether_sessions::{ScanLimits, SessionStore, SessionStoreError};
+use aether_sessions::{ScanLimits, SessionStore, SessionStoreError, SessionSummary, SummaryCache};
 use llm::ContentBlock;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -74,6 +75,25 @@ fn list_sorts_sessions_and_extracts_first_user_title() {
 }
 
 #[test]
+fn cached_list_rereads_changed_sessions_and_forgets_removed_ones() {
+    let store = TestStore::new().session("kept", &[]).session("removed", &[]);
+    let mut cache = SummaryCache::default();
+    let titles = |sessions: Vec<SessionSummary>| {
+        sessions.into_iter().map(|session| (session.meta.session_id, session.title)).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        titles(store.store().list_cached(&mut cache)),
+        [("removed".to_owned(), None), ("kept".to_owned(), None)]
+    );
+
+    store.append("kept", &user_message("now titled"));
+    fs::remove_file(store.path().join("removed.jsonl")).unwrap();
+
+    assert_eq!(titles(store.store().list_cached(&mut cache)), [("kept".to_owned(), Some("now titled".to_owned()))]);
+    assert_eq!(store.store().list_cached(&mut cache), store.store().list());
+}
+
+#[test]
 fn list_skips_non_session_jsonl_files_and_malformed_metadata() {
     let store = TestStore::new().session("valid", &[]);
     store.write_raw("prompt-history.jsonl", "not a session");
@@ -95,15 +115,31 @@ fn prompt_search_is_smart_case_unicode_safe_and_retains_recent_entries() {
     store.append("session-1", &user_message("café"));
 
     let old = store.store().search_prompts("prompt 0", None).expect("search succeeds");
-    assert!(old.results.is_empty());
+    assert_eq!(old.results.len(), 0);
 
     let lower = store.store().search_prompts("hello", None).expect("search succeeds");
     assert_eq!(lower.results.len(), 1);
     let upper = store.store().search_prompts("Hello", None).expect("search succeeds");
-    assert!(upper.results.is_empty());
+    assert_eq!(upper.results.len(), 0);
     let unicode = store.store().search_prompts("fé", None).expect("search succeeds");
     let hit = &unicode.results[0];
     assert_eq!(&hit.prompt[hit.match_start..hit.match_end], "fé");
+}
+
+#[test]
+fn prompt_history_appends_until_compaction_and_keeps_the_newest_entries() {
+    let store = TestStore::new().session("session-1", &[]);
+    for index in 0..250 {
+        store.append("session-1", &user_message(&format!("prompt {index};")));
+    }
+
+    let lines = fs::read_to_string(store.path().join("prompt-history.jsonl")).unwrap().lines().count();
+    assert!((101..=200).contains(&lines), "history file holds {lines} lines");
+    let reloaded = SessionStore::from_path(store.path().to_path_buf());
+    for sessions in [store.store(), &reloaded] {
+        assert_eq!(sessions.search_prompts("prompt 149;", None).unwrap().results.len(), 0);
+        assert_eq!(sessions.search_prompts("prompt 150;", None).unwrap().results.len(), 1);
+    }
 }
 
 #[test]
@@ -115,6 +151,81 @@ fn relocating_updates_metadata_and_derived_prompt_entries() {
     assert_eq!(store.store().session_cwd("session-1"), Some(PathBuf::from("/tmp/new-project")));
     let response = store.store().search_prompts("move me", None).expect("search succeeds");
     assert_eq!(response.results[0].cwd, PathBuf::from("/tmp/new-project"));
+}
+
+#[test]
+fn a_set_title_replaces_the_prompt_title_and_survives_later_prompts() {
+    let store = TestStore::new().session("session-1", &[user_message("first prompt")]);
+
+    let stored = store.store().set_title("session-1", "  Renamed  ").expect("retitling succeeds");
+    store.append("session-1", &user_message("second prompt"));
+
+    assert_eq!(stored, "Renamed");
+    assert_eq!(store.store().list()[0].title.as_deref(), Some("Renamed"));
+    assert_eq!(store.store().session_cwd("session-1"), Some(PathBuf::from("/tmp/project")));
+}
+
+#[test]
+fn retitling_while_events_are_appended_keeps_every_event() {
+    let store = TestStore::new().session("session-1", &[user_message("first prompt")]);
+
+    assert_eq!(appended_while_retitling(&store, store.store()), RETITLE_ROUNDS + 1);
+}
+
+#[test]
+fn retitling_from_another_process_while_events_are_appended_keeps_every_event() {
+    let store = TestStore::new().session("session-1", &[user_message("first prompt")]);
+    let other_process = SessionStore::from_path(store.path().to_path_buf());
+
+    assert_eq!(appended_while_retitling(&store, &other_process), RETITLE_ROUNDS + 1);
+}
+
+#[test]
+fn a_cached_list_shows_a_title_set_after_it_was_cached() {
+    let store = TestStore::new().session("session-1", &[user_message("first prompt")]);
+    let mut cache = SummaryCache::default();
+    store.store().list_cached(&mut cache);
+
+    store.store().set_title("session-1", "Renamed").expect("retitling succeeds");
+
+    assert_eq!(store.store().list_cached(&mut cache)[0].title.as_deref(), Some("Renamed"));
+}
+
+#[test]
+fn a_blank_title_is_rejected() {
+    let store = TestStore::new().session("session-1", &[user_message("first prompt")]);
+
+    let error = store.store().set_title("session-1", "   ").expect_err("a blank title is invalid");
+
+    assert!(matches!(error, SessionStoreError::InvalidTitle));
+    assert_eq!(store.store().list()[0].title.as_deref(), Some("first prompt"));
+}
+
+#[test]
+fn retitling_an_unknown_session_fails_as_not_found() {
+    let store = TestStore::new();
+
+    let error = store.store().set_title("missing", "Title").expect_err("the session does not exist");
+
+    assert!(matches!(error, SessionStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound));
+}
+
+#[test]
+fn relocating_succeeds_while_a_temp_path_is_occupied() {
+    let store = TestStore::new().session("session-1", &[user_message("move me")]);
+    fs::create_dir(store.path().join("session-1.jsonl.tmp")).unwrap();
+    store.store().relocate("session-1", Path::new("/tmp/new-project")).expect("relocation succeeds");
+
+    assert_eq!(store.store().session_cwd("session-1"), Some(PathBuf::from("/tmp/new-project")));
+}
+
+#[test]
+fn rebuilding_prompt_history_succeeds_while_a_temp_path_is_occupied() {
+    let store = TestStore::new().session("session-1", &[user_message("find me")]);
+    fs::create_dir(store.path().join("prompt-history.jsonl.tmp")).unwrap();
+    store.store().rebuild_prompt_history().expect("rebuild succeeds");
+
+    assert_eq!(store.store().search_prompts("find me", None).unwrap().results.len(), 1);
 }
 
 #[test]
@@ -211,20 +322,38 @@ fn blank_runs_and_oversized_lines_consume_preview_budget() {
 
     let preview = store.store().preview("session-1").expect("preview succeeds");
     assert!(preview.truncated);
-    assert!(preview.transcript.is_empty());
+    assert_eq!(preview.transcript.len(), 0);
 }
 
 #[test]
 fn empty_and_missing_stores_have_no_sessions_or_prompts() {
     let store = TestStore::new();
-    assert!(store.store().list().is_empty());
+    assert_eq!(store.store().list().len(), 0);
     let missing_session = store.store().load("missing").unwrap_err();
     assert!(matches!(missing_session, SessionStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound));
     let empty = store.store().search_prompts(" ", None).expect("search succeeds");
-    assert!(empty.results.is_empty());
+    assert_eq!(empty.results.len(), 0);
 
     let missing = SessionStore::from_path(store.path().join("missing"));
-    assert!(missing.list().is_empty());
+    assert_eq!(missing.list().len(), 0);
+}
+
+const RETITLE_ROUNDS: usize = 100;
+
+fn appended_while_retitling(store: &TestStore, retitler: &SessionStore) -> usize {
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for round in 0..RETITLE_ROUNDS {
+                store.append("session-1", &assistant_text(&format!("message-{round}"), "reply"));
+            }
+        });
+        scope.spawn(|| {
+            for round in 0..RETITLE_ROUNDS {
+                retitler.set_title("session-1", &format!("Title {round}")).expect("retitling succeeds");
+            }
+        });
+    });
+    store.store().load("session-1").expect("the session loads").1.len()
 }
 
 /// A run killed mid-turn must still leave the completed turns on disk, and the

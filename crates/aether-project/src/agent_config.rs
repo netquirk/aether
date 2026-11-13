@@ -1,7 +1,7 @@
 use crate::{McpSourceSpec, PromptSource};
-use aether_core::mcp::ToolOutputSettings;
+
+use aether_core::mcp::ToolFilter;
 use llm::{ModelSettings, ProviderConnectionOverrides, ReasoningEffort};
-use mcp_utils::client::ToolFilter;
 
 #[doc = include_str!("docs/agent_config.md")]
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
@@ -18,16 +18,6 @@ pub struct AgentConfig {
     /// comma-separated alloy of specs to round-robin across turns.
     #[schemars(length(min = 1))]
     pub model: String,
-    /// Optional fallback model spec the agent swaps in when the primary
-    /// fails with a server (5xx) error (TASK-25-465). A bare
-    /// `provider:model-id` is parsed the same way as `model`; an empty
-    /// string is treated as "no fallback". The swap is recorded as a
-    /// `ModelEvent::Fallback` in the run transcript, naming the
-    /// provider that took over. Omit the field (or set it to an empty
-    /// string) to keep the pre-existing retry-then-fail behaviour.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1))]
-    pub fallback_model: Option<String>,
     /// Reasoning level for the LLM. Uses provider default when not explicitly set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -40,13 +30,6 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub context_window: Option<u32>,
-    /// Optional cap on the number of LLM chat turns a single run may take.
-    /// When the cap is reached, the run ends cleanly without failing and
-    /// reports the value back through `TurnOutcome::MaxTurnsReached`. When
-    /// omitted, runs are unbounded (current behaviour).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
-    pub max_turns: Option<u32>,
     /// Exposes the agent as a user-selectable mode.
     #[serde(default)]
     pub user_invocable: bool,
@@ -66,11 +49,6 @@ pub struct AgentConfig {
     /// Per-agent MCP tool filter (allow/deny lists).
     #[serde(default, skip_serializing_if = "ToolFilter::is_empty")]
     pub tools: ToolFilter,
-    /// Per-agent override of the tool result cap. When unset the agent
-    /// inherits the top-level `toolOutput` block. Env vars still win over
-    /// both. See [`ToolOutputSettings`] and `AETHER_TOOL_OUTPUT_MAX_BYTES`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_output: Option<ToolOutputSettings>,
 }
 
 fn require_agent_invocation_surface_schema(schema: &mut schemars::Schema) {

@@ -28,12 +28,10 @@ async fn hello_world_test() -> Result<(), aether_evals::WorkspaceError> {
     let workspace = Workspace::empty()?;
     let prompt = "Write 'Hello, World!' to hello.txt";
     let agent = FakeAgent::writes_file("hello.txt", "Hello, World!").with_workspace(workspace.path());
-    let transcript =
-        Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
+    let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await.unwrap();
 
     assert!(!transcript.events().is_empty());
     assert!(workspace.join("hello.txt").exists());
-    assert_eq!(transcript.header().map(|header| header.working_dir.clone()), Some(workspace.path().to_path_buf()));
     Ok(())
 }
 ```
@@ -51,22 +49,6 @@ The CI profile writes JUnit XML to `target/nextest/ci/junit.xml`.
 
 Aether Evals' fake-agent coverage should use normal test names. Reserve `_eval` suffixes for real provider-backed evals selected by the repository `evals` nextest group.
 
-## Core API
-
-- `Task::new(prompt)` describes the problem to solve.
-- `Agent::run(task)` streams `AgentEvent`s from an agent's configured execution environment.
-- `Transcript::from_stream(agent.run(task))` collects the stream into a `Transcript`.
-- `Transcript::default()` plus `transcript.add(message)` supports observing each streamed message while building the transcript manually.
-- `Transcript::with_working_dir(path)` records the run's working directory and its git HEAD commit (or `not a git repository`) on the transcript header.
-- `Container::builder(image).start(&workspace)` starts a caller-owned Docker container with the workspace mounted at `/workspace`.
-- `DockerAgent::new(container, command)` runs an in-container command whose stdout is newline-delimited `AgentEvent` JSON.
-- `Container::exec_shell(script)` runs follow-up assertions or test commands in the same caller-owned container.
-- `default_eval_env_vars()` forwards provider credentials and Aether-related environment into Docker while setting `AETHER_HOME=/root/.aether`.
-- `Workspace::empty()` creates an isolated temp directory.
-- `Workspace::from_dir(path)` copies fixture directory contents into a temp directory.
-- `Workspace::from_git_repo(GitRepoSpec { url, start_commit, gold_commit, subdir })` clones and checks out a git repository.
-- `Transcript` exposes collected agent messages, token usage, tool-call helpers, and an optional header recording the run's working directory and starting commit.
-
 ## Dockerized evals
 
 Aether Evals mounts the workspace root at `/workspace` and runs the command from the effective eval cwd. It does not wrap or alter prompts; the command receives the caller-provided prompt verbatim:
@@ -79,30 +61,25 @@ Stdout is reserved for `AgentEvent` JSON lines and must end with a terminal even
 
 ```rust
 use aether_evals::{
-    Agent, CONTAINER_AETHER_HOME, Container, DockerAgent, GitRepoSpec, Image, Task, Transcript, Workspace,
-    default_eval_env_vars,
+    Agent, CONTAINER_AETHER_HOME, Container, DockerAgent, GitFixture, GitSource, GitSpec, Image, Task, Transcript,
+    eval_env_vars,
 };
 
-let workspace = Workspace::from_git_repo(GitRepoSpec {
-    url: "https://github.com/example/repo".to_string(),
-    start_commit: "start_sha".to_string(),
-    gold_commit: "gold_sha".to_string(),
-    subdir: None,
-})?;
+let source = GitSource::Url("https://github.com/example/repo".to_string());
+let fixture = GitFixture::fetch(GitSpec::new(source, "start_sha", "gold_sha"))?;
+let workspace = fixture.workspace()?;
 let container = Container::builder(Image::new("aether-sandbox", "latest"))
-    .with_env_vars(default_eval_env_vars())
+    .with_env_vars(eval_env_vars(&"anthropic:claude-opus-4-6".parse()?))
     .with_ephemeral_mount(CONTAINER_AETHER_HOME)
     .start(&workspace)
     .await?;
 let agent = DockerAgent::new(container.clone(), vec!["/usr/local/bin/aether-eval-agent".to_string()]);
 
 let prompt = "fix the failing test";
-let transcript =
-    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
+let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
 let tests = container.exec_shell("cargo test").await?;
 assert_eq!(tests.exit_code, 0, "stdout:\n{}\nstderr:\n{}", tests.stdout, tests.stderr);
 assert!(!transcript.events().is_empty());
-assert!(transcript.header().is_some(), "transcript should record its run header");
 ```
 
 Run follow-up `container.exec_shell(...)` assertions before dropping the caller-owned container and workspace.
@@ -132,8 +109,7 @@ Use normal Rust assertions over the returned `Transcript` and files on disk:
 
 ```rust
 let workspace = Workspace::empty()?;
-let transcript =
-    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
+let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
 
 assert!(transcript.tool_called("write_file"));
 assert_eq!(transcript.tool_call_count("bash"), 1);
@@ -158,24 +134,28 @@ Judge faults — transient LLM stream failures, unparseable responses, criterion
 
 `Workspace` removes its temporary directory when dropped. To retain files for debugging, call `workspace.persist()` and remove the returned path manually when finished.
 
-For git-backed workspaces, `workspace.capture_git_diffs()` returns the agent-produced diff and the reference diff when available.
+For a workspace checked out from a `GitFixture`, `fixture.agent_diff(&workspace)?` returns the agent's commits, staged and unstaged edits, and untracked files since the start commit, and errors if git can't read the repository. Compare it with `fixture.reference_diff()`; both leave out `diff_exclude` pathspecs such as `*pnpm-lock.yaml`.
 
 ## Git-backed evals
 
 ```rust
-use aether_evals::{Agent, GitRepoSpec, Task, Transcript, Workspace};
+use aether_evals::{Agent, GitFixture, GitSource, GitSpec, Task, Transcript};
 
-let workspace = Workspace::from_git_repo(GitRepoSpec {
-    url: "https://github.com/example/repo".to_string(),
-    start_commit: "start_sha".to_string(),
-    gold_commit: "gold_sha".to_string(),
+let fixture = GitFixture::fetch(GitSpec {
     subdir: Some("packages/api".into()),
+    diff_exclude: vec!["*pnpm-lock.yaml".to_string()],
+    ..GitSpec::new(GitSource::Bundle("fixtures/repo.bundle".into()), "start_sha", "gold_sha")
 })?;
-let prompt = "Make the test pass";
-let transcript =
-    Transcript::from_stream(agent.run(Task::new(prompt))).await?.with_working_dir(workspace.path());
 
-assert!(transcript.tool_called("bash"));
+for _trial in 0..3 {
+    let workspace = fixture.workspace()?;
+    let prompt = "Make the test pass";
+    let transcript = Transcript::from_stream(agent.run(Task::new(prompt))).await?;
+
+    assert!(transcript.tool_called("bash"));
+    let agent_diff = fixture.agent_diff(&workspace)?;
+    println!("agent: {:?}, reference: {:?}", agent_diff.stats, fixture.reference_diff().stats);
+}
 ```
 
 ## Development

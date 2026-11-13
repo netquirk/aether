@@ -1,11 +1,9 @@
-use acp::schema::v2::{AgentCapabilities, CompactionStatus, LoginAuthRequest};
+use acp::v2::schema::{AgentCapabilities, CompactionStatus, LoginAuthRequest};
 use acp_utils::client::{AcpClient, AcpClientError, AcpEvent, connect_acp_client};
-use acp_utils::notifications::{
-    PromptSearchParams, PromptSearchResponse, SessionPreviewParams, SessionPreviewResponse,
-};
+use acp_utils::notifications::{PromptSearchParams, SessionPreviewParams};
 use acp_utils::testing::FakeAgent;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::v2::schema::{
     CancelSessionNotification, CloseSessionRequest, ContentBlock, ContentChunk, Implementation, ListSessionsRequest,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReplayFrom, ReplayFromStart,
     ResumeSessionRequest, SessionId, SessionInfo, SessionUpdate, SetSessionConfigOptionRequest,
@@ -22,13 +20,14 @@ async fn cancel_reaches_the_agent_while_a_config_response_is_outstanding() {
         .run_until(async {
             let (agent, mut requests) = FakeAgent::default()
                 .new_session_response(NewSessionResponse::new("sess-1"))
-                .hold_config(true)
+                .hold::<SetSessionConfigOptionRequest>()
+                .hold::<PromptRequest>()
                 .capture();
             let client = agent.build().await.expect("initialization succeeds");
 
             let created = client
                 .handle
-                .new_session(NewSessionRequest::new(PathBuf::from("/tmp")))
+                .request(NewSessionRequest::new(PathBuf::from("/tmp")))
                 .await
                 .expect("session establishes");
 
@@ -37,18 +36,18 @@ async fn cancel_reaches_the_agent_while_a_config_response_is_outstanding() {
             let prompt_session_id = session_id.clone();
             spawn_local(async move {
                 let _ = prompt_task_handle
-                    .prompt(PromptRequest::new(prompt_session_id, vec![ContentBlock::Text(TextContent::new("hi"))]))
+                    .request(PromptRequest::new(prompt_session_id, vec![ContentBlock::Text(TextContent::new("hi"))]))
                     .await;
             });
-            let (_, prompt_responder) = requests.prompt.recv().await.unwrap();
+            let (_, prompt_responder) = requests.held::<PromptRequest>().recv().await.unwrap();
             let config_handle = client.handle.clone();
             let config_session_id = session_id.clone();
             spawn_local(async move {
                 let _ =
                     config_handle.request(SetSessionConfigOptionRequest::new(config_session_id, "mode", "Plan")).await;
             });
-            let config_responder = requests.pending_config.recv().await.unwrap();
-            client.handle.cancel(CancelSessionNotification::new(session_id)).expect("cancel queues");
+            let (_, config_responder) = requests.held::<SetSessionConfigOptionRequest>().recv().await.unwrap();
+            client.handle.notify(CancelSessionNotification::new(session_id)).expect("cancel queues");
 
             assert_eq!(requests.cancel.recv().await.unwrap().session_id, SessionId::new("sess-1"));
             drop((prompt_responder, config_responder));
@@ -61,17 +60,17 @@ async fn cancel_reaches_the_agent_while_a_config_response_is_outstanding() {
 async fn prompt_completion_follows_session_updates_on_the_event_stream() {
     LocalSet::new()
         .run_until(async {
-            let (agent, mut requests) = FakeAgent::default().capture();
+            let (agent, mut requests) = FakeAgent::default().hold::<PromptRequest>().capture();
             let mut client = agent.build().await.expect("initialization succeeds");
             let cx = requests.connection.recv().await.unwrap();
-            let prompt = client.handle.prompt(PromptRequest::new("session", vec![ContentBlock::from("hello")]));
-            let (request, responder) = requests.prompt.recv().await.unwrap();
+            let prompt = client.handle.request(PromptRequest::new("session", vec![ContentBlock::from("hello")]));
+            let (request, responder) = requests.held::<PromptRequest>().recv().await.unwrap();
             cx.send_notification(UpdateSessionNotification::new(
                 request.session_id.clone(),
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from("final answer"), "answer")),
             )).unwrap();
             cx.send_notification(acp_utils::testing::idle_notification(request.session_id, Some(StopReason::EndTurn))).unwrap();
-            responder.respond(PromptResponse::new()).unwrap();
+            responder.respond(PromptResponse::new("user-message")).unwrap();
             prompt.await.expect("prompt succeeds");
 
             assert!(matches!(client.event_rx.recv().await, Some(AcpEvent::SessionUpdate(_))));
@@ -97,7 +96,7 @@ async fn new_session_preserves_startup_updates_before_live_updates() {
                 acp::on_receive_request!(),
             );
             let mut client = connect_test_agent(agent).await.unwrap();
-            client.handle.new_session(NewSessionRequest::new("/tmp")).await.unwrap();
+            client.handle.request(NewSessionRequest::new("/tmp")).await.unwrap();
             client.handle.request(ListSessionsRequest::new()).await.unwrap();
             let mut updates = Vec::new();
             while let Ok(event) = client.event_rx.try_recv() {
@@ -125,15 +124,15 @@ async fn replay_updates_precede_the_resume_response() -> Result<(), TestError> {
                 .build()
                 .await?;
 
+            client.handle.request(ResumeSessionRequest::new("saved", "/remote")).await?;
+            assert!(client.event_rx.try_recv().is_err(), "plain resume must request no history");
             client
                 .handle
-                .resume_session(
+                .request(
                     ResumeSessionRequest::new("saved", "/remote")
                         .replay_from(ReplayFrom::Start(ReplayFromStart::new())),
                 )
                 .await?;
-            assert!(client.event_rx.try_recv().is_err(), "plain resume must request no history");
-            client.handle.resume_session_with_replay(ResumeSessionRequest::new("saved", "/remote")).await?;
 
             let replay = [client.event_rx.try_recv()?, client.event_rx.try_recv()?, client.event_rx.try_recv()?];
             let [
@@ -158,7 +157,6 @@ async fn replay_updates_precede_the_resume_response() -> Result<(), TestError> {
         .await
 }
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "current_thread")]
 async fn initialized_client_manages_typed_sessions_and_streams_replay() -> Result<(), TestError> {
     LocalSet::new()
@@ -169,38 +167,14 @@ async fn initialized_client_manages_typed_sessions_and_streams_replay() -> Resul
                 .replay_message("listed", "replayed")
                 .new_session_response(NewSessionResponse::new("created"))
                 .sessions(vec![SessionInfo::new("listed", "/tmp/project")])
-                .agent()
-                .on_receive_request(
-                    async |_request: PromptSearchParams, responder, _cx| {
-                        responder.respond(PromptSearchResponse {
-                            query: "hello".to_string(),
-                            results: vec![],
-                            truncated: false,
-                        })
-                    },
-                    acp::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async |_request: SessionPreviewParams, responder, _cx| {
-                        responder.respond(SessionPreviewResponse {
-                            session_id: "listed".to_string(),
-                            cwd: PathBuf::from("/tmp/project"),
-                            created_at: "now".to_string(),
-                            model: "fake".to_string(),
-                            selected_mode: None,
-                            transcript: vec![],
-                            tool_call_count: 0,
-                            truncated: false,
-                        })
-                    },
-                    acp::on_receive_request!(),
-                );
+                .session_preview(acp_utils::testing::session_preview("listed", "/tmp/project"))
+                .agent();
             let mut client = connect_test_agent(agent_builder).await?;
             assert_eq!(client.agent_name(), "Typed Fake");
             assert_eq!(client.initialize_response.info.name, "Typed Fake");
 
             let created =
-                client.handle.new_session(NewSessionRequest::new("/tmp/project")).await?;
+                client.handle.request(NewSessionRequest::new("/tmp/project")).await?;
             assert_eq!(created.session_id, SessionId::new("created"));
             assert!(client.event_rx.try_recv().is_err());
 
@@ -208,15 +182,18 @@ async fn initialized_client_manages_typed_sessions_and_streams_replay() -> Resul
             assert_eq!(listed.sessions.len(), 1);
             assert_eq!(listed.sessions[0].session_id, SessionId::new("listed"));
 
-            client.handle.resume_session_with_replay(ResumeSessionRequest::new("listed", "/tmp/project")).await?;
+            client
+                .handle
+                .request(
+                    ResumeSessionRequest::new("listed", "/tmp/project")
+                        .replay_from(ReplayFrom::Start(ReplayFromStart::new())),
+                )
+                .await?;
             for id in ["other", "listed", "listed"] {
                 assert!(matches!(client.event_rx.try_recv()?, AcpEvent::SessionUpdate(notification) if notification.session_id == SessionId::new(id)));
             }
 
-            client
-                .handle
-                .resume_session(ResumeSessionRequest::new("listed", "/tmp/project"))
-                .await?;
+            client.handle.request(ResumeSessionRequest::new("listed", "/tmp/project")).await?;
             let search = client
                 .handle
                 .request(PromptSearchParams { query: "hello".to_string(), limit: Some(10) })
@@ -248,7 +225,7 @@ async fn initialization_without_capabilities_exposes_none() -> Result<(), TestEr
 
 #[tokio::test]
 async fn v2_initialization_accessors_expose_agent_metadata() -> Result<(), TestError> {
-    use acp::schema::v2::{PromptCapabilities, SessionCapabilities};
+    use acp::v2::schema::{PromptCapabilities, SessionCapabilities};
     LocalSet::new()
         .run_until(async {
             let client = acp_utils::testing::FakeAgent::default()
@@ -262,7 +239,7 @@ async fn v2_initialization_accessors_expose_agent_metadata() -> Result<(), TestE
             assert_eq!(client.agent_name(), "Display Name");
             assert!(client.prompt_capabilities().is_some());
             assert!(client.session_capabilities().is_some());
-            assert!(client.auth_methods().is_empty());
+            assert_eq!(client.auth_methods(), []);
             client.handle.disconnect().await;
             Ok(())
         })
@@ -284,22 +261,22 @@ async fn login_accepts_supported_methods_and_rejects_unknown_methods() -> Result
 
 #[tokio::test]
 async fn permission_with_no_options_is_cancelled() {
-    use acp::schema::v2::{RequestPermissionOutcome, RequestPermissionRequest};
+    use acp::v2::schema::{RequestPermissionOutcome, RequestPermissionRequest};
 
     LocalSet::new()
         .run_until(async {
-            let (agent, mut requests) = acp_utils::testing::FakeAgent::default().capture();
+            let (agent, mut requests) = FakeAgent::default().hold::<PromptRequest>().capture();
             let client = agent.build().await.unwrap();
             let connection = requests.connection.recv().await.unwrap();
-            let prompt = client.handle.prompt(PromptRequest::new("session", vec![]));
-            let (_, responder) = requests.prompt.recv().await.unwrap();
+            let prompt = client.handle.request(PromptRequest::new("session", vec![]));
+            let (_, responder) = requests.held::<PromptRequest>().recv().await.unwrap();
             let response = connection
                 .send_request(RequestPermissionRequest::new("session", "Continue?", vec![]))
                 .block_task()
                 .await
                 .unwrap();
-            assert_eq!(response.outcome, RequestPermissionOutcome::Cancelled);
-            responder.respond(PromptResponse::new()).unwrap();
+            assert!(matches!(response.outcome, RequestPermissionOutcome::Cancelled(_)));
+            responder.respond(PromptResponse::new("user-message")).unwrap();
             prompt.await.unwrap();
             client.handle.disconnect().await;
         })
@@ -312,12 +289,13 @@ async fn requests_are_sent_in_call_order_without_polling_their_responses() {
 
     LocalSet::new()
         .run_until(async {
-            let (agent, mut requests) = FakeAgent::default().sessions(vec![]).hold_config(true).capture();
+            let (agent, mut requests) =
+                FakeAgent::default().sessions(vec![]).hold::<SetSessionConfigOptionRequest>().capture();
             let client = agent.build().await.unwrap();
             let config = client.handle.request(SetSessionConfigOptionRequest::new("session", "mode", "Plan"));
             client.handle.request(ListSessionsRequest::new()).await.unwrap();
-            let responder = requests
-                .pending_config
+            let (_, responder) = requests
+                .held::<SetSessionConfigOptionRequest>()
                 .recv()
                 .now_or_never()
                 .expect("config must already have been sent before the list request")

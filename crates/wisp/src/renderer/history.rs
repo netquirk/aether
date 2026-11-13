@@ -1,7 +1,7 @@
 use crate::app::App;
-use crate::conversation::{ConversationContent, ConversationId, ConversationItem, ItemState};
 use crate::error::RenderError;
 use crate::view::wrap::{as_u16, wrap_line};
+use acp_utils::conversation::{ConversationContent, ConversationId, ConversationItem, ItemState};
 use clankerdiff_ratatui::MarkdownCommitError;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -9,7 +9,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Widget};
 
 use super::Renderer;
-use crate::conversation::item_view::content_kind;
+use crate::conversation::item_view::{content_kind, kind_before};
 
 /// The native-scrollback cursor: how much of which conversation the terminal's
 /// real scrollback already holds.
@@ -46,7 +46,7 @@ impl Renderer {
         terminal: &mut Terminal<T>,
         app: &App,
     ) -> Result<(), RenderError<T::Error>> {
-        let current = committed_replacements(app.conversation_items(), self.native_history.commit);
+        let current = committed_replacements(app.core().conversation().items(), self.native_history.commit);
         if current != self.native_history.committed_replacements {
             let width = terminal.size().map_err(RenderError::Backend)?.width;
             let notice = wrap_line(Line::raw("Transcript updated; earlier scrollback is superseded."), width);
@@ -66,7 +66,6 @@ impl Renderer {
     /// Moves transcript rows the viewport can no longer show into the
     /// terminal's native scrollback, advancing the commit point, and returns
     /// the live rows left over for the viewport to draw.
-    ///
     pub(super) fn commit_overflow<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -74,7 +73,7 @@ impl Renderer {
         width: u16,
         capacity: usize,
     ) -> Result<Vec<Line<'static>>, RenderError<B::Error>> {
-        let items = app.conversation_items();
+        let items = app.core().conversation().items();
         let live = self.live_lines(app, width)?;
         let mut overflow = live.len().saturating_sub(capacity);
         if overflow == 0 {
@@ -86,8 +85,9 @@ impl Renderer {
                 break;
             };
             let (item_width, item_padding) = commit.dimensions(width, app.content_padding());
-            let previous = items.get(commit.item_index.wrapping_sub(1)).map(content_kind);
-            let separator = usize::from(previous.is_some_and(|kind| kind != content_kind(item)));
+            let previous = kind_before(items, commit.item_index);
+            let separator =
+                usize::from(content_kind(item).is_some_and(|kind| previous.is_some_and(|previous| previous != kind)));
             let rendered =
                 self.item_suffix(item, previous, item_width, item_padding, app.spinner_tick(), commit.rows)?;
             let committed = commit.rows;
@@ -95,7 +95,9 @@ impl Renderer {
             let take = if streams_into_history(item) {
                 let available = pending.len().saturating_sub(usize::from(item.is_open()));
                 overflow.min(available)
-            } else if item.state() == ItemState::Sealed || matches!(item.content(), ConversationContent::User(_)) {
+            } else if item.state() == ItemState::Sealed
+                || matches!(item.content(), ConversationContent::User(_) | ConversationContent::Thought(_))
+            {
                 pending.len()
             } else {
                 break;

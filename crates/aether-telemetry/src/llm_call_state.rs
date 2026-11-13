@@ -2,11 +2,11 @@ use crate::content_capture::ContentBuffer;
 use crate::content_json::output_messages_json;
 use crate::gen_ai_metrics::GenAiMetrics;
 use crate::genai_constants::{
-    AI_REASONING_TOKENS, ERROR_TYPE, GEN_AI_OUTPUT_MESSAGES, GEN_AI_RESPONSE_FINISH_REASONS,
-    GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, GEN_AI_TOKEN_TYPE, GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-    GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, GEN_AI_USAGE_INPUT_TOKENS, GEN_AI_USAGE_OUTPUT_TOKENS,
-    GEN_AI_USAGE_REASONING_OUTPUT_TOKENS, GENAI_RESPONSE_START_EVENT, GENAI_TOOL_CALL_START_EVENT, MESSAGE_ID,
-    TOOL_CALL_ID, TOOL_CALL_NAME,
+    AI_CACHE_REPORTING_EXCLUSIVE, AI_REASONING_TOKENS, ERROR_TYPE, GEN_AI_OUTPUT_MESSAGES,
+    GEN_AI_RESPONSE_FINISH_REASONS, GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, GEN_AI_TOKEN_TYPE,
+    GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS, GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS, GEN_AI_USAGE_REASONING_OUTPUT_TOKENS, GENAI_RESPONSE_START_EVENT,
+    GENAI_TOOL_CALL_START_EVENT, MESSAGE_ID, TOOL_CALL_ID, TOOL_CALL_NAME,
 };
 use crate::span_guard::{ErrorKind, SpanGuard};
 use aether_core::events::LlmCallOutcome;
@@ -53,47 +53,22 @@ impl LlmCallState {
         self.output.push(chunk);
     }
 
-    pub(crate) fn record_tool_call_start(&mut self, tool_call: &ToolCallRequest) {
+    pub(crate) fn record_tool_input_started(&mut self, id: &str, name: &str) {
         self.record_output_chunk();
-        if let Some(tool_calls) = &mut self.tool_calls {
-            tool_calls.push(tool_call.clone());
-        }
         self.span.add_event(
             GENAI_TOOL_CALL_START_EVENT,
-            vec![
-                KeyValue::new(TOOL_CALL_ID, tool_call.id.clone()),
-                KeyValue::new(TOOL_CALL_NAME, tool_call.name.clone()),
-            ],
+            vec![KeyValue::new(TOOL_CALL_ID, id.to_string()), KeyValue::new(TOOL_CALL_NAME, name.to_string())],
         );
     }
 
-    pub(crate) fn record_tool_call_update(&mut self, tool_call_id: &str, chunk: &str) {
+    pub(crate) fn record_tool_input_delta(&mut self) {
         self.record_output_chunk();
-        if let Some(tool_call) = self
-            .tool_calls
-            .as_mut()
-            .and_then(|tool_calls| tool_calls.iter_mut().find(|tool_call| tool_call.id == tool_call_id))
-        {
-            tool_call.arguments.push_str(chunk);
-        }
     }
 
-    pub(crate) fn record_output_chunk(&mut self) {
-        let now = Instant::now();
-        match self.chunk_timing {
-            ChunkTiming::Disabled => return,
-            ChunkTiming::AwaitingFirst => {
-                let elapsed = self.start.elapsed().as_secs_f64();
-                self.span.set_attribute(KeyValue::new(GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, elapsed));
-                self.metrics.time_to_first_chunk.record(elapsed, &self.metric_attributes);
-            }
-            ChunkTiming::Streaming { last_chunk } => {
-                self.metrics
-                    .time_per_output_chunk
-                    .record(now.duration_since(last_chunk).as_secs_f64(), &self.metric_attributes);
-            }
+    pub(crate) fn record_tool_call(&mut self, tool_call: &ToolCallRequest) {
+        if let Some(tool_calls) = &mut self.tool_calls {
+            tool_calls.push(tool_call.clone());
         }
-        self.chunk_timing = ChunkTiming::Streaming { last_chunk: now };
     }
 
     pub(crate) fn finish(mut self, outcome: &LlmCallOutcome) {
@@ -114,24 +89,22 @@ impl LlmCallState {
                     ));
                 }
                 if let Some(usage) = usage {
-                    self.span.set_attribute(KeyValue::new(GEN_AI_USAGE_INPUT_TOKENS, attr_tokens(usage.input_tokens)));
-                    self.span
-                        .set_attribute(KeyValue::new(GEN_AI_USAGE_OUTPUT_TOKENS, attr_tokens(usage.output_tokens)));
-                    if let Some(tokens) = usage.cache_read_tokens {
-                        self.span
-                            .set_attribute(KeyValue::new(GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, attr_tokens(tokens)));
+                    let token_attributes = [
+                        (GEN_AI_USAGE_INPUT_TOKENS, Some(usage.input_tokens)),
+                        (GEN_AI_USAGE_OUTPUT_TOKENS, Some(usage.output_tokens)),
+                        (GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, usage.cache_read_tokens),
+                        (GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS, usage.cache_creation_tokens),
+                        (GEN_AI_USAGE_REASONING_OUTPUT_TOKENS, usage.reasoning_tokens),
+                        (AI_REASONING_TOKENS, usage.reasoning_tokens),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, tokens)| tokens.map(|tokens| KeyValue::new(key, attr_tokens(tokens))));
+                    for attribute in token_attributes {
+                        self.span.set_attribute(attribute);
                     }
-                    if let Some(tokens) = usage.cache_creation_tokens {
-                        self.span.set_attribute(KeyValue::new(
-                            GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-                            attr_tokens(tokens),
-                        ));
-                    }
-                    if let Some(tokens) = usage.reasoning_tokens {
-                        let tokens = attr_tokens(tokens);
-                        self.span.set_attribute(KeyValue::new(GEN_AI_USAGE_REASONING_OUTPUT_TOKENS, tokens));
-                        self.span.set_attribute(KeyValue::new(AI_REASONING_TOKENS, tokens));
-                    }
+                    // `TokenUsage::input_tokens` includes cache tokens; without this,
+                    // OTEL consumers double count cached tokens for providers with exclusive APIs (e.g. Anthropic).
+                    self.span.set_attribute(KeyValue::new(AI_CACHE_REPORTING_EXCLUSIVE, false));
                     self.record_token_usage(*usage);
                 }
                 self.span.end_ok();
@@ -140,6 +113,24 @@ impl LlmCallState {
             LlmCallOutcome::Failed { error, .. } => self.fail(ErrorKind::LlmError, error.clone()),
             LlmCallOutcome::Cancelled => self.cancel(),
         }
+    }
+
+    fn record_output_chunk(&mut self) {
+        let now = Instant::now();
+        match self.chunk_timing {
+            ChunkTiming::Disabled => return,
+            ChunkTiming::AwaitingFirst => {
+                let elapsed = self.start.elapsed().as_secs_f64();
+                self.span.set_attribute(KeyValue::new(GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, elapsed));
+                self.metrics.time_to_first_chunk.record(elapsed, &self.metric_attributes);
+            }
+            ChunkTiming::Streaming { last_chunk } => {
+                self.metrics
+                    .time_per_output_chunk
+                    .record(now.duration_since(last_chunk).as_secs_f64(), &self.metric_attributes);
+            }
+        }
+        self.chunk_timing = ChunkTiming::Streaming { last_chunk: now };
     }
 
     fn record_response_start(&mut self, message_id: &str) {

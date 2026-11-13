@@ -1,55 +1,94 @@
 pub(crate) use acp_utils::client::AcpEvent;
 pub(crate) use acp_utils::config_meta::SelectOptionMeta;
-pub(crate) use acp_utils::config_option_id::ConfigOptionId;
 pub(crate) use acp_utils::notifications::{
-    AuthMethodsUpdatedParams, ContextClearedParams, McpNotification, McpServerAuthCapability, McpServerStatus,
-    McpServerStatusEntry, SessionPreviewResponse, SessionPreviewRole, SessionPreviewTurn, SubAgentEvent,
-    SubAgentProgressParams, SubAgentToolRequest, SubAgentToolResult, WorkspaceEntry, WorkspaceListResponse,
-    WorkspaceMoveResponse,
+    AuthMethodsUpdatedParams, ContextClearedParams, McpNotification, McpRequest, McpServerAuthCapability,
+    McpServerStatus, McpServerStatusEntry, PromptSearchParams, PromptSearchResult, SessionPreviewParams,
+    WorkspaceEntry, WorkspaceListParams, WorkspaceListResponse, WorkspaceMoveParams, WorkspaceMoveResponse,
+    WorkspaceMoveTarget,
 };
-pub(crate) use acp_utils::testing::test_connection;
-pub(crate) use agent_client_protocol::schema::v2::{
+pub(crate) use acp_utils::testing::{
+    FakeAgent, announced, choices, idle_notification, model_choice, model_picker, on_session, option_group, plan,
+    prompt_search_hit, prompt_search_response, running_state, select, session_preview, user_message,
+};
+pub(crate) use agent_client_protocol::Error;
+pub(crate) use agent_client_protocol::v2::schema::{
     self as acp, BooleanPropertySchema, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, SessionId,
     StringPropertySchema,
 };
+use clankerdiff_core::RepoPath;
+use client_core::composer::file_listing::{FileListing, RepoFiles};
+pub(crate) use client_core::session_core::CommandEntry;
+
+pub(crate) use client_core::session_core::{ForegroundOperation, SessionCore};
+pub(crate) use client_core::testing::{FakeGit, SessionCoreConfigBuilder};
 pub(crate) use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub(crate) use ratatui::buffer::{Buffer, Cell};
 pub(crate) use ratatui::layout::Position;
 pub(crate) use ratatui::style::{Color, Modifier};
+use std::borrow::Cow;
 pub(crate) use std::fmt::Write as FmtWrite;
 pub(crate) use std::io::Write as IoWrite;
-pub(crate) use std::sync::Arc;
+pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::time::{Duration, Instant};
-pub(crate) use tempfile::TempDir;
-pub(crate) use tokio::task::LocalSet;
-pub(crate) use wisp::app::ForegroundOperation;
-pub(crate) use wisp::command::{AgentCommand, Command, CommandResult, FilesystemCommand};
+pub(crate) use unicode_width::UnicodeWidthStr;
+pub(crate) use utils::artifact_review::ArtifactReviewElicitationMeta;
+pub(crate) use wisp::command::HostCommandResult;
+pub(crate) use wisp::testing::ElicitationReply;
 pub(crate) use wisp::testing::{
-    BackendEvent, CountingBackend, FakeGit, RecordingBackend, StreamContent, TestUi, TestUiBuilder, assert_buffer_eq,
-    buffer_text, chunk_message, compaction_update, has_cell, line_text, row_containing, row_text, rows_with_background,
-    session_update, text_chunk, thought_chunk, tool_completed,
+    BackendEvent, InstrumentedBackend, TestUi, TestUiBuilder, assert_buffer_eq, buffer_text, compaction_update,
+    context_cleared, has_cell, line_text, numbered_lines, render_surface, row_cells, row_containing, row_text,
+    rows_with_background, session_update, sub_agent_finished, sub_agent_started, sub_agent_tool_update, text_chunk,
+    text_chunk_with_id, text_diff, thought_chunk, thought_chunk_with_id, tool_completed, tool_status,
 };
 
-pub(crate) use wisp::attachment::{AttachmentKind, PromptAttachment, build_attachments, classify_attachment};
-pub(crate) use wisp::conversation::tool_calls::ToolStatus;
-pub(crate) use wisp::conversation::{ConversationContent, ItemState};
-pub(crate) use wisp::file_index::index_files;
-pub(crate) use wisp::git_review::{FileStatus, StageState};
-pub(crate) use wisp::renderer::DrawContext;
-pub(crate) use wisp::session::session_config_view::LocalConfigOption;
+pub(crate) use acp_utils::conversation::{ConversationContent, ConversationItem, ItemState, ToolCall, ToolStatus};
+use clankerdiff_client::{ClientState, ConnectionState};
+use clankerdiff_ratatui::diff::{DiffDocument, FileDiff};
+pub(crate) use clankerdiff_ratatui::diff::{FileStatus, StageState};
+use wisp::screens::git_diff::GitDiffScreen;
 pub(crate) use wisp::settings::overlay::SettingsOverlay;
 pub(crate) use wisp::settings::{StatusLineSegmentConfig, UiSettings};
 pub(crate) use wisp::surfaces::composer::Composer;
-pub(crate) use wisp::surfaces::input::UiEvent;
-pub(crate) use wisp::surfaces::picker::CommandEntry;
+pub(crate) use wisp::surfaces::picker::SlashCommand;
 pub(crate) use wisp::theme::Theme;
-pub(crate) use wisp::view::generation::Generation;
-pub(crate) use wisp::view::syntax::SyntaxHighlighter;
+pub(crate) use wisp::view::input::UiEvent;
+pub(crate) use wisp::view::syntax::highlight;
 
-pub(crate) fn block_on_local<F: std::future::Future>(body: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    LocalSet::new().block_on(&runtime, body)
+pub(crate) type Step = fn(&mut TestUi);
+
+pub(crate) type ListSessions = acp::ListSessionsRequest;
+pub(crate) type Resume = acp::ResumeSessionRequest;
+pub(crate) type NewSession = acp::NewSessionRequest;
+pub(crate) type Login = acp::LoginAuthRequest;
+pub(crate) type Preview = SessionPreviewParams;
+pub(crate) type Search = PromptSearchParams;
+pub(crate) type ListWorkspaces = WorkspaceListParams;
+pub(crate) type MoveWorkspace = WorkspaceMoveParams;
+
+pub(crate) fn sent_prompt(ui: &mut TestUi) -> acp::PromptRequest {
+    ui.agent().prompt.try_recv().expect("the agent received a prompt")
+}
+
+pub(crate) fn sent_prompts(ui: &mut TestUi) -> Vec<String> {
+    std::iter::from_fn(|| ui.agent().prompt.try_recv().ok())
+        .map(|request| prompt_text(&request).unwrap_or_default().to_owned())
+        .collect()
+}
+
+pub(crate) fn sent_any_prompt(ui: &mut TestUi) -> bool {
+    ui.agent().prompt.try_recv().is_ok()
+}
+
+pub(crate) fn prompt_text(request: &acp::PromptRequest) -> Option<&str> {
+    match request.prompt.first()? {
+        acp::ContentBlock::Text(text) => Some(&text.text),
+        _ => None,
+    }
+}
+
+pub(crate) fn agent_error(message: &str) -> Error {
+    Error::new(-32603, message)
 }
 
 pub(crate) fn form_elicitation(
@@ -79,16 +118,6 @@ fn server_meta(server_name: &str) -> acp::Meta {
     )])
 }
 
-pub(crate) async fn with_elicitation(
-    ui: &mut TestUi,
-    params: CreateElicitationRequest,
-) -> tokio::sync::oneshot::Receiver<CreateElicitationResponse> {
-    let (cx, mut peer) = test_connection().await;
-    let (responder, response_rx) = peer.fake_elicitation(&cx).await;
-    ui.acp_event(AcpEvent::ElicitationRequest { params: Box::new(params), responder });
-    response_rx
-}
-
 pub(crate) fn accepted_content(response: &CreateElicitationResponse) -> serde_json::Value {
     let ElicitationAction::Accept(accept) = &response.action else {
         panic!("expected an accepted elicitation, got {:?}", response.action);
@@ -99,74 +128,124 @@ pub(crate) fn accepted_content(response: &CreateElicitationResponse) -> serde_js
     }
 }
 
-pub(crate) fn message_texts(app: &TestUi) -> impl Iterator<Item = &str> {
-    app.app().conversation_items().iter().filter_map(|item| match item.content() {
-        ConversationContent::User(text) => Some(text.text.as_str()),
-        ConversationContent::Notice(notice) => Some(notice.text.as_str()),
+pub(crate) fn message_texts(app: &TestUi) -> impl Iterator<Item = String> + '_ {
+    app.app().core().conversation().items().iter().filter_map(|item| match item.content() {
+        ConversationContent::User(_) => item.text().map(Cow::into_owned),
+        ConversationContent::Notice(notice) => Some(notice.text.clone()),
         _ => None,
     })
 }
 
-pub(crate) fn make_app() -> TestUi {
-    TestUiBuilder::new().build()
+pub(crate) fn sonnet_model() -> acp::SessionConfigOption {
+    select("model", "Model", "claude-sonnet", &[("claude-sonnet", "Claude Sonnet")])
 }
 
-pub(crate) fn make_app_in(working_dir: std::path::PathBuf) -> TestUi {
-    TestUiBuilder::new().working_dir(working_dir).build()
+pub(crate) fn status_ui() -> TestUi {
+    TestUiBuilder::new().session(|session| session.config_options(vec![sonnet_model()])).dimensions(120, 15).build()
+}
+
+pub(crate) fn config_update(options: Vec<acp::SessionConfigOption>) -> AcpEvent {
+    session_update(acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(options)))
+}
+
+pub(crate) fn mcp_notification(servers: Vec<McpServerStatusEntry>) -> AcpEvent {
+    AcpEvent::McpNotification(McpNotification::ServerStatus { servers })
 }
 
 pub(crate) fn select_option(id: &str, current_value: &str) -> acp::SessionConfigOption {
-    acp::SessionConfigOption::select(
-        id.to_string(),
-        id.to_string(),
-        current_value.to_string(),
-        vec![acp::SessionConfigSelectOption::new(current_value.to_string(), current_value.to_string())],
-    )
+    acp::SessionConfigOption::select(id.to_string(), id.to_string(), current_value.to_string(), plain(&[current_value]))
 }
 
 pub(crate) fn reasoning_option(current: &str, levels: &[&str]) -> acp::SessionConfigOption {
-    let options: Vec<acp::SessionConfigSelectOption> =
-        levels.iter().map(|&level| acp::SessionConfigSelectOption::new(level.to_string(), level.to_string())).collect();
-    acp::SessionConfigOption::select("reasoning_effort", "Reasoning", current.to_string(), options)
+    acp::SessionConfigOption::select("reasoning_effort", "Reasoning", current.to_string(), plain(levels))
 }
 
 pub(crate) fn mode_option(current: &str, modes: &[&str]) -> acp::SessionConfigOption {
-    acp::SessionConfigOption::select("mode", "Mode", current.to_string(), select_options(modes))
+    acp::SessionConfigOption::select("mode", "Mode", current.to_string(), plain(modes))
         .category(acp::SessionConfigOptionCategory::Mode)
 }
 
 /// A mode option whose values arrive under group headers rather than as a flat list.
 pub(crate) fn grouped_mode_option(current: &str, groups: &[(&str, &[&str])]) -> acp::SessionConfigOption {
-    let groups: Vec<acp::SessionConfigSelectGroup> = groups
-        .iter()
-        .map(|(name, modes)| {
-            acp::SessionConfigSelectGroup::new((*name).to_string(), (*name).to_string(), select_options(modes))
-        })
-        .collect();
+    let groups: Vec<_> = groups.iter().map(|(name, modes)| option_group(name, plain(modes))).collect();
     acp::SessionConfigOption::select("mode", "Mode", current.to_string(), groups)
         .category(acp::SessionConfigOptionCategory::Mode)
 }
 
-fn select_options(values: &[&str]) -> Vec<acp::SessionConfigSelectOption> {
-    values.iter().map(|&value| acp::SessionConfigSelectOption::new(value.to_string(), value.to_string())).collect()
+pub(crate) fn open_file_picker(composer: &mut Composer, files: &[&str]) {
+    composer.open_file_picker();
+    let mut paths: Vec<_> = files.iter().map(|file| RepoPath::new(*file).expect("a repository path")).collect();
+    paths.sort();
+    composer.on_files_listed(FileListing::Listed(RepoFiles { root: "/workspace".into(), paths: paths.into() }));
 }
 
-/// Opens the `@` picker on `composer` and delivers the file index, the way the
-/// event loop does once the walk completes.
-pub(crate) fn open_file_picker(composer: &mut Composer, root: &std::path::Path) {
-    let FilesystemCommand::IndexFiles { request_id, root } = composer.open_file_picker(root) else {
-        panic!("opening the file picker should ask for a file index");
-    };
-    composer.on_files_indexed(request_id, index_files(&root));
+pub(crate) fn assert_shell_command_highlighted(ui: &mut TestUi, tool: &str, command: &str) {
+    let conversation = ui.conversation();
+    let row = row_containing(&conversation, command).expect("rendered shell command");
+    let text = row_text(&conversation, row);
+    assert!(text.contains(&format!("{tool} {command}")), "command should share the tool row: {text:?}");
+    let start = text[..text.find(command).expect("command position")].width();
+    let cells = row_cells(&conversation, row);
+    assert_eq!(cells[start - 1].bg, Color::Reset, "the gap before the command should not set a background");
+    let command_cells: Vec<_> =
+        cells[start..start + command.width()].iter().filter(|cell| cell.symbol() != " ").collect();
+    assert!(command_cells.iter().all(|cell| cell.bg == Color::Reset), "command should sit on the terminal background");
+    let keyword = command_cells.iter().find(|cell| cell.symbol() == "i").expect("if keyword");
+    let variable = command_cells.iter().find(|cell| cell.symbol() == "$").expect("shell variable");
+    assert_ne!(keyword.fg, variable.fg, "shell keywords and variables should use distinct token colors");
 }
 
-pub(crate) fn assert_ctrl_c_exits(ui: &mut TestUi) {
-    assert!(ui.app().has_navigation(), "test must open navigation before asserting the exit shortcut");
-    ui.key(ctrl('c'));
-    assert!(ui.app().exit_confirmation_active(), "first Ctrl+C should arm exit confirmation");
-    assert!(!ui.app().exit_requested());
-    ui.key(ctrl('c'));
-    assert!(ui.app().exit_requested(), "second Ctrl+C should request exit");
+pub(crate) fn plan_meta(markdown: &str) -> ArtifactReviewElicitationMeta {
+    ArtifactReviewElicitationMeta::new(Some(PathBuf::from("/tmp/plan.md")), "Review /tmp/plan.md", markdown)
+}
+
+/// Opens `/settings` and then the menu row labelled `label`, wherever it sits.
+pub(crate) fn open_settings_row(ui: &mut TestUi, label: &str) {
+    ui.run_command("/settings");
+    ui.click_text(label);
+}
+
+pub(crate) fn open_workspace_picker(ui: &mut TestUi, workspaces: Vec<WorkspaceEntry>) {
+    ui.run_command("/move");
+    ui.answer::<ListWorkspaces>(Ok(WorkspaceListResponse { workspaces }));
+}
+
+pub(crate) fn move_to_other_workspace(ui: &mut TestUi) {
+    open_workspace_picker(
+        ui,
+        vec![workspace_entry("/home/user/code/current", true), workspace_entry("/home/user/code/other", false)],
+    );
+    ui.key(key(KeyCode::Enter));
+}
+
+pub(crate) fn workspace_moved(ui: &mut TestUi, new_cwd: &str) -> WorkspaceMoveParams {
+    ui.answer::<MoveWorkspace>(Ok(WorkspaceMoveResponse { new_cwd: PathBuf::from(new_cwd) }))
+}
+
+pub(crate) fn session_loaded(
+    ui: &mut TestUi,
+    config_options: Vec<acp::SessionConfigOption>,
+) -> acp::ResumeSessionRequest {
+    ui.answer::<Resume>(Ok(acp::ResumeSessionResponse::new().config_options(config_options)))
+}
+
+pub(crate) fn new_session_created(ui: &mut TestUi, session_id: &str, config_options: Vec<acp::SessionConfigOption>) {
+    ui.answer::<NewSession>(Ok(acp::NewSessionResponse::new(session_id.to_string()).config_options(config_options)));
+}
+
+pub(crate) fn assert_sets_config_option(ui: &mut TestUi, id: &str, value: &str) {
+    let request = ui.agent().config.try_recv().expect("the agent was asked to change a setting");
+    assert_eq!(request.config_id, acp::SessionConfigId::new(id.to_string()));
+    assert_eq!(request.value, acp::SessionConfigOptionValue::id(value));
+}
+
+pub(crate) fn assert_authenticates_mcp_server(ui: &mut TestUi, name: &str) {
+    let request = ui.agent().mcp.try_recv().expect("the agent was asked to authenticate a server");
+    assert!(matches!(&request, McpRequest::Authenticate { server_name, .. } if server_name == name), "{request:?}");
+}
+
+pub(crate) fn take_applied_theme(ui: &mut TestUi) -> UiSettings {
+    ui.applied_themes().into_iter().next().expect("the app should ask to apply a theme")
 }
 
 pub(crate) fn key(code: KeyCode) -> KeyEvent {
@@ -190,7 +269,7 @@ pub(crate) fn tool_completed_with_diff(id: &str) -> AcpEvent {
 }
 
 pub(crate) fn tool_completed_with_diff_contents(id: &str, old: &str, new: &str) -> AcpEvent {
-    let diff = wisp::testing::text_diff("/src/main.rs", old, new);
+    let diff = text_diff("/src/main.rs", old, new);
     session_update(acp::SessionUpdate::ToolCallUpdate(
         acp::ToolCallUpdate::new(id.to_string())
             .content(vec![acp::ToolCallContent::Diff(diff)])
@@ -217,81 +296,58 @@ pub(crate) fn session_info(id: &str, cwd: &str, title: &str, updated_at: &str) -
         .updated_at(Some(updated_at.to_string()))
 }
 
-pub(crate) fn sessions_listed(sessions: Vec<acp::SessionInfo>) -> CommandResult {
-    CommandResult::SessionsListed(Ok(acp::ListSessionsResponse::new(sessions)))
-}
-
-pub(crate) fn session_loaded(session_id: &str, config_options: Vec<acp::SessionConfigOption>) -> CommandResult {
-    CommandResult::ResumeSession {
-        session_id: SessionId::new(session_id),
-        result: Ok(acp::ResumeSessionResponse::default().config_options(config_options)),
-    }
-}
-
-pub(crate) fn new_session_created(session_id: &str, config_options: Vec<acp::SessionConfigOption>) -> CommandResult {
-    CommandResult::NewSession(Ok(
-        acp::NewSessionResponse::new(SessionId::new(session_id)).config_options(config_options)
-    ))
-}
-
-pub(crate) fn session_preview_response(session_id: &str) -> SessionPreviewResponse {
-    SessionPreviewResponse {
-        session_id: session_id.to_string(),
-        cwd: std::path::PathBuf::from("/tmp/project"),
-        created_at: "2025-01-01T00:00:00Z".to_string(),
-        model: "claude".to_string(),
-        selected_mode: Some("code".to_string()),
-        transcript: vec![
-            SessionPreviewTurn { role: SessionPreviewRole::User, text: "hello".to_string() },
-            SessionPreviewTurn { role: SessionPreviewRole::Assistant, text: "hi there".to_string() },
-        ],
-        tool_call_count: 1,
-        truncated: false,
-    }
-}
-
-pub(crate) fn session_update_for(session_id: &str, update: acp::SessionUpdate) -> AcpEvent {
-    acp::UpdateSessionNotification::new(SessionId::new(session_id), update).into()
-}
-
-pub(crate) fn user_message_chunk(text: &str) -> acp::SessionUpdate {
-    acp::SessionUpdate::UserMessage(
-        acp::UserMessage::new("user-message").content(vec![acp::ContentBlock::Text(acp::TextContent::new(text))]),
-    )
-}
-
-pub(crate) fn make_app_with_session_preview() -> TestUi {
-    TestUiBuilder::new().session_preview().build()
-}
-
-pub(crate) fn make_app_with_workspace_move() -> TestUi {
-    TestUiBuilder::new().workspace_move().build()
-}
-
 pub(crate) fn workspace_entry(path: &str, is_current: bool) -> WorkspaceEntry {
     WorkspaceEntry { path: std::path::PathBuf::from(path), is_current }
 }
 
-pub(crate) fn workspaces_listed(workspaces: Vec<WorkspaceEntry>) -> CommandResult {
-    CommandResult::WorkspacesListed(Ok(WorkspaceListResponse { workspaces }))
+pub(crate) fn search(ui: &mut TestUi, query: &str, results: Vec<PromptSearchResult>) {
+    start_search(ui, query);
+    answer_search(ui, query, Ok(prompt_search_response(query, results)));
 }
 
-pub(crate) fn workspace_list_failed(error: &str) -> CommandResult {
-    CommandResult::WorkspacesListed(Err(error.to_string()))
+pub(crate) fn start_search(ui: &mut TestUi, query: &str) {
+    ui.key(ctrl('r'));
+    ui.type_text(query);
 }
 
-pub(crate) fn workspace_moved(new_cwd: &str) -> CommandResult {
-    CommandResult::WorkspaceMoved(Ok(WorkspaceMoveResponse { new_cwd: std::path::PathBuf::from(new_cwd) }))
+pub(crate) fn answer_search(
+    ui: &mut TestUi,
+    query: &str,
+    response: Result<acp_utils::notifications::PromptSearchResponse, Error>,
+) {
+    loop {
+        let (request, responder) = ui.held::<Search>();
+        if request.query == query {
+            return ui.respond(responder, response);
+        }
+        let _ = responder.respond(prompt_search_response(&request.query, Vec::new()));
+    }
 }
 
-pub(crate) fn workspace_move_failed(error: &str) -> CommandResult {
-    CommandResult::WorkspaceMoved(Err(error.to_string()))
+/// A git review screen that installed `state`, the way the app installs each
+/// review update.
+pub(crate) fn screen_showing(state: &ClientState) -> GitDiffScreen {
+    let mut screen = GitDiffScreen::new();
+    screen.install(state);
+    screen
 }
 
-pub(crate) fn prompt_failed(error: &str) -> CommandResult {
-    CommandResult::Prompt(Err(error.to_string()))
+/// A git review screen showing `files` in a connected review.
+pub(crate) fn git_diff_screen(files: Vec<FileDiff>) -> GitDiffScreen {
+    let document = DiffDocument { repo_root: "/workspace".into(), files, ..DiffDocument::default() };
+    screen_showing(&ClientState {
+        connection: ConnectionState::Connected,
+        snapshot: Some(std::sync::Arc::new(document)),
+        ..ClientState::default()
+    })
 }
 
-pub(crate) fn session_load_failed(error: &str) -> CommandResult {
-    CommandResult::ResumeSession { session_id: "test-session".into(), result: Err(error.to_string()) }
+pub(crate) fn render_git_diff(screen: &mut GitDiffScreen, width: u16, height: u16) -> Buffer {
+    render_surface(Buffer::empty(ratatui::layout::Rect::new(0, 0, width, height)), |buffer, cx| {
+        screen.render(buffer.area, buffer, cx)
+    })
+}
+
+fn plain(values: &[&str]) -> Vec<acp::SessionConfigSelectOption> {
+    values.iter().map(|&value| acp::SessionConfigSelectOption::new(value.to_string(), value.to_string())).collect()
 }

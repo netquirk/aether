@@ -3,19 +3,20 @@ use acp_utils::notifications::{
     GitDiffClosePayload, GitDiffCommandPayload, McpRequest, PromptSearchParams, SessionPreviewParams,
     WorkspaceListParams, WorkspaceMoveParams, WorkspaceStatusPayload,
 };
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::util::MatchDispatchFrom;
+use agent_client_protocol::v2::schema::{
     CancelSessionNotification, CloseSessionRequest, InitializeRequest, ListSessionsRequest, LoginAuthRequest,
     LogoutAuthRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest, SetSessionConfigOptionRequest,
+    SetSessionTitleRequest,
 };
-use agent_client_protocol::util::MatchDispatchFrom;
 use agent_client_protocol::{
     self as acp, Agent, Client, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, JsonRpcResponse, NullRun,
-    Responder, V2Builder,
+    Responder, v2,
 };
 use std::future::Future;
 use std::sync::Arc;
 
-pub(crate) fn acp_agent_builder(state: Arc<AcpState>) -> V2Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
+pub(crate) fn acp_agent_builder(state: Arc<AcpState>) -> v2::Builder<Agent, impl HandleDispatchFrom<Client>, NullRun> {
     Agent.v2().name("aether-acp").with_handler(AcpHandlers(state))
 }
 
@@ -30,42 +31,40 @@ impl HandleDispatchFrom<Client> for AcpHandlers {
         let state = &self.0;
         let matcher = MatchDispatchFrom::new(message, &cx)
             .if_request(async |req: InitializeRequest, responder| {
-                let state = state.clone();
-                spawn_response(&cx, responder, async move { state.initialize(req).await })
+                spawn_response(&cx, state, responder, move |state, _| async move { state.initialize(req).await })
             })
             .await
             .if_request(async |req: LoginAuthRequest, responder| {
-                let state = state.clone();
-                let connection = cx.clone();
-                spawn_response(&cx, responder, async move { state.login(req, &connection).await })
+                spawn_response(&cx, state, responder, move |state, cx| async move { state.login(req, &cx).await })
             })
             .await
             .if_request(async |req: NewSessionRequest, responder| {
-                let state = state.clone();
-                let connection = cx.clone();
-                spawn_response(&cx, responder, async move { state.new_session(req, &connection).await })
+                spawn_response(&cx, state, responder, move |state, cx| async move { state.new_session(req, &cx).await })
             })
             .await
             .if_request(async |req: ListSessionsRequest, responder| {
-                let state = state.clone();
-                spawn_response(&cx, responder, async move { state.list_sessions(&req) })
+                spawn_response(&cx, state, responder, move |state, _| async move { state.list_sessions(&req) })
+            })
+            .await
+            .if_request(async |req: SetSessionTitleRequest, responder| {
+                spawn_response(&cx, state, responder, move |state, _| async move { state.set_session_title(&req) })
             })
             .await
             .if_request(async |req: LogoutAuthRequest, responder| {
-                let state = state.clone();
-                let connection = cx.clone();
-                spawn_response(&cx, responder, async move { state.logout(req, &connection).await })
+                spawn_response(&cx, state, responder, move |state, cx| async move { state.logout(req, &cx).await })
             })
             .await
             .if_request(async |req: ResumeSessionRequest, responder| {
-                let state = state.clone();
-                let connection = cx.clone();
-                spawn_response(&cx, responder, async move { state.resume_session(req, &connection).await })
+                spawn_response(
+                    &cx,
+                    state,
+                    responder,
+                    move |state, cx| async move { state.resume_session(req, &cx).await },
+                )
             })
             .await
             .if_request(async |req: CloseSessionRequest, responder| {
-                let state = state.clone();
-                spawn_response(&cx, responder, async move { state.close_session(req).await })
+                spawn_response(&cx, state, responder, move |state, _| async move { state.close_session(req).await })
             })
             .await
             .if_request(async |req: PromptRequest, responder| {
@@ -103,28 +102,23 @@ impl AcpHandlers {
         let state = &self.0;
         matcher
             .if_request(async |req: PromptSearchParams, responder| {
-                let state = state.clone();
-                spawn_response(cx, responder, async move { state.search_prompts(&req) })
+                spawn_response(cx, state, responder, move |state, _| async move { state.search_prompts(&req) })
             })
             .await
             .if_request(async |req: SessionPreviewParams, responder| {
-                let state = state.clone();
-                spawn_response(cx, responder, async move { state.session_preview(&req) })
+                spawn_response(cx, state, responder, move |state, _| async move { state.session_preview(&req) })
             })
             .await
             .if_request(async |req: WorkspaceListParams, responder| {
-                let state = state.clone();
-                spawn_response(cx, responder, async move { state.workspace_list(&req).await })
+                spawn_response(cx, state, responder, move |state, _| async move { state.workspace_list(&req).await })
             })
             .await
             .if_request(async |req: WorkspaceMoveParams, responder| {
-                let state = state.clone();
-                spawn_response(cx, responder, async move { state.workspace_move(&req).await })
+                spawn_response(cx, state, responder, move |state, _| async move { state.workspace_move(&req).await })
             })
             .await
             .if_request(async |req: WorkspaceStatusPayload, responder| {
-                let state = state.clone();
-                spawn_response(cx, responder, async move { state.workspace_status(&req).await })
+                spawn_response(cx, state, responder, move |state, _| async move { state.workspace_status(&req).await })
             })
             .await
             .if_notification(async |params: GitDiffCommandPayload| {
@@ -146,11 +140,18 @@ impl AcpHandlers {
     }
 }
 
-fn spawn_response<T, U>(cx: &ConnectionTo<Client>, responder: Responder<T>, future: U) -> Result<(), acp::Error>
+fn spawn_response<T, F, U>(
+    cx: &ConnectionTo<Client>,
+    state: &Arc<AcpState>,
+    responder: Responder<T>,
+    handler: F,
+) -> Result<(), acp::Error>
 where
     T: JsonRpcResponse + Send + 'static,
+    F: FnOnce(Arc<AcpState>, ConnectionTo<Client>) -> U,
     U: Future<Output = Result<T, acp::Error>> + Send + 'static,
 {
+    let future = handler(Arc::clone(state), cx.clone());
     cx.spawn(async move {
         if let Err(e) = responder.respond_with_result(future.await) {
             tracing::warn!("failed to send ACP response: {e:?}");

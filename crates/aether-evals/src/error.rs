@@ -1,7 +1,7 @@
 use crate::agents::RunError;
-use crate::git_repo::GitRepoError;
 use std::path::PathBuf;
 use thiserror::Error;
+use utils::git::GitError;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -23,8 +23,22 @@ pub enum WorkspaceError {
         source: std::io::Error,
     },
 
-    #[error("git workspace setup failed: {0}")]
-    Git(#[from] GitRepoError),
+    #[error("failed to resolve path '{}': {source}", path.display())]
+    ResolvePath {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to copy the git index '{}': {source}", path.display())]
+    CopyIndex {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("git workspace command failed: {0}")]
+    Git(#[from] GitError),
 
     #[error("git workspace subdirectory does not exist: {}", path.display())]
     MissingSubdir { path: PathBuf },

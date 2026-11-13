@@ -1,17 +1,16 @@
-import type { AetherAcpOptions } from "./generated/aether-acp-options.js";
-import type { SessionUsageEvent } from "./generated/eval-types.js";
+import type { AetherAcpOptions, SessionUsageEvent } from "./generated/types.js";
 import { addAbortListener } from "node:events";
 import path from "node:path";
-import * as acp from "@agentclientprotocol/sdk/experimental/v2";
+import * as acp from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { AsyncQueue } from "./asyncQueue.js";
 import {
   startAgent,
   type AcpAgentProcess,
   type SettingsSelection,
 } from "./agentProcess.js";
-import { AetherSdkError, throwIfAborted } from "./errors.js";
+import { AetherSdkError, abortedError, throwIfAborted } from "./errors.js";
 import { SDK_VERSION } from "./generated/sdk-version.js";
-import type { AetherMessage, AgentSelection } from "./types.js";
+import type { AetherMessage, AgentSelection, StopReason } from "./types.js";
 
 export type PermissionRequestHandler = (
   request: acp.RequestPermissionRequest,
@@ -142,7 +141,7 @@ export class AetherSession {
       this.abortCleanup = addAbortListener(abortSignal, () => {
         this.events.push({
           type: "error",
-          error: new AetherSdkError("aborted", "Aborted by caller"),
+          error: abortedError(),
         });
         void this.cancel()
           .catch(() => undefined)
@@ -184,10 +183,10 @@ export class AetherSession {
     )
       return;
     const update = notification.update;
-    if (
-      acp.SessionUpdate.isStateUpdate(update) &&
-      acp.StateUpdate.isIdle(update)
-    ) {
+    if (!acp.SessionUpdate.isStateUpdate(update)) return;
+    if (!acp.StateUpdate.isIdle(update)) {
+      this.turn.started = true;
+    } else if (this.turn.started) {
       this.turn.stopReason ??= update.stopReason ?? "end_turn";
       this.completeTurn();
     }
@@ -226,7 +225,7 @@ export class AetherSession {
       );
     }
 
-    const turn: Turn = { accepted: false, completed: false };
+    const turn: Turn = { accepted: false, started: false, completed: false };
     this.turn = turn;
     let rejection: Extract<AetherMessage, { type: "error" }> | undefined;
     const promptPromise = this.connection.agent
@@ -277,7 +276,8 @@ export class AetherSession {
 
 type Turn = {
   accepted: boolean;
-  stopReason?: acp.StopReason;
+  started: boolean;
+  stopReason?: StopReason;
   completed: boolean;
 };
 

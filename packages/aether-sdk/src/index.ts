@@ -20,20 +20,15 @@ export type { AetherHeadlessOptions, HeadlessEventKind } from "./headless.js";
 export { tool } from "./tool.js";
 export { mcp } from "./mcp/index.js";
 export type { McpHandle, InlineMcpSource } from "./mcp/index.js";
-export { AetherSdkError } from "./errors.js";
+export { AetherSdkError, abortedError, throwIfAborted } from "./errors.js";
 export type {
   AgentSelection,
   AetherMessage,
   SdkMcpToolDefinition,
+  StopReason,
 } from "./types.js";
 export type { AetherSdkErrorCode } from "./errors.js";
 export { runCommand } from "./childProcess.js";
 export { resolveEnv } from "./processEnv.js";
-export type * from "./generated/eval-types.js";
-export type * from "./generated/aether-settings.js";
-export type {
-  AetherAcpOptions,
-  AgentTraceContext,
-} from "./generated/aether-acp-options.js";
-export type { AetherHeadlessCliOptions } from "./generated/aether-headless-options.js";
-export * as acp from "@agentclientprotocol/sdk/experimental/v2";
+export type * from "./generated/types.js";
+export * as acp from "@agentclientprotocol/sdk/experimental/v2/unstable";

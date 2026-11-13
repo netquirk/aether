@@ -1,6 +1,6 @@
 [package]
 name = "aether-project"
-version = "0.5.48"
+version = "0.5.64"
 edition = "2024"
 description = "Project-local settings and agent discovery for the Aether AI agent framework"
 license = "MIT"
@@ -20,22 +20,19 @@ rustdoc-args = ["--cfg", "docsrs"]
 workspace = true
 
 [dependencies]
-aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.8.4" }
-llm = { package = "aether-llm", path = "../llm", version = "0.9.4" }
-mcp_utils = { package = "aether-mcp-utils", path = "../mcp-utils", version = "0.7.4" }
-utils = { package = "aether-utils", path = "../utils", version = "0.2.16" }
+aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.9.10" }
+llm = { package = "aether-llm", path = "../llm", version = "0.9.19" }
+utils = { package = "aether-utils", path = "../utils", version = "0.3.1" }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+noyalib = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-glob = { workspace = true }
 globset = { workspace = true }
-tempfile = { workspace = true, optional = true }
 
 [features]
-testing = ["dep:tempfile"]
+testing = ["utils/testing"]
 
 [dev-dependencies]
 aether-project = { package = "aether-project", path = ".", features = ["testing"] }

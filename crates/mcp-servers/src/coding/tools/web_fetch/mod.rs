@@ -1,8 +1,7 @@
 mod http_client;
 
 pub use http_client::{
-    DEFAULT_TIMEOUT_MS, HttpClient, HttpResponse, MAX_CONTENT_LENGTH, MAX_TIMEOUT_MS, ReqwestClient, WebFetchInput,
-    WebFetchOutput,
+    DEFAULT_TIMEOUT_MS, HttpClient, HttpResponse, MAX_TIMEOUT_MS, ReqwestClient, WebFetchInput, WebFetchOutput,
 };
 
 use dom_smoothie::Readability;
@@ -11,31 +10,27 @@ use reqwest::Url;
 use std::time::Duration;
 
 use crate::coding::error::WebFetchError;
-use mcp_utils::display_meta::{ToolDisplayMeta, truncate};
 
 /// HTTP client for fetching web content and converting to markdown.
-#[derive(Debug, Clone)]
-pub struct WebFetcher<C: HttpClient = ReqwestClient> {
-    client: C,
+pub struct WebFetcher {
+    client: Box<dyn HttpClient>,
 }
 
-impl Default for WebFetcher<ReqwestClient> {
+impl Default for WebFetcher {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl WebFetcher<ReqwestClient> {
+impl WebFetcher {
     /// Creates a new `WebFetcher` with a preconfigured reqwest client
     pub fn new() -> Self {
-        Self { client: ReqwestClient::new() }
+        Self::with_client(ReqwestClient::new())
     }
-}
 
-impl<C: HttpClient> WebFetcher<C> {
     /// Creates a `WebFetcher` with a custom HTTP client (useful for testing)
-    pub fn with_client(client: C) -> Self {
-        Self { client }
+    pub fn with_client(client: impl HttpClient + 'static) -> Self {
+        Self { client: Box::new(client) }
     }
 
     /// Fetches web content and converts it to markdown
@@ -55,23 +50,13 @@ impl<C: HttpClient> WebFetcher<C> {
         } else {
             ExtractedContent { title: None, markdown: response.body, byline: None }
         };
-        let (content, truncated) = if extracted.markdown.len() > MAX_CONTENT_LENGTH {
-            (truncate_str(&extracted.markdown, MAX_CONTENT_LENGTH), true)
-        } else {
-            (extracted.markdown, false)
-        };
-
-        let display_meta =
-            ToolDisplayMeta::new("Fetch URL", extracted.title.clone().unwrap_or_else(|| truncate(&url, 60)));
 
         Ok(WebFetchOutput {
-            content,
+            content: extracted.markdown,
             final_url: response.final_url,
             status_code: response.status_code,
-            truncated,
             title: extracted.title,
             byline: extracted.byline,
-            meta: Some(display_meta.into()),
         })
     }
 }
@@ -83,30 +68,18 @@ struct ExtractedContent {
 }
 
 fn extract_content(html: &str, url: &str) -> ExtractedContent {
-    if let Some(extracted) = try_readability(html, url) {
-        return extracted;
+    let mut reader = Readability::new(html, Some(url), None).ok();
+    let title = reader.as_ref().and_then(|reader| non_empty(reader.get_article_title().to_string()));
+    let article = reader.as_mut().and_then(|reader| reader.parse().ok()).filter(|article| !article.content.is_empty());
+
+    match article {
+        Some(article) => ExtractedContent {
+            markdown: convert(&article.content).unwrap_or_else(|_| article.text_content.to_string()),
+            title: non_empty(article.title),
+            byline: article.byline,
+        },
+        None => ExtractedContent { title, markdown: convert(html).unwrap_or_else(|_| html.to_string()), byline: None },
     }
-    fallback_extract(html)
-}
-
-fn try_readability(html: &str, url: &str) -> Option<ExtractedContent> {
-    let mut reader = Readability::new(html, Some(url), None).ok()?;
-    let article = reader.parse().ok()?;
-
-    if article.content.is_empty() {
-        return None;
-    }
-
-    let markdown = convert(&article.content).unwrap_or_else(|_| article.text_content.to_string());
-    let title = non_empty(article.title);
-
-    Some(ExtractedContent { title, markdown, byline: article.byline })
-}
-
-fn fallback_extract(html: &str) -> ExtractedContent {
-    let title = extract_title(html);
-    let markdown = convert(html).unwrap_or_else(|_| html.to_string());
-    ExtractedContent { title, markdown, byline: None }
 }
 
 fn normalize_url(url: &str) -> Result<String, WebFetchError> {
@@ -121,44 +94,13 @@ fn normalize_url(url: &str) -> Result<String, WebFetchError> {
     Url::parse(&url).map(|u| u.to_string()).map_err(WebFetchError::InvalidUrl)
 }
 
-fn extract_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let start = lower.find("<title>")?;
-    let end = lower.find("</title>")?;
-    if start >= end {
-        return None;
-    }
-    non_empty(html[start + 7..end].trim().to_string())
-}
-
 fn non_empty(s: String) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
-}
-
-fn truncate_str(content: &str, max_len: usize) -> String {
-    if content.len() <= max_len {
-        return content.to_string();
-    }
-
-    let truncated = &content[..content.floor_char_boundary(max_len)];
-
-    if let Some(last_para) = truncated.rfind("\n\n") {
-        format!("{}\n\n[Content truncated...]", &truncated[..last_para])
-    } else if let Some(last_newline) = truncated.rfind('\n') {
-        format!("{}\n\n[Content truncated...]", &truncated[..last_newline])
-    } else {
-        format!("{truncated}\n\n[Content truncated...]")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::FakeHttpClient;
-
-    fn input(url: &str) -> WebFetchInput {
-        WebFetchInput { url: url.to_string(), prompt: None, timeout: None }
-    }
 
     #[test]
     fn test_normalize_url() {
@@ -174,10 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_title() {
-        assert_eq!(extract_title("<html><head><title>Test Page</title></head></html>"), Some("Test Page".to_string()));
-        assert_eq!(extract_title("<html><head></head><body></body></html>"), None);
-        assert_eq!(extract_title("<html><head><title>  </title></head></html>"), None);
+    fn title_comes_from_the_page_when_it_has_no_article() {
+        let title = |html| extract_content(html, "https://example.com/").title;
+
+        assert_eq!(title("<html><head><title>Test Page</title></head></html>"), Some("Test Page".to_string()));
+        assert_eq!(title("<html><head></head><body></body></html>"), None);
+        assert_eq!(title("<html><head><title>  </title></head></html>"), None);
     }
 
     fn article_html(body: &str) -> String {
@@ -220,69 +164,20 @@ mod tests {
     }
 
     #[test]
+    fn title_survives_text_whose_lowercase_form_has_a_different_byte_length() {
+        let html = "<!-- \u{130} --><html><head><title>Sparse</title></head><body></body></html>";
+
+        let result = extract_content(html, "https://example.com/sparse");
+
+        assert_eq!(result.title, Some("Sparse".to_string()));
+    }
+
+    #[test]
     fn test_fallback_when_no_article_content() {
         let html = "<html><head><title>Sparse</title></head><body><p>Hi</p></body></html>";
         let result = extract_content(html, "https://example.com/sparse");
 
         assert_eq!(result.title, Some("Sparse".to_string()));
         assert!(result.markdown.contains("Hi"));
-    }
-
-    #[test]
-    fn test_truncate_str() {
-        assert_eq!(truncate_str("Short content", 100), "Short content");
-
-        let content = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
-        let result = truncate_str(content, 35);
-        assert!(result.contains("First paragraph."));
-        assert!(result.contains("[Content truncated...]"));
-        assert!(!result.contains("Third paragraph"));
-    }
-
-    #[tokio::test]
-    async fn test_fake_client_returns_configured_response() {
-        let fake = FakeHttpClient::new().with_html(
-            "https://example.com/",
-            "<html><head><title>Example</title></head><body><h1>Hello</h1></body></html>",
-        );
-        let fetcher = WebFetcher::with_client(fake.clone());
-        let result = fetcher.fetch(input("example.com")).await.unwrap();
-
-        assert_eq!(result.status_code, 200);
-        assert_eq!(result.title, Some("Example".to_string()));
-        assert!(result.content.contains("Hello"));
-        assert_eq!(fake.fetch_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_fake_client_tracks_fetch_history() {
-        let fake = FakeHttpClient::new()
-            .with_html("https://example.com/page1", "<h1>Page 1</h1>")
-            .with_html("https://example.com/page2", "<h1>Page 2</h1>");
-        let fetcher = WebFetcher::with_client(fake.clone());
-
-        fetcher.fetch(input("https://example.com/page1")).await.unwrap();
-        fetcher.fetch(input("https://example.com/page2")).await.unwrap();
-
-        assert_eq!(fake.fetch_count(), 2);
-        assert_eq!(fake.fetched_urls(), vec!["https://example.com/page1", "https://example.com/page2"]);
-    }
-
-    #[tokio::test]
-    async fn test_fake_client_missing_url_returns_error() {
-        let fetcher = WebFetcher::with_client(FakeHttpClient::new());
-        assert!(fetcher.fetch(input("https://not-configured.com/")).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_fake_client_with_default_response() {
-        let fake = FakeHttpClient::new().with_default(HttpResponse {
-            final_url: "https://fallback.com/".to_string(),
-            status_code: 404,
-            body: "<h1>Not Found</h1>".to_string(),
-            content_type: Some("text/html".to_string()),
-        });
-        let result = WebFetcher::with_client(fake).fetch(input("https://any-url.com/")).await.unwrap();
-        assert_eq!(result.status_code, 404);
     }
 }

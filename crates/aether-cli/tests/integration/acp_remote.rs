@@ -1,19 +1,17 @@
 mod client;
-mod health;
 mod websocket;
 
 use aether_cli::acp::testing::AcpTestHarness;
-use aether_core::core::agent;
-use aether_core::events::{AgentEvent, MessageEvent, TurnEvent, TurnOutcome};
+use aether_core::events::{AgentEvent, AgentObserver, MessageEvent, TurnEvent, TurnOutcome};
 use aether_sessions::{SessionEvent, UserEvent};
-use agent_client_protocol::schema::v2::{
-    AbsolutePath, CloseSessionRequest, ContentBlock, NewSessionRequest, PromptRequest, ReplayFrom, ReplayFromStart,
-    ResumeSessionRequest, SessionId, SessionUpdate, SetSessionConfigOptionRequest, StateUpdate, StopReason,
+use agent_client_protocol::v2::schema::{
+    AbsolutePath, CloseSessionRequest, ContentBlock, ElicitationMode, ElicitationScope, NewSessionRequest, ReplayFrom,
+    ReplayFromStart, ResumeSessionRequest, SessionId, SessionUpdate, SetSessionConfigOptionRequest, StateUpdate,
+    StopReason,
 };
 use llm::{LlmResponse, testing::FakeLlmProvider};
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::LocalSet;
+use tokio::sync::{Notify, oneshot};
 
 #[tokio::test(flavor = "current_thread")]
 async fn initialize_remote_metadata_always_tracks_live_session() {
@@ -194,58 +192,75 @@ async fn invalid_live_resume_leaves_original_turn_running() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn elicitations_reach_the_client_and_its_answer_reaches_the_server() {
+    AcpTestHarness::run(|mut harness| async move {
+        let mut results = harness.elicit_during_prompt_expansion();
+        harness.peer.queue_elicitation_response(
+            serde_json::from_value(serde_json::json!({"action": "accept", "content": {"approved": true}})).unwrap(),
+        );
+        let session = harness.insert_agent_switching_session().await;
+        let id = session.session_id().clone();
+
+        harness.prompt(&id, "/plan").await.expect("the prompt completes");
+
+        let request = harness.peer.next_elicitation_request().await;
+        assert_eq!(acp_utils::elicitation::source_mcp_server_name(request.meta.as_ref()), Some("planner-mcp"));
+        let ElicitationMode::Form(form) = request.mode else { panic!("expected a form elicitation") };
+        let ElicitationScope::Session(scope) = form.scope else { panic!("expected a session-scoped elicitation") };
+        assert_eq!(scope.session_id, id);
+        let answer = results.recv().await.expect("the server receives the answer");
+        assert_eq!(answer.action, mcp_utils::model::ElicitationAction::Accept);
+        assert_eq!(answer.content, Some(serde_json::json!({"approved": true})));
+        harness.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pending_and_detached_elicitations_cancel_without_stopping_session() {
-    LocalSet::new()
-        .run_until(async {
-            for detach_before_elicitation in [false, true] {
-                let mut harness = AcpTestHarness::start().await;
-                let (started, release) = harness.pause_prompt_expansion();
-                let mut results = harness.elicit_during_prompt_expansion();
-                let session = harness.insert_agent_switching_session().await;
-                let id = session.session_id().clone();
-                let capture = harness.peer.capture_next_elicitation();
-                let prompt =
-                    harness.client_cx.send_request(PromptRequest::new(id.clone(), vec!["/plan".into()])).block_task();
-                started.notified().await;
-                let pending = if detach_before_elicitation {
-                    harness.disconnect().await;
-                    release.notify_one();
-                    None
-                } else {
-                    release.notify_one();
-                    let responder = capture.await.expect("client received elicitation");
-                    harness.disconnect().await;
-                    Some(responder)
-                };
-                assert_eq!(
-                    results.recv().await.expect("MCP receives cancellation"),
-                    mcp_utils::client::cancel_result()
-                );
-                drop(pending);
-                assert!(prompt.await.is_err(), "disconnected prompt response is not retried");
-                harness.reconnect().await;
-                harness.resume_with_replay(&id).await;
-                let mut completed = false;
-                loop {
-                    let update = harness.peer.next_session_notification().await.update;
-                    match update {
-                        SessionUpdate::AgentMessage(_) => completed = true,
-                        SessionUpdate::StateUpdate(StateUpdate::Idle(_)) if completed => break,
-                        _ => {}
-                    }
+    for detach_before_elicitation in [false, true] {
+        AcpTestHarness::run(|mut harness| async move {
+            let expansion = harness.pause_prompt_expansion();
+            let mut results = harness.elicit_during_prompt_expansion();
+            let session = harness.insert_agent_switching_session().await;
+            let id = session.session_id().clone();
+            let capture = harness.peer.capture_next_elicitation();
+            let prompt = harness.prompt(&id, "/plan");
+            expansion.reached().await;
+            let pending = if detach_before_elicitation {
+                harness.disconnect().await;
+                expansion.open();
+                None
+            } else {
+                expansion.open();
+                let responder = capture.await.expect("client received elicitation");
+                harness.disconnect().await;
+                Some(responder)
+            };
+            assert_eq!(
+                results.recv().await.expect("MCP receives cancellation"),
+                mcp_utils::model::ElicitResult::new(mcp_utils::model::ElicitationAction::Cancel)
+            );
+            drop(pending);
+            assert!(prompt.await.is_err(), "disconnected prompt response is not retried");
+            harness.reconnect().await;
+            harness.resume_with_replay(&id).await;
+            let mut completed = false;
+            loop {
+                let update = harness.peer.next_session_notification().await.update;
+                match update {
+                    SessionUpdate::AgentMessage(_) => completed = true,
+                    SessionUpdate::StateUpdate(StateUpdate::Idle(_)) if completed => break,
+                    _ => {}
                 }
-                harness
-                    .client_cx
-                    .send_request(PromptRequest::new(id.clone(), vec!["still usable".into()]))
-                    .block_task()
-                    .await
-                    .expect("session remains usable");
-                harness.expect_idle(&id, StopReason::EndTurn).await;
-                session.planner().assert_saw(&["expanded plan", "planner reply", "still usable"]);
-                harness.shutdown().await;
             }
+            harness.prompt(&id, "still usable").await.expect("session remains usable");
+            harness.expect_idle(&id, StopReason::EndTurn).await;
+            session.planner().assert_saw(&["expanded plan", "planner reply", "still usable"]);
+            harness.shutdown().await;
         })
         .await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -253,12 +268,7 @@ async fn repeated_attachment_replays_history_and_preserves_config_and_mcp() {
     AcpTestHarness::run(|mut harness| async move {
         let session = harness.insert_agent_switching_session().await;
         let id = session.session_id().clone();
-        harness
-            .client_cx
-            .send_request(PromptRequest::new(id.clone(), vec!["first prompt".into()]))
-            .block_task()
-            .await
-            .expect("first prompt accepted");
+        harness.prompt(&id, "first prompt").await.expect("first prompt accepted");
         harness.expect_idle(&id, StopReason::EndTurn).await;
         let configured = harness
             .client_cx
@@ -287,15 +297,10 @@ async fn repeated_attachment_replays_history_and_preserves_config_and_mcp() {
                 }
             }
             assert_eq!((users, agents), if cycle < 3 { (1, 1) } else { (0, 0) });
-            harness.expect_mcp_server_status_exact(&["planner-mcp"]).await;
+            harness.expect_mcp_server_status(&["planner-mcp"]).await;
             harness.expect_available_commands(&["plan"], &["edit"]).await;
         }
-        harness
-            .client_cx
-            .send_request(PromptRequest::new(id.clone(), vec!["next prompt".into()]))
-            .block_task()
-            .await
-            .expect("next prompt accepted");
+        harness.prompt(&id, "next prompt").await.expect("next prompt accepted");
         harness.expect_idle(&id, StopReason::EndTurn).await;
         session.planner().assert_saw_exactly(&["first prompt", "planner reply", "next prompt"]);
         harness.shutdown().await;
@@ -359,30 +364,16 @@ async fn start_observed_paused_turn(harness: &mut AcpTestHarness) -> (SessionId,
         LlmResponse::done(),
     ]])
     .pause_turn_after(0, 1, release.clone());
-    let (tx, mut events, handle) = agent(provider).spawn().await.expect("fake agent spawns");
-    let (forward, rx) = mpsc::channel(1);
     let (completed, completion) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut completed = Some(completed);
-        while let Some(event) = events.recv().await {
-            let done = matches!(event, AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Completed }));
-            if forward.send(event).await.is_err() {
-                break;
-            }
-            if done && let Some(completed) = completed.take() {
-                let _ = completed.send(());
-            }
-        }
-    });
     let id = SessionId::new("remote-lifecycle");
     harness.append_stored_session(id.0.as_ref(), "2026-05-01T00:00:00Z");
-    harness.insert_stub_session(tx, rx, handle, id.clone(), "anthropic:claude-sonnet-4-5").await;
     harness
-        .client_cx
-        .send_request(PromptRequest::new(id.clone(), vec!["original prompt".into()]))
-        .block_task()
-        .await
-        .expect("prompt accepted");
+        .session(id.clone(), provider)
+        .model("anthropic:claude-sonnet-4-5")
+        .observer(TurnCompletion(Some(completed)))
+        .insert()
+        .await;
+    harness.prompt(&id, "original prompt").await.expect("prompt accepted");
 
     let mut running = false;
     loop {
@@ -402,12 +393,6 @@ async fn start_observed_paused_turn(harness: &mut AcpTestHarness) -> (SessionId,
 }
 
 async fn finish_original_turn(harness: &mut AcpTestHarness, id: &SessionId, release: Arc<Notify>) {
-    let second_prompt = harness
-        .client_cx
-        .send_request(PromptRequest::new(id.clone(), vec!["must not start another turn".into()]))
-        .block_task()
-        .await;
-    assert!(second_prompt.is_err(), "resume must preserve the running turn, not accept a new prompt");
     assert_no_ended_turn(harness, id);
     release.notify_one();
 
@@ -480,4 +465,17 @@ fn assert_stopped_turn(harness: &AcpTestHarness, id: &SessionId) {
         )),
         "shutdown must not complete the gated turn"
     );
+}
+
+/// Signals once the agent completes a turn.
+struct TurnCompletion(Option<oneshot::Sender<()>>);
+
+impl AgentObserver for TurnCompletion {
+    fn on_event(&mut self, event: &AgentEvent) {
+        if matches!(event, AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Completed }))
+            && let Some(completed) = self.0.take()
+        {
+            let _ = completed.send(());
+        }
+    }
 }

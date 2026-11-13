@@ -2,8 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::Displayed;
 use crate::file_ops::{ApplyEditsResult, FileEdit, FileError, apply_edits};
-use mcp_utils::display_meta::{FileDiff, ToolDisplayMeta, ToolResultMeta, basename};
+use utils::display_meta::{FileDiff, ToolDisplayMeta, ToolResultMeta, basename};
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -17,39 +18,20 @@ pub struct EditFileArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EditFileResponse {
-    pub status: String,
     /// Path of the file that was edited
     pub file_path: String,
-    /// Total number of lines in the file after editing
-    pub total_lines: usize,
-    /// Number of replacements made
-    pub replacements_made: usize,
-    /// The new file content after editing (used internally for LSP sync)
-    #[serde(skip_serializing)]
-    pub content: String,
-    /// Display metadata for human-friendly rendering
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)]
-    pub meta: Option<ToolResultMeta>,
 }
 
-pub async fn edit_file_contents(args: EditFileArgs) -> Result<EditFileResponse, FileError> {
-    let ApplyEditsResult { path, original_content, updated_content, replacements_made } =
+pub async fn edit_file_contents(args: EditFileArgs) -> Result<Displayed<EditFileResponse>, FileError> {
+    let ApplyEditsResult { path, original_content, updated_content } =
         apply_edits(Path::new(&args.file_path), &args.edits).await?;
     let file_path = path.to_string_lossy().into_owned();
-    let total_lines = updated_content.lines().count();
     let display_meta = ToolDisplayMeta::new("Edit file", basename(&file_path));
     let file_diff =
-        FileDiff { path: file_path.clone(), old_text: Some(original_content), new_text: Some(updated_content.clone()) };
+        FileDiff { path: file_path.clone(), old_text: Some(original_content), new_text: Some(updated_content) };
 
-    Ok(EditFileResponse {
-        status: "success".to_string(),
-        file_path,
-        total_lines,
-        replacements_made,
-        content: updated_content,
-        meta: Some(ToolResultMeta::with_file_diff(display_meta, file_diff)),
-    })
+    let response = EditFileResponse { file_path };
+    Ok(Displayed::new(response, ToolResultMeta::with_file_diff(display_meta, file_diff)))
 }
 
 #[cfg(test)]
@@ -117,14 +99,13 @@ mod tests {
         let workspace = TestWorkspace::new().file("lines.txt", "alpha\nbeta\ngamma\n");
         let file_path = workspace.path("lines.txt");
 
-        let result = edit_file_contents(EditFileArgs {
+        edit_file_contents(EditFileArgs {
             file_path: file_path.to_string_lossy().to_string(),
             edits: vec![FileEdit::new("alpha", "ALPHA"), FileEdit::new("gamma", "GAMMA")],
         })
         .await
         .unwrap();
 
-        assert_eq!(result.replacements_made, 2);
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "ALPHA\nbeta\nGAMMA\n");
     }
 

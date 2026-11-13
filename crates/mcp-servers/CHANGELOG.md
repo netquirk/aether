@@ -2,6 +2,131 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.10](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.9...aether-mcp-servers-v0.8.10) - 2026-11-03
+
+### Added
+
+- add gpt-6.1-terra to codex subscription models ([#642](https://github.com/contextbridge/aether/pull/642))
+- *(desktop)* browse repository files and open where tools worked ([#637](https://github.com/contextbridge/aether/pull/637))
+- ACP native subagents ([#627](https://github.com/contextbridge/aether/pull/627))
+
+### Other
+
+- replace aether-lspd with clankerdiff-lspd ([#633](https://github.com/contextbridge/aether/pull/633))
+
+## [0.8.9](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.8...aether-mcp-servers-v0.8.9) - 2026-10-20
+
+### Fixed
+
+- *(llm)* send adaptive thinking to Claude and replay reasoning in order ([#622](https://github.com/contextbridge/aether/pull/622))
+
+## [0.8.8](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.7...aether-mcp-servers-v0.8.8) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project
+
+## [0.8.7](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.6...aether-mcp-servers-v0.8.7) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-auth, aether-llm, aether-mcp-utils, aether-agent-core, aether-lspd, aether-project
+
+## [0.8.6](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.5...aether-mcp-servers-v0.8.6) - 2026-10-19
+
+### Fixed
+
+- share provider connections and credentials across agents ([#607](https://github.com/contextbridge/aether/pull/607))
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.8.5](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.4...aether-mcp-servers-v0.8.5) - 2026-10-12
+
+### Other
+
+- Simplify MCP code around Client, Server and Gateway concepts  ([#595](https://github.com/contextbridge/aether/pull/595))
+
+## [0.8.4](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.3...aether-mcp-servers-v0.8.4) - 2026-10-10
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.8.3](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.2...aether-mcp-servers-v0.8.3) - 2026-10-08
+
+### Added
+
+- support native TypeScript 7 LSP ([#582](https://github.com/contextbridge/aether/pull/582))
+
+### Fixed
+
+- report agent panics as failed turns ([#586](https://github.com/contextbridge/aether/pull/586))
+
+## [0.8.2](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.1...aether-mcp-servers-v0.8.2) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-agent-core, aether-project
+
+## [0.8.1](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.8.0...aether-mcp-servers-v0.8.1) - 2026-10-04
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.0](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.7.0...aether-mcp-servers-v0.8.0) - 2026-10-03
+
+### Fixed
+
+- *(mcp-servers)* Make url annotation work when source content is loa… ([#556](https://github.com/contextbridge/aether/pull/556))
+
+### Other
+
+- Oversized coding tool output handling ([#560](https://github.com/contextbridge/aether/pull/560))
+- *(mcp-servers)* [**breaking**] Remove a handful of LSP tools that burned a lot of tokens and make remaining LSP tool responses more token efficient.  ([#558](https://github.com/contextbridge/aether/pull/558))
+
+## [0.7.0](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.9...aether-mcp-servers-v0.7.0) - 2026-10-01
+
+### Fixed
+
+- Bash tool highlighting ([#551](https://github.com/contextbridge/aether/pull/551))
+
+### Other
+
+- [**breaking**] remove tools that are no longer needed ([#549](https://github.com/contextbridge/aether/pull/549))
+
+## [0.6.9](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.8...aether-mcp-servers-v0.6.9) - 2026-09-28
+
+### Other
+
+- Fix/aether server logs when detached ([#531](https://github.com/contextbridge/aether/pull/531))
+
+## [0.6.8](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.7...aether-mcp-servers-v0.6.8) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
+### Other
+
+- release ([#519](https://github.com/contextbridge/aether/pull/519))
+
+## [0.6.7](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.6...aether-mcp-servers-v0.6.7) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils, aether-agent-core, aether-project
+
+## [0.6.6](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.5...aether-mcp-servers-v0.6.6) - 2026-09-23
+
+### Other
+
+- *(deps)* bump tower-http from 0.6.11 to 0.7.1 ([#509](https://github.com/contextbridge/aether/pull/509))
+- scheduled code-cleanup ([#506](https://github.com/contextbridge/aether/pull/506))
+
 ## [0.6.5](https://github.com/contextbridge/aether/compare/aether-mcp-servers-v0.6.4...aether-mcp-servers-v0.6.5) - 2026-09-21
 
 ### Fixed

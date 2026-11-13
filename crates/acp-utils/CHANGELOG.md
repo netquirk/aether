@@ -2,6 +2,103 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.19](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.18...aether-acp-utils-v0.5.19) - 2026-11-03
+
+### Added
+
+- *(desktop)* browse repository files and open where tools worked ([#637](https://github.com/contextbridge/aether/pull/637))
+- ACP native subagents ([#627](https://github.com/contextbridge/aether/pull/627))
+
+### Other
+
+- extract aether-client-core from wisp ([#634](https://github.com/contextbridge/aether/pull/634))
+
+## [0.5.18](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.17...aether-acp-utils-v0.5.18) - 2026-10-20
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.17](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.16...aether-acp-utils-v0.5.17) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.5.16](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.15...aether-acp-utils-v0.5.16) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm
+
+## [0.5.15](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.14...aether-acp-utils-v0.5.15) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- *(deps)* bump agent-client-protocol from 2.2.0 to 3.1.0 ([#604](https://github.com/contextbridge/aether/pull/604))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.5.14](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.13...aether-acp-utils-v0.5.14) - 2026-10-12
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.5.13](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.12...aether-acp-utils-v0.5.13) - 2026-10-10
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.5.12](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.11...aether-acp-utils-v0.5.12) - 2026-10-08
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.11](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.10...aether-acp-utils-v0.5.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.5.10](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.9...aether-acp-utils-v0.5.10) - 2026-10-03
+
+### Fixed
+
+- ACP actor gets proper state when background tasks return  ([#559](https://github.com/contextbridge/aether/pull/559))
+
+## [0.5.9](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.8...aether-acp-utils-v0.5.9) - 2026-10-01
+
+### Fixed
+
+- Bash tool highlighting ([#551](https://github.com/contextbridge/aether/pull/551))
+
+## [0.5.8](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.7...aether-acp-utils-v0.5.8) - 2026-09-28
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.5.7](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.6...aether-acp-utils-v0.5.7) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
+## [0.5.6](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.5...aether-acp-utils-v0.5.6) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils
+
+## [0.5.5](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.4...aether-acp-utils-v0.5.5) - 2026-09-23
+
+### Other
+
+- updated the following local packages: aether-llm, aether-mcp-utils
+
 ## [0.5.4](https://github.com/contextbridge/aether/compare/aether-acp-utils-v0.5.3...aether-acp-utils-v0.5.4) - 2026-09-21
 
 ### Other

@@ -1,31 +1,14 @@
-use crate::common::{CodingWorkspace, call_tool, call_tool_error, connect_lsp};
-use aether_lspd::testing::{CargoProject, TestProject};
-
-#[tokio::test]
-async fn lsp_check_errors_accepts_flat_file_path_and_infers_file_scope() {
-    let project = CargoProject::new("diag_contract_infers_file_scope").expect("Failed to create project");
-    project.add_file("src/main.rs", "fn main() {}\n").expect("Failed to add file");
-
-    let (_server_handle, client) = connect_lsp(&project).await;
-    let result = call_tool(
-        &client,
-        "lsp_check_errors",
-        serde_json::json!({
-            "filePath": project.file_path_str("src/main.rs")
-        }),
-    )
-    .await;
-
-    assert_eq!(result["scope"], "file");
-}
+use crate::common::{CodingWorkspace, call_tool_error};
+use clankerdiff_lspd::LanguageId;
+use clankerdiff_lspd::testing::TestDaemon;
+use mcp_servers::testing::TestWorkspace;
+use serde_json::json;
+use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
 async fn lsp_check_errors_schema_is_flat_and_has_only_file_path() {
-    let project = CargoProject::new("diag_contract_flat_schema").expect("Failed to create project");
-    project.add_file("src/main.rs", "fn main() {}\n").expect("Failed to add file");
-
-    let (_server_handle, client) = connect_lsp(&project).await;
-    let tools = client.peer().list_all_tools().await.expect("list tools");
+    let workspace = CodingWorkspace::with_lsp(TestWorkspace::new()).await;
+    let tools = workspace.client.list_tools().await.expect("list tools");
     let tool =
         tools.into_iter().find(|tool| tool.name.as_ref() == "lsp_check_errors").expect("lsp_check_errors tool present");
 
@@ -34,80 +17,71 @@ async fn lsp_check_errors_schema_is_flat_and_has_only_file_path() {
     let properties = schema.get("properties").and_then(|v| v.as_object()).expect("schema properties");
     assert_eq!(properties.len(), 1);
     assert!(properties.contains_key("filePath"));
-    assert!(!properties.contains_key("scope"));
-    assert!(!properties.contains_key("input"));
 }
 
 #[tokio::test]
-async fn lsp_check_errors_rejects_redundant_scope_parameter() {
-    let project = CargoProject::new("diag_contract_redundant_scope").expect("Failed to create project");
-    project.add_file("src/main.rs", "fn main() {}\n").expect("Failed to add file");
+async fn lsp_check_errors_rejects_scope_parameters() {
+    let workspace = CodingWorkspace::with_lsp(TestWorkspace::new().file("src/main.rs", "fn main() {}\n")).await;
+    let main_rs = workspace.path("src/main.rs");
 
-    let (_server_handle, client) = connect_lsp(&project).await;
-    let error = call_tool_error(&client, "lsp_check_errors", serde_json::json!({ "scope": "workspace" })).await;
+    for args in [json!({ "scope": "workspace" }), json!({ "scope": "file", "filePath": main_rs })] {
+        let error = call_tool_error(&workspace.client, "lsp_check_errors", args).await;
+        assert!(error.contains("unknown field `scope`"), "{error}");
+    }
+}
 
-    assert!(error.contains("unknown field `scope`"), "{error}");
+#[tokio::test]
+async fn lsp_check_errors_rejects_file_scope_directory_path() {
+    let workspace = CodingWorkspace::with_lsp(TestWorkspace::new()).await;
+    let error = call_tool_error(&workspace.client, "lsp_check_errors", json!({ "filePath": workspace.root() })).await;
+
+    assert!(error.contains("filePath must point to an existing file"), "{error}");
 }
 
 #[tokio::test]
 async fn lsp_check_errors_fails_when_workspace_has_no_active_language_server() {
-    let workspace = CodingWorkspace::new_with_lsp().await.expect("create workspace");
-    let error = call_tool_error(workspace.client.raw(), "lsp_check_errors", serde_json::json!({})).await;
+    let workspace = CodingWorkspace::with_lsp(TestWorkspace::new()).await;
+    let error = call_tool_error(&workspace.client, "lsp_check_errors", json!({})).await;
 
     assert!(error.contains("No active LSP clients"), "{error}");
 }
 
 #[tokio::test]
 async fn lsp_check_errors_returns_typescript_installation_instructions_when_server_fails() {
-    let workspace = CodingWorkspace::new_with_lsp().await.expect("create workspace");
-    workspace.write("package.json", "{}\n").expect("write package.json");
-    let index_ts = workspace.write("index.ts", "const value: string = 1;\n").expect("write TypeScript file");
-    workspace
-        .write("node_modules/.bin/typescript-language-server", "not executable\n")
-        .expect("write unavailable language server");
+    let workspace = typescript_workspace("not executable\n", 0o644).await;
 
-    let error =
-        call_tool_error(workspace.client.raw(), "lsp_check_errors", serde_json::json!({ "filePath": index_ts })).await;
+    let error = check_index_ts(&workspace).await;
 
     assert!(error.contains("Permission denied"), "{error}");
-    assert!(error.contains("TypeScript language server"), "{error}");
-    assert!(error.contains("npm install --save-dev typescript typescript-language-server"), "{error}");
-    assert!(error.contains("npm install --global typescript typescript-language-server"), "{error}");
+    assert!(error.contains("TypeScript 7 language server"), "{error}");
+    assert!(error.contains("npm install --save-dev typescript@^7"), "{error}");
+    assert!(error.contains("npm install --global typescript@^7"), "{error}");
 }
 
 #[tokio::test]
-async fn lsp_check_errors_rejects_file_scope_parameter() {
-    let project = CargoProject::new("diag_contract_rejects_scope").expect("Failed to create project");
-    project.add_file("src/main.rs", "fn main() {}\n").expect("Failed to add file");
+async fn lsp_check_errors_returns_typescript_installation_instructions_when_tsc_predates_lsp() {
+    let tsc = "#!/bin/sh\necho \"error TS5023: Unknown compiler option '--lsp'.\"\nexit 1\n";
+    let workspace = typescript_workspace(tsc, 0o755).await;
 
-    let (_server_handle, client) = connect_lsp(&project).await;
-    let error = call_tool_error(
-        &client,
-        "lsp_check_errors",
-        serde_json::json!({
-            "scope": "file",
-            "filePath": project.file_path_str("src/main.rs")
-        }),
-    )
-    .await;
+    let error = check_index_ts(&workspace).await;
 
-    assert!(error.contains("unknown field `scope`"), "{error}");
+    assert!(error.contains("failed to complete initialization"), "{error}");
+    assert!(error.contains("TypeScript 7 language server"), "{error}");
+    assert!(error.contains("npm install --save-dev typescript@^7"), "{error}");
 }
 
-#[tokio::test]
-async fn lsp_check_errors_rejects_file_scope_directory_path() {
-    let project = CargoProject::new("diag_contract_file_rejects_directory").expect("Failed to create project");
-    project.add_file("src/main.rs", "fn main() {}\n").expect("Failed to add file");
+/// A TypeScript workspace whose local `tsc` is `script` with permissions `mode`.
+async fn typescript_workspace(script: &str, mode: u32) -> CodingWorkspace {
+    let workspace = TestWorkspace::new()
+        .file("package.json", "{}\n")
+        .file("index.ts", "const value: string = 1;\n")
+        .file("node_modules/.bin/tsc", script);
+    let tsc = workspace.path("node_modules/.bin/tsc");
+    std::fs::set_permissions(tsc, std::fs::Permissions::from_mode(mode)).expect("set tsc permissions");
+    let daemon = TestDaemon::builder(workspace.root(), LanguageId::TypeScript);
+    CodingWorkspace::with_daemon(workspace, daemon).await
+}
 
-    let (_server_handle, client) = connect_lsp(&project).await;
-    let error = call_tool_error(
-        &client,
-        "lsp_check_errors",
-        serde_json::json!({
-            "filePath": project.root().to_string_lossy().to_string()
-        }),
-    )
-    .await;
-
-    assert!(error.contains("filePath must point to an existing file"), "{error}");
+async fn check_index_ts(workspace: &CodingWorkspace) -> String {
+    call_tool_error(&workspace.client, "lsp_check_errors", json!({ "filePath": workspace.path("index.ts") })).await
 }

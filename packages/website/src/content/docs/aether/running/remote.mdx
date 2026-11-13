@@ -64,6 +64,22 @@ aether client wss://agent.example/acp -H 'Authorization: Bearer ...'
 
 The client loads local Wisp UI settings, not local Aether project or provider settings. Provider/MCP credentials, workspace files, and session logs stay on the server. Browser-based OAuth flows needing server-local callbacks require suitable deployment connectivity; Aether does not tunnel those callbacks.
 
+## Start with an initial prompt
+
+`aether server` can start work before any client attaches. Pass `--prompt` (or pipe the prompt in via stdin when stdin is not a TTY) and the server immediately creates a session and runs it:
+
+```bash
+aether server --cwd /workspace/project --agent Build \
+  --prompt "Fix the failing tests, then summarize what you changed"
+```
+
+The turn keeps running server-side while you are detached, and attaching with `aether client` resumes that session. Agent events always stream to stdout, whether or not a client is attached, in the format selected by `--output` (`text` by default, `pretty`, or `json`). `--idle-after <seconds>` and `--on-idle <command>` (required together) spawn a shell command once the agent has been idle with no client attached for the given number of seconds:
+
+```bash
+aether server --prompt "Refactor the auth module" \
+  --idle-after 120 --on-idle "notify-send 'Aether is idle'"
+```
+
 ## Detach, cancel, and restore
 
 - **Exit the client:** disconnect only. The same live actor, agent runtime, MCP runtime, and session ID remain on the server.
@@ -74,13 +90,17 @@ The client loads local Wisp UI settings, not local Aether project or provider se
 
 An unexpected connection loss restores the terminal and exits with an error. There is **no automatic reconnect or prompt retry**. If a prompt's acceptance response was lost, reconnect and inspect the transcript before resubmitting: a retry could execute tools twice.
 
-Partial streamed chunks, intermediate tool states, and pending dialogs are not guaranteed to be recovered. Pending survey/plan-approval/other elicitation requests are cancelled on disconnect; requests first raised while detached are cancelled immediately. They are not queued for reattachment. Cancelling an interaction does not itself cancel the session—the agent/tool decides how to handle that result.
+Partial streamed chunks, intermediate tool states, and pending dialogs are not guaranteed to be recovered. Pending elicitation requests (such as artifact review or permission dialogs) are cancelled on disconnect; requests first raised while detached are cancelled immediately. They are not queued for reattachment. Cancelling an interaction does not itself cancel the session—the agent/tool decides how to handle that result.
 
 ## Remote workspace boundaries
 
 The status line labels the server path as `remote:`. Server paths are never resolved against your local checkout or HOME. Local Git review/watch, file picking/indexing, and path-based attachments are unavailable in remote mode. Pasted paths remain ordinary text rather than being read as local files; blocked attachment actions leave the composer usable.
 
-Chat, streamed tool output and diffs delivered through ACP, prompt search, configuration, server status, forms, plan review, `/clear`, and `/resume` remain available. Workspace operations stay server-side. Themes, Wisp settings, rendering, terminal bell, clipboard, and browser integration remain client-local features.
+Chat, streamed tool output and diffs delivered through ACP, prompt search, configuration, server status, forms, artifact review, `/clear`, and `/resume` remain available. Workspace operations stay server-side. Themes, Wisp settings, rendering, terminal bell, clipboard, and browser integration remain client-local features.
+
+## Browser client
+
+`@aether-agent/browser` is an ACP client for web pages, compiled to WebAssembly from the same client code `aether client` uses. It is not published to npm yet; build it from the repository with `pnpm browser:build` (requires `wasm-pack`). Its [README](https://github.com/contextbridge/aether/tree/main/packages/aether-browser#readme) has a quickstart.
 
 ## Deployment and limitations
 

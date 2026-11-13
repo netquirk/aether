@@ -30,10 +30,6 @@ pub enum SettingsError {
     #[error("Agent '{agent}' has invalid contextWindow {context_window}; expected a positive integer")]
     InvalidContextWindow { agent: String, context_window: u32 },
 
-    /// An agent entry has an invalid max-turns cap.
-    #[error("Agent '{agent}' has invalid maxTurns {max_turns}; expected a positive integer")]
-    InvalidMaxTurns { agent: String, max_turns: u32 },
-
     /// An agent entry has an empty name.
     #[error("Agent at index {index} has an empty name")]
     EmptyAgentName { index: usize },
@@ -78,6 +74,13 @@ pub enum SettingsError {
     #[error("MCP config path '{path}' references undefined variable '{variable}'")]
     UnresolvedMcpConfigVariable { path: String, variable: String },
 
+    #[error("Failed to read MCP config '{path}': {source}")]
+    McpConfig {
+        path: String,
+        #[source]
+        source: aether_core::mcp::ParseError,
+    },
+
     /// I/O error while reading files.
     #[error("I/O error: {0}")]
     IoError(String),
@@ -101,8 +104,4 @@ pub enum SettingsError {
     /// The configured agent selector matched an agent that users cannot invoke.
     #[error("Configured agent selector '{name}' is not user-invocable")]
     NonUserInvocableAgentSelector { name: String },
-
-    /// Duplicate prompt names in the catalog.
-    #[error("Duplicate prompt name: '{name}'")]
-    DuplicatePromptName { name: String },
 }

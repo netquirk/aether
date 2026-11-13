@@ -1,4 +1,4 @@
-The primary MCP tool server for coding workflows. Provides file I/O, shell execution, regex search, structural AST search, glob-based file discovery, LSP code intelligence, and web fetch/search -- all exposed as MCP tools that an agent can invoke.
+The primary MCP tool server for coding workflows. Provides file I/O, shell execution, LSP code intelligence, and web fetch/search -- all exposed as MCP tools that an agent can invoke.
 
 # Construction
 
@@ -7,21 +7,14 @@ Use the builder-style methods to configure the server:
 ```rust,ignore
 use mcp_servers::CodingMcp;
 
-// Default: local filesystem tools, no LSP
-let server = CodingMcp::new();
+// Default: local filesystem tools rooted at the project, no LSP
+let server = CodingMcp::new("/my/project");
 
-// With LSP code intelligence and explicit read-rule directories
-let server = CodingMcp::new()
-    .with_rules_dirs(vec!["/my/project/.aether/skills".into(), "/my/project/.claude/rules".into()])
-    .with_lsp("/my/project".into())
-    .with_root_dir("/my/project".into())
+// With LSP code intelligence for that root and explicit read-rule directories
+let server = CodingMcp::new("/my/project")
+    .with_rules_dirs(&["/my/project/.aether/skills".into(), "/my/project/.claude/rules".into()])
+    .with_lsp()
     .with_permission_mode(mcp_servers::PermissionMode::Auto);
-```
-
-For custom tool backends, use [`CodingMcp::with_tools`]:
-
-```rust,ignore
-let server = CodingMcp::with_tools(my_custom_tools);
 ```
 
 # Tools provided
@@ -30,21 +23,16 @@ let server = CodingMcp::with_tools(my_custom_tools);
 - `read_file` -- Read file contents with optional offset/limit
 - `write_file` -- Write content to a file (creates parent dirs)
 - `edit_file` -- String replacement in an existing file
-- `list_files` -- List directory contents with metadata
 
-**Shell & search:**
+**Shell:**
 - `bash` -- Execute shell commands (with background process support) 
-- `grep` -- Regex search across files with glob filters
-- `find` -- Find files by glob pattern. Bare patterns like `README*`, `justfile`, and `*.rs` match basenames recursively; slash-containing patterns like `crates/**/*.rs` match paths relative to the search path. Limited searches stop early and set `truncated` when more matches exist.
 
 **Web:**
 - `web_fetch` -- Fetch a URL and extract text content
 - `web_search` -- Web search via Brave Search API
 
 **LSP** (requires [`with_lsp`](CodingMcp::with_lsp)):
-- `lsp_symbol` -- Go to definition, find references, find implementations
-- `lsp_workspace_search` -- Search one explicitly selected language for workspace symbols
-- `lsp_document` -- List symbols in a file
+- `lsp_symbol` -- Go to definition, find references, hover for types and docs
 - `lsp_check_errors` -- Get diagnostics for a file or workspace
 - `lsp_rename` -- Rename a symbol across the project
 
@@ -52,14 +40,12 @@ let server = CodingMcp::with_tools(my_custom_tools);
 
 The server enforces several safety checks:
 
-- **Read-before-edit** -- `write_file` and `edit_file` require the file to have been read first in the same session, preventing blind overwrites.
+- **Read-before-edit** -- `write_file` and `edit_file` require the file to have been read (or written by `write_file`) first in the same session, preventing blind overwrites.
 - **Dangerous command detection** -- Bash commands containing destructive patterns (`rm`, `git push --force`, redirect operators, etc.) are flagged.
 - **Permission modes** -- [`PermissionMode`] controls whether flagged operations require user approval via MCP elicitation.
 
 # See also
 
-- [`CodingTools`] -- Trait abstracting the tool backend (implement for custom environments)
-- [`DefaultCodingTools`] -- The default local-filesystem implementation
 - [`PermissionMode`] -- User approval settings
 - [`LspRegistry`](crate::lsp::LspRegistry) -- LSP daemon connection manager
 - [`CodingError`](crate::coding::error::CodingError) -- Error types for tool operations

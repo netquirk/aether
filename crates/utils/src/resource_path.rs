@@ -3,19 +3,11 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(serde::Deserialize)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum PathOrObject<O> {
     Path(ResourcePath),
     Object(O),
-}
-
-pub fn string_or_object_schema(description: &str, object_schema: &serde_json::Value) -> Schema {
-    Schema::try_from(serde_json::json!({
-        "description": description,
-        "oneOf": [{ "type": "string" }, object_schema],
-    }))
-    .expect("string_or_object schema must be valid")
 }
 
 /// A path declared in user-facing settings.
@@ -36,24 +28,14 @@ impl ResourcePath {
 
     /// Expand this path to an absolute [`PathBuf`].
     pub fn resolve(&self, workspace_root: &Path) -> Result<PathBuf, VarError> {
-        let s = self.0.as_str();
         let vars = Vars::new().with("WORKSPACE", workspace_root.to_string_lossy().into_owned());
-        if vars.has_reference(s) {
-            let expanded = vars.expand(s)?;
-            let path = PathBuf::from(&expanded);
-            Ok(if path.is_absolute() { path } else { workspace_root.join(path) })
-        } else if Path::new(s).is_absolute() {
-            Ok(PathBuf::from(s))
-        } else {
-            Ok(workspace_root.join(s))
-        }
+        Ok(workspace_root.join(vars.expand(&self.0)?))
     }
 
     /// Convert a bare relative path to an absolute one in place.
     pub fn promote_relative(&mut self, source_root: &Path) {
-        let s = self.0.as_str();
-        if !Vars::new().has_reference(s) && !Path::new(s).is_absolute() {
-            self.0 = source_root.join(s).to_string_lossy().into_owned();
+        if !Vars::has_reference(&self.0) && !Path::new(&self.0).is_absolute() {
+            self.0 = source_root.join(&self.0).to_string_lossy().into_owned();
         }
     }
 }
@@ -101,24 +83,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_expands_aether_workspace_token() {
+    fn resolve_expands_variables_against_the_workspace_root() {
         let root = PathBuf::from("/workspace");
-        let path: ResourcePath = "${WORKSPACE}/AGENTS.md".into();
-        assert_eq!(path.resolve(&root).unwrap(), PathBuf::from("/workspace/AGENTS.md"));
-    }
-
-    #[test]
-    fn resolve_joins_relative_with_workspace() {
-        let root = PathBuf::from("/workspace");
-        let path: ResourcePath = "AGENTS.md".into();
-        assert_eq!(path.resolve(&root).unwrap(), PathBuf::from("/workspace/AGENTS.md"));
-    }
-
-    #[test]
-    fn resolve_keeps_absolute_path() {
-        let root = PathBuf::from("/workspace");
-        let path: ResourcePath = "/abs/AGENTS.md".into();
-        assert_eq!(path.resolve(&root).unwrap(), PathBuf::from("/abs/AGENTS.md"));
+        for (input, expected) in [
+            ("${WORKSPACE}/AGENTS.md", "/workspace/AGENTS.md"),
+            ("$WORKSPACE/a", "/workspace/a"),
+            ("AGENTS.md", "/workspace/AGENTS.md"),
+            ("/abs/AGENTS.md", "/abs/AGENTS.md"),
+            ("$$x/y", "/workspace/$x/y"),
+        ] {
+            assert_eq!(ResourcePath::from(input).resolve(&root).unwrap(), PathBuf::from(expected), "{input}");
+        }
     }
 
     #[test]
@@ -134,6 +109,14 @@ mod tests {
         let mut path: ResourcePath = "agents/foo.md".into();
         path.promote_relative(&source_root);
         assert_eq!(path, ResourcePath::from("/user/.aether/agents/foo.md"));
+    }
+
+    #[test]
+    fn promote_relative_treats_escaped_dollar_paths_as_relative() {
+        let source_root = PathBuf::from("/user/.aether");
+        let mut path: ResourcePath = "$$x/y".into();
+        path.promote_relative(&source_root);
+        assert_eq!(path.resolve(Path::new("/workspace")).unwrap(), PathBuf::from("/user/.aether/$x/y"));
     }
 
     #[test]

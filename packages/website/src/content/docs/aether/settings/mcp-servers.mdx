@@ -125,32 +125,7 @@ If a server entry has a `command` and no `type`, it is treated as `"type": "stdi
     | `url` | `string` | Streamable HTTP endpoint URL. |
     | `headers` | `object` | Optional headers. Aether currently forwards the `Authorization` header to the transport. |
     | `oauth` | `object` | Optional custom CIMD or pre-registered public OAuth client settings. See [OAuth clients](#oauth-clients). |
-    | `deferTools` | `boolean \| object` | `true` proxies every tool; an object partitions tools with `include` and `exclude` patterns. |
-
-  </TabItem>
-  <TabItem label="SSE">
-    Remote MCP servers over HTTP with Server-Sent Events. Internally, Aether uses the same HTTP transport path.
-
-    ```json title=".aether/mcp.json"
-    {
-      "servers": {
-        "remote-tools": {
-          "type": "sse",
-          "url": "https://mcp.example.com/sse",
-          "headers": {
-            "Authorization": "Bearer $MCP_TOKEN"
-          }
-        }
-      }
-    }
-    ```
-
-    | Field | Type | Description |
-    |-------|------|-------------|
-    | `type` | `"sse"` | Required. |
-    | `url` | `string` | SSE endpoint URL. |
-    | `headers` | `object` | Optional headers. Aether currently forwards the `Authorization` header to the transport. |
-    | `oauth` | `object` | Optional custom CIMD or pre-registered public OAuth client settings. See [OAuth clients](#oauth-clients). |
+    | `sigv4` | `object` | Optional AWS SigV4 request signing. Cannot be combined with `oauth`. See [AWS SigV4](#aws-sigv4). |
     | `deferTools` | `boolean \| object` | `true` proxies every tool; an object partitions tools with `include` and `exclude` patterns. |
 
   </TabItem>
@@ -158,7 +133,7 @@ If a server entry has a `command` and no `type`, it is treated as `"type": "stdi
 
 ## OAuth clients
 
-For `http` and `sse` servers that return an OAuth challenge, Aether defaults to its first-party Client ID Metadata Document (CIMD) at `https://aether-agent.io/oauth/client-metadata.json`. The callback listener binds `http://localhost:3118/`. If port 3118 is occupied, authentication fails rather than selecting an unregistered redirect URI.
+For `http` servers that return an OAuth challenge, Aether defaults to its first-party Client ID Metadata Document (CIMD) at `https://aether-agent.io/oauth/client-metadata.json`. The callback listener binds `http://localhost:3118/`. If port 3118 is occupied, authentication fails rather than selecting an unregistered redirect URI.
 
 Set `oauth.clientMetadataUrl` to use a custom CIMD, or `oauth.clientId` for a public client pre-registered with the provider. A pre-registered client ID takes priority when both are configured:
 
@@ -183,17 +158,45 @@ Set `oauth.clientMetadataUrl` to use a custom CIMD, or `oauth.clientId` for a pu
 | `oauth.clientMetadataUrl` | `string` | HTTPS URL of a custom Client ID Metadata Document. Supports variable expansion. |
 | `oauth.callbackPort` | `number` | Loopback callback port; defaults to `3118`. The advertised URI is `http://localhost:<callbackPort>/` and must exactly match the client metadata or registration. |
 
-When the authorization server does not advertise CIMD support, Aether falls back to deprecated Dynamic Client Registration for compatibility. OAuth discovery, PKCE, scopes, `offline_access`, resource indicators, refresh, and issuer validation are handled by `rmcp`. An explicit bearer `Authorization` header remains authoritative and bypasses OAuth.
+When the authorization server does not advertise CIMD support, Aether falls back to deprecated Dynamic Client Registration for compatibility. OAuth discovery, PKCE, scopes, `offline_access`, resource indicators, refresh, and issuer validation are handled by `rmcp`. An `Authorization` header on its own turns off the default OAuth sign-in. A server can set at most one of `oauth`, `sigv4` or an `Authorization` header.
+
+## AWS SigV4
+
+Set `sigv4` to sign every request with AWS Signature Version 4, for example to reach an MCP gateway behind API Gateway IAM auth or a Lambda function URL. A gateway like this can proxy many upstream servers while holding their tokens itself, so the agent only needs AWS credentials:
+
+```json title=".aether/mcp.json"
+{
+  "servers": {
+    "gateway": {
+      "type": "http",
+      "url": "https://abc123.execute-api.us-east-1.amazonaws.com/mcp",
+      "sigv4": {
+        "service": "execute-api",
+        "region": "us-east-1",
+        "profile": "dev"
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sigv4.service` | `string` | Required. Signing name of the AWS service in front of the server, e.g. `execute-api` (API Gateway) or `lambda` (function URLs). |
+| `sigv4.region` | `string` | Required. Region to sign for. `$AWS_REGION` takes it from the environment, but the config fails to load when that variable is unset. |
+| `sigv4.profile` | `string` | Optional named profile. Omit to use the default AWS credential chain (environment, shared config, SSO, web identity, ECS, IMDS), which already honors `AWS_PROFILE`. |
+
+All fields support variable expansion. A server can set at most one of `oauth`, `sigv4` or an `Authorization` header; `sigv4` sends its signature in the `Authorization` header.
 
 ## Built-in servers
 
 | Server      | Purpose                                                                  | Args                                                                                                                  |
 | ----------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `coding`    | File I/O, bash, grep/find, web fetch/search, and LSP-backed coding tools | `--root-dir <path>`, repeat `--rules-dir <path>`, `--permission-mode always-allow\|auto\|always-ask`, `--disable-lsp` |
+| `coding`    | File I/O, bash, web fetch/search, and LSP-backed coding tools | `--root-dir <path>`, repeat `--rules-dir <path>`, `--permission-mode always-allow\|auto\|always-ask`, `--disable-lsp` |
 | `skills`    | Skill discovery, slash-command prompts, and rules                        | Required: repeat `--dir <path>`                                                                                         |
 | `tasks`     | Hierarchical task management                                             | Optional `--dir <base>` for persistent storage                                                                        |
 | `subagents` | Spawn child agents from loaded settings                                  | `--project-root <path>` (alias: `--dir`; defaults to the workspace root)                                              |
-| `review`    | Markdown artifact review through elicitation                             | Optional `--root-dir <path>`                                                                                         |
+| `review`    | Markdown and HTML artifact review through elicitation                    | Optional `--root-dir <path>`                                                                                          |
 
 <CardGrid>
   <LinkCard
@@ -218,7 +221,7 @@ When the authorization server does not advertise CIMD support, Aether falls back
   />
   <LinkCard
     title="Review"
-    description="Markdown artifact review and contextual feedback"
+    description="Markdown & HTML artifact review and contextual feedback"
     href="/aether/built-in-servers/review/"
   />
 </CardGrid>
@@ -304,7 +307,7 @@ Multiple MCP sources are loaded in order after settings resolution. Server names
 Tools can be deferred in two ways:
 
 1. Set `"deferTools": true` on a server entry to defer every tool, or use a `deferTools` object with `include` and `exclude` rules.
-2. Reference a file source with `{ "type": "file", "path": "...", "deferTools": true }`, which defers every tool loaded from that file.
+2. Reference a file source with `{ "type": "file", "path": "...", "deferTools": true }`, which defers every tool loaded from that file. Servers in that file that already declare their own `deferTools` rules keep those rules.
 
 `deferTools` and `optional` can be combined: `{ "type": "file", "path": "${WORKSPACE}/.aether/external-mcp.json", "deferTools": true, "optional": true }`.
 
@@ -350,7 +353,7 @@ Only the private session socket and Aether executable directory are injected int
 
 ## Variable expansion
 
-Variables are expanded in two places: MCP source paths in settings, and server fields inside MCP JSON files. Environment variables are expanded in stdio `command`, stdio `args`, stdio `env` values, in-memory `args`, HTTP/SSE `url`, and the HTTP/SSE `Authorization` header value. `${WORKSPACE}` and `${AETHER_HOME}` (the user-level Aether home, honoring the `AETHER_HOME` env var) are also available when server configs are converted into running MCP servers.
+Variables are expanded in two places: MCP source paths in settings, and server fields inside MCP JSON files. Environment variables are expanded in stdio `command`, stdio `args`, stdio `env` values, in-memory `args`, HTTP `url`, and HTTP header values. `${WORKSPACE}` and `${AETHER_HOME}` (the user-level Aether home, honoring the `AETHER_HOME` env var) are also available when server configs are converted into running MCP servers.
 
 Supported syntax:
 
@@ -392,7 +395,7 @@ Tool names use `server__tool` with a double underscore. Patterns support exact n
 | `coding__read_file` | Only the `read_file` tool            |
 | `coding__web_*`     | `web_fetch` and `web_search`         |
 | `tasks__*`          | All task management tools            |
-| `review__review_artifact` | Only the Markdown review tool    |
+| `review__review_artifact` | Only the artifact review tool       |
 | `coding__bash`      | Only the coding server's `bash` tool |
 
 Wildcards are only valid at the end of a pattern.

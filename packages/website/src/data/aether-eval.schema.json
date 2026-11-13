@@ -1,0 +1,2013 @@
+{
+  "AgentEvent": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "AgentEvent",
+    "description": "A canonical event on the agent's output stream.",
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "message"
+          },
+          "event": {
+            "$ref": "#/$defs/MessageEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "tool"
+          },
+          "event": {
+            "$ref": "#/$defs/ToolEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "turn"
+          },
+          "event": {
+            "$ref": "#/$defs/TurnEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "context"
+          },
+          "event": {
+            "$ref": "#/$defs/ContextEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "model"
+          },
+          "event": {
+            "$ref": "#/$defs/ModelEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "const": "session_usage"
+          },
+          "event": {
+            "$ref": "#/$defs/SessionUsageEvent"
+          }
+        },
+        "required": [
+          "category",
+          "event"
+        ]
+      }
+    ],
+    "$defs": {
+      "MessageEvent": {
+        "description": "Streaming message content from the agent.\n\nChunks stream with `is_complete: false`; a final event with `is_complete: true`\ncarries the full accumulated text. The completion event is emitted when the\nturn wraps up, which may be after the originating LLM call's\n[`TurnEvent::LlmCallEnded`](crate::events::TurnEvent::LlmCallEnded).",
+        "oneOf": [
+          {
+            "description": "Assistant response text.",
+            "type": "object",
+            "properties": {
+              "message_id": {
+                "$ref": "#/$defs/MessageId"
+              },
+              "chunk": {
+                "type": "string"
+              },
+              "is_complete": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "const": "text"
+              }
+            },
+            "required": [
+              "type",
+              "message_id",
+              "chunk",
+              "is_complete"
+            ]
+          },
+          {
+            "description": "Assistant reasoning summary text.",
+            "type": "object",
+            "properties": {
+              "message_id": {
+                "$ref": "#/$defs/MessageId"
+              },
+              "chunk": {
+                "type": "string"
+              },
+              "is_complete": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "const": "thought"
+              }
+            },
+            "required": [
+              "type",
+              "message_id",
+              "chunk",
+              "is_complete"
+            ]
+          }
+        ]
+      },
+      "MessageId": {
+        "description": "Provider-independent message id",
+        "type": "string"
+      },
+      "ToolEvent": {
+        "description": "Tool call lifecycle events.",
+        "oneOf": [
+          {
+            "description": "The LLM requested a tool call; arguments may still be streaming.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "type": {
+                "type": "string",
+                "const": "call"
+              }
+            },
+            "required": [
+              "type",
+              "request"
+            ]
+          },
+          {
+            "description": "A chunk of streamed tool call arguments.",
+            "type": "object",
+            "properties": {
+              "tool_call_id": {
+                "type": "string"
+              },
+              "chunk": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "call_update"
+              }
+            },
+            "required": [
+              "type",
+              "tool_call_id",
+              "chunk"
+            ]
+          },
+          {
+            "description": "The tool began executing.",
+            "type": "object",
+            "properties": {
+              "tool_id": {
+                "type": "string"
+              },
+              "tool_name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "execution_started"
+              }
+            },
+            "required": [
+              "type",
+              "tool_id",
+              "tool_name"
+            ]
+          },
+          {
+            "description": "Progress reported by an executing tool.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "progress": {
+                "type": "number",
+                "format": "double"
+              },
+              "total": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "double"
+              },
+              "message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "const": "progress"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "progress"
+            ]
+          },
+          {
+            "description": "Progress from a sub-agent spawned by this tool call, carrying the child's own event.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "payload": {
+                "$ref": "#/$defs/SubAgentProgressPayload"
+              },
+              "type": {
+                "type": "string",
+                "const": "sub_agent_progress"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "payload"
+            ]
+          },
+          {
+            "description": "An executing tool refreshed how it should be displayed.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "meta": {
+                "$ref": "#/$defs/ToolResultMeta"
+              },
+              "type": {
+                "type": "string",
+                "const": "display_update"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "meta"
+            ]
+          },
+          {
+            "description": "A background task was created by a tool call response.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "const": "task_created"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "task_id"
+            ]
+          },
+          {
+            "description": "The background task reported a new status.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "const": "task_status"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "task_id",
+              "status"
+            ]
+          },
+          {
+            "description": "The background task completed successfully.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/$defs/ToolCallResult"
+              },
+              "result_meta": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ToolResultMeta"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "const": "task_completed"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "task_id",
+              "result"
+            ]
+          },
+          {
+            "description": "The background task failed.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "error": {
+                "$ref": "#/$defs/ToolCallError"
+              },
+              "type": {
+                "type": "string",
+                "const": "task_failed"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "task_id",
+              "error"
+            ]
+          },
+          {
+            "description": "The background task was cancelled.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "task_cancelled"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "task_id"
+            ]
+          },
+          {
+            "description": "The tool completed successfully.",
+            "type": "object",
+            "properties": {
+              "result": {
+                "$ref": "#/$defs/ToolCallResult"
+              },
+              "result_meta": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ToolResultMeta"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "const": "result"
+              }
+            },
+            "required": [
+              "type",
+              "result"
+            ]
+          },
+          {
+            "description": "The tool failed.",
+            "type": "object",
+            "properties": {
+              "error": {
+                "$ref": "#/$defs/ToolCallError"
+              },
+              "type": {
+                "type": "string",
+                "const": "error"
+              }
+            },
+            "required": [
+              "type",
+              "error"
+            ]
+          },
+          {
+            "description": "The tool call was refused before execution (e.g. by a [`ToolPolicy`](crate::core::ToolPolicy)).\nThe `reason` is a human-readable string describing why execution was declined; the full\n`request` is preserved so the transcript records exactly what was rejected.",
+            "type": "object",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/ToolCallRequest"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "refused"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "reason"
+            ]
+          },
+          {
+            "description": "The set of available tool definitions changed.",
+            "type": "object",
+            "properties": {
+              "tools": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ToolDefinition"
+                }
+              },
+              "type": {
+                "type": "string",
+                "const": "definitions_updated"
+              }
+            },
+            "required": [
+              "type",
+              "tools"
+            ]
+          }
+        ]
+      },
+      "ToolCallRequest": {
+        "description": "Tool call request from the LLM",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "arguments"
+        ]
+      },
+      "SubAgentProgressPayload": {
+        "description": "A sub-agent's event, tagged with the task and agent it came from.\n\n`mcp-subagents` serializes this into MCP progress notification messages.\nThe parent agent parses it once at the tool-execution boundary into\n`ToolEvent::SubAgentProgress`, so every consumer downstream sees a typed\nevent instead of JSON in a string.",
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "event": {
+            "$ref": "#"
+          }
+        },
+        "required": [
+          "task_id",
+          "agent_name",
+          "event"
+        ]
+      },
+      "ToolResultMeta": {
+        "description": "Typed wrapper for the MCP `_meta` field on tool results.\n\nWraps a [`ToolDisplayMeta`] so that tool output structs can use\n`Option<ToolResultMeta>` instead of `Option<serde_json::Value>`.",
+        "type": "object",
+        "properties": {
+          "display": {
+            "$ref": "#/$defs/ToolDisplayMeta"
+          },
+          "file_diff": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/FileDiff"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/PlanMeta"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "display"
+        ]
+      },
+      "ToolDisplayMeta": {
+        "description": "Human-readable display metadata for a tool operation.\n\nContains a pre-computed `title` (e.g., \"Read file\") and `value`\n(e.g., \"Cargo.toml, 156 lines\") that consumers render directly.",
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "value"
+        ]
+      },
+      "FileDiff": {
+        "description": "Full file contents for a diff, sent as metadata so the ACP layer\ncan emit a first-class `ToolCallContent::Diff`.",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "old_text": {
+            "description": "Original file content (`None` for new files).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "PlanMeta": {
+        "description": "A snapshot of the agent's current task plan.",
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PlanMetaEntry"
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "PlanMetaEntry": {
+        "description": "A single entry in a plan.",
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/PlanMetaStatus"
+          }
+        },
+        "required": [
+          "content",
+          "status"
+        ]
+      },
+      "PlanMetaStatus": {
+        "description": "Execution status of a plan entry.",
+        "type": "string",
+        "enum": [
+          "pending",
+          "in_progress",
+          "completed",
+          "cancelled"
+        ]
+      },
+      "ToolCallResult": {
+        "description": "Successful result of a tool call",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "string"
+          },
+          "result": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "arguments",
+          "result"
+        ]
+      },
+      "ToolCallError": {
+        "description": "Error result of a tool call",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "error"
+        ]
+      },
+      "ToolDefinition": {
+        "description": "A tool that the LLM can invoke during generation.\n\nTools follow a request-response lifecycle:\n\n1. **Define** -- Create [`ToolDefinition`]s with a name, description, and JSON Schema parameters, then pass them to the model via [`Context::set_tools`](crate::Context::set_tools).\n2. **Request** -- The model emits a [`ToolCallRequest`] (streamed as `ToolRequestStart` -> `ToolRequestArg` -> `ToolRequestComplete` in [`LlmResponse`](crate::LlmResponse)).\n3. **Execute** -- Run the requested tool and produce either a [`ToolCallResult`] (success) or a [`ToolCallError`] (failure).\n4. **Return** -- Feed the result back to the model as a [`ChatMessage::ToolCallResult`](crate::ChatMessage::ToolCallResult) in the next turn.\n\n# Related types\n\n- [`ToolCallRequest`] -- What the model asks for: tool `id`, `name`, and `arguments` (JSON string).\n- [`ToolCallResult`] -- Successful execution: includes the `result` string.\n- [`ToolCallError`] -- Failed execution: includes the `error` string. Construct from a request with [`ToolCallError::from_request`].\n\nThe optional `server` field on `ToolDefinition` tracks which MCP server originally provided the tool, if any.\n\nThe optional `annotations` field preserves MCP tool hints such as `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. These values are hints supplied by the server and are used by higher-level filtering policy; they are not a security boundary.",
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "parameters": true,
+          "server": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ToolAnnotations"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters"
+        ]
+      },
+      "ToolAnnotations": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "readOnlyHint": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "destructiveHint": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "idempotentHint": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "openWorldHint": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "TurnEvent": {
+        "description": "Turn lifecycle events.\n\nA turn spans from a user message to a terminal [`TurnEvent::Ended`]. Within a\nturn, each LLM call is bracketed by `LlmCallStarted`/`LlmCallEnded`; retries\nsurface as an `LlmCallStarted` with `attempt > 0`. Note that the completion\nevents for streamed message content\n([`MessageEvent`](crate::events::MessageEvent) with `is_complete: true`) are\nemitted at turn completion, after the originating call's `LlmCallEnded`.",
+        "oneOf": [
+          {
+            "description": "A user message began a turn. Messages queued while a turn is active are\nfolded into that turn and do not start a new one.",
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                }
+              },
+              "type": {
+                "type": "string",
+                "const": "started"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "description": "A retry is waiting for its backoff delay before the request starts.",
+            "type": "object",
+            "properties": {
+              "purpose": {
+                "$ref": "#/$defs/LlmCallPurpose"
+              },
+              "attempt": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "max_attempts": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "delay_ms": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "retry_scheduled"
+              }
+            },
+            "required": [
+              "type",
+              "purpose",
+              "attempt",
+              "max_attempts",
+              "delay_ms"
+            ]
+          },
+          {
+            "description": "An LLM request was issued.",
+            "type": "object",
+            "properties": {
+              "purpose": {
+                "$ref": "#/$defs/LlmCallPurpose"
+              },
+              "model": {
+                "$ref": "#/$defs/ModelIdentity"
+              },
+              "display_name": {
+                "type": "string"
+              },
+              "attempt": {
+                "description": "0 for the initial call, incrementing per retry.",
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "max_attempts": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "llm_call_started"
+              }
+            },
+            "required": [
+              "type",
+              "purpose",
+              "model",
+              "display_name",
+              "attempt",
+              "max_attempts"
+            ]
+          },
+          {
+            "description": "An LLM call reached a terminal state.",
+            "type": "object",
+            "properties": {
+              "purpose": {
+                "$ref": "#/$defs/LlmCallPurpose"
+              },
+              "outcome": {
+                "$ref": "#/$defs/LlmCallOutcome"
+              },
+              "type": {
+                "type": "string",
+                "const": "llm_call_ended"
+              }
+            },
+            "required": [
+              "type",
+              "purpose",
+              "outcome"
+            ]
+          },
+          {
+            "description": "The agent is auto-continuing because the LLM stopped with a resumable\nstop reason.",
+            "type": "object",
+            "properties": {
+              "attempt": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "max_attempts": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "message_id": {
+                "$ref": "#/$defs/MessageId"
+              },
+              "content": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                }
+              },
+              "type": {
+                "type": "string",
+                "const": "auto_continue"
+              }
+            },
+            "required": [
+              "type",
+              "attempt",
+              "max_attempts",
+              "message_id",
+              "content"
+            ]
+          },
+          {
+            "description": "The turn reached a terminal state.",
+            "type": "object",
+            "properties": {
+              "outcome": {
+                "$ref": "#/$defs/TurnOutcome"
+              },
+              "type": {
+                "type": "string",
+                "const": "ended"
+              }
+            },
+            "required": [
+              "type",
+              "outcome"
+            ]
+          }
+        ]
+      },
+      "ContentBlock": {
+        "description": "A block of content within a [`ChatMessage::User`] message.\n\nSupports multimodal input: text, images (base64-encoded), and audio (base64-encoded).\n\n# Variants\n\n- **`Text`** -- Plain text content. Construct with [`ContentBlock::text(\"hello\")`](ContentBlock::text).\n- **`Image`** -- Base64-encoded image with its MIME type (e.g. `image/png`).\n- **`Audio`** -- Base64-encoded audio with its MIME type (e.g. `audio/wav`).\n\n# Working with text\n\n- [`text()`](ContentBlock::text) -- Create a `Text` block from anything that implements `Into<String>`.\n- [`first_text(parts)`](ContentBlock::first_text) -- Find the first non-empty text block in a slice.\n- [`join_text(parts)`](ContentBlock::join_text) -- Concatenate all text blocks with newlines.\n\n# Working with media\n\n- [`is_image()`](ContentBlock::is_image) -- Check if this is an image block.\n- [`as_data_uri()`](ContentBlock::as_data_uri) -- Convert image/audio blocks to a `data:{mime};base64,{data}` URI. Returns `None` for text blocks.\n- [`estimated_bytes()`](ContentBlock::estimated_bytes) -- Byte-size estimate (text length or base64 data length).",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "text"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "image"
+              }
+            },
+            "required": [
+              "type",
+              "data",
+              "mime_type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "audio"
+              }
+            },
+            "required": [
+              "type",
+              "data",
+              "mime_type"
+            ]
+          }
+        ]
+      },
+      "LlmCallPurpose": {
+        "description": "What an LLM call was issued for.",
+        "type": "string",
+        "enum": [
+          "chat",
+          "compaction"
+        ]
+      },
+      "ModelIdentity": {
+        "description": "Provider, model id, and catalog pricing of the model serving a call. All\nfields are `None` for dynamic or local models the catalog does not know.",
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pricing": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ModelPricing"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ModelPricing": {
+        "description": "Provider/model prices sourced from models.dev, denominated in USD per million tokens.",
+        "type": "object",
+        "properties": {
+          "input_per_million": {
+            "type": "number",
+            "format": "double"
+          },
+          "output_per_million": {
+            "type": "number",
+            "format": "double"
+          },
+          "cache_read_per_million": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "cache_write_per_million": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        },
+        "required": [
+          "input_per_million",
+          "output_per_million"
+        ]
+      },
+      "LlmCallOutcome": {
+        "description": "How a single LLM call ended.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "stop_reason": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/StopReason"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "usage": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TokenUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "provider_request_id": {
+                "description": "Provider-side request id (response body id or response header), as\nreported by the streaming parser on the terminal `Done` event.\nSurfaced on the run log so each turn can be traced back to the\nprovider's request. `None` means the provider did not return one;\nthe run log records none in that case rather than a placeholder.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "const": "completed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "will_retry": {
+                "type": "boolean"
+              },
+              "http_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint16",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "provider_request_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "description": "Normalized provider failure classification carried over from the\noriginal [`LlmError`]. `None` for client-side errors (missing API\nkey, OAuth flow, argument validation, etc.) and for the legacy\n`failed` constructor; the headless CLI uses\n`Some(ProviderErrorKind::Authentication)` to pick a distinct exit\ncode when the model *rejected* the credential (HTTP 401/403).",
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderErrorKind"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "status": {
+                "type": "string",
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status",
+              "error",
+              "will_retry"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        ]
+      },
+      "StopReason": {
+        "description": "The reason an LLM stopped generating.\n\nReturned inside [`LlmResponse::Done`] at the end of a response stream.\n\n# Variants\n\n- **`EndTurn`** -- The model finished its response naturally.\n- **`Length`** -- The response was truncated because it hit the maximum output token limit.\n- **`ToolCalls`** -- The model stopped to request one or more tool calls. The caller should execute the requested tools and send the results back in a new turn.\n- **`ContentFilter`** -- The response was stopped by the provider's content filter.\n- **`FunctionCall`** -- Legacy variant for older `OpenAI` function calling (deprecated in favor of `ToolCalls`).\n- **`Unknown(String)`** -- An unrecognized stop reason from the provider.",
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "end_turn",
+              "length",
+              "tool_calls",
+              "content_filter",
+              "function_call"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "unknown": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "unknown"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "TokenUsage": {
+        "description": "Token counts for a single LLM call or an aggregate of calls. Providers fill\nin only the dimensions they report; the rest stay `None`.",
+        "type": "object",
+        "properties": {
+          "input_tokens": {
+            "$ref": "#/$defs/Tokens"
+          },
+          "output_tokens": {
+            "$ref": "#/$defs/Tokens"
+          },
+          "cache_read_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "cache_creation_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "input_audio_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "input_video_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "reasoning_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_audio_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "accepted_prediction_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "rejected_prediction_tokens": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ]
+      },
+      "Tokens": {
+        "description": "A count of tokens. Sums saturate instead of wrapping.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      },
+      "ProviderErrorKind": {
+        "type": "string",
+        "enum": [
+          "authentication",
+          "api",
+          "rate_limit",
+          "server",
+          "timeout",
+          "network",
+          "stream_interrupted",
+          "unknown"
+        ]
+      },
+      "TurnOutcome": {
+        "description": "How a turn reached its terminal state.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "completed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status",
+              "error"
+            ]
+          },
+          {
+            "description": "The configured per-run turn cap was reached. The run ends cleanly\n(no failure) and the cap is reported in the outcome payload so callers\ncan surface it.",
+            "type": "object",
+            "properties": {
+              "max_turns": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "status": {
+                "type": "string",
+                "const": "max_turns_reached"
+              }
+            },
+            "required": [
+              "status",
+              "max_turns"
+            ]
+          }
+        ]
+      },
+      "ContextEvent": {
+        "description": "Context lifecycle events.\n\nCompaction IDs are required in persisted and headless events. Logs without\nthese IDs are not migrated or assigned identities during deserialization.",
+        "oneOf": [
+          {
+            "description": "Context compaction has been triggered.",
+            "type": "object",
+            "properties": {
+              "compaction_id": {
+                "$ref": "#/$defs/CompactionId"
+              },
+              "message_count": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "compaction_started"
+              }
+            },
+            "required": [
+              "type",
+              "compaction_id",
+              "message_count"
+            ]
+          },
+          {
+            "description": "Context compaction reached a terminal state.",
+            "type": "object",
+            "properties": {
+              "compaction_id": {
+                "$ref": "#/$defs/CompactionId"
+              },
+              "outcome": {
+                "$ref": "#/$defs/CompactionOutcome"
+              },
+              "type": {
+                "type": "string",
+                "const": "compaction_ended"
+              }
+            },
+            "required": [
+              "type",
+              "compaction_id",
+              "outcome"
+            ]
+          },
+          {
+            "description": "Context was compacted to reduce token usage.",
+            "type": "object",
+            "properties": {
+              "compaction_id": {
+                "$ref": "#/$defs/CompactionId"
+              },
+              "message_id": {
+                "$ref": "#/$defs/MessageId"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "messages_removed": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "compaction_result"
+              }
+            },
+            "required": [
+              "type",
+              "compaction_id",
+              "message_id",
+              "summary",
+              "messages_removed"
+            ]
+          },
+          {
+            "description": "Context usage update for UI display.",
+            "type": "object",
+            "properties": {
+              "usage": {
+                "$ref": "#/$defs/ContextUsage"
+              },
+              "type": {
+                "type": "string",
+                "const": "usage_updated"
+              }
+            },
+            "required": [
+              "type",
+              "usage"
+            ]
+          },
+          {
+            "description": "The agent context was cleared and reset to its blank state.",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "cleared"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        ]
+      },
+      "CompactionId": {
+        "description": "Protocol-independent identity persisted across a compaction's lifecycle.",
+        "type": "string"
+      },
+      "CompactionOutcome": {
+        "description": "Terminal result of a context compaction operation.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "completed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status",
+              "error"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        ]
+      },
+      "ContextUsage": {
+        "description": "One agent's context window after its most recent LLM call.",
+        "type": "object",
+        "properties": {
+          "usage_ratio": {
+            "description": "`input_tokens` as a fraction of `context_limit`, when the limit is known.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "default": null
+          },
+          "context_limit": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Tokens"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "input_tokens": {
+            "description": "Input tokens on the most recent call, i.e. the current size of the context.",
+            "$ref": "#/$defs/Tokens",
+            "default": 0
+          }
+        }
+      },
+      "ModelEvent": {
+        "description": "Model configuration events.",
+        "oneOf": [
+          {
+            "description": "The model was successfully switched.",
+            "type": "object",
+            "properties": {
+              "previous": {
+                "type": "string"
+              },
+              "new": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "switched"
+              }
+            },
+            "required": [
+              "type",
+              "previous",
+              "new"
+            ]
+          },
+          {
+            "description": "The primary provider failed with a server (5xx) error and the agent\nretried the turn on a configured secondary provider. `from` is the\nprimary's display name, `to` is the secondary's display name, and\n`reason` is the textual description of the 5xx that triggered the\nfallback. Emitted exactly once per run, on the first server error.",
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "const": "fallback"
+              }
+            },
+            "required": [
+              "type",
+              "from",
+              "to",
+              "reason"
+            ]
+          }
+        ]
+      },
+      "SessionUsageEvent": {
+        "description": "One provider usage sample, its estimated cost, and the totals after it.",
+        "type": "object",
+        "properties": {
+          "sequence": {
+            "description": "Sequence assigned by the emitting tracker, including folded child samples.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "source": {
+            "description": "Attribution of this sample, not the owner of the cumulative totals.",
+            "$ref": "#/$defs/UsageSource"
+          },
+          "purpose": {
+            "$ref": "#/$defs/LlmCallPurpose"
+          },
+          "model": {
+            "$ref": "#/$defs/ModelIdentity"
+          },
+          "tokens": {
+            "$ref": "#/$defs/TokenUsage"
+          },
+          "estimated_cost": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UsageCost"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "totals": {
+            "$ref": "#/$defs/SessionUsageTotals"
+          }
+        },
+        "required": [
+          "sequence",
+          "source",
+          "purpose",
+          "model",
+          "tokens",
+          "totals"
+        ]
+      },
+      "UsageSource": {
+        "description": "The agent a usage sample belongs to and where it sits in the sub-agent\ntree. A freshly created source has no parent; the agent that receives a\nsub-agent's usage fills in `parent_agent_id` and `task_id`.",
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "parent_agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "agent_name"
+        ]
+      },
+      "UsageCost": {
+        "description": "Estimated USD cost of one call, split by token pool.",
+        "type": "object",
+        "properties": {
+          "input_usd": {
+            "$ref": "#/$defs/Usd"
+          },
+          "output_usd": {
+            "$ref": "#/$defs/Usd"
+          },
+          "cache_read_usd": {
+            "$ref": "#/$defs/Usd"
+          },
+          "cache_creation_usd": {
+            "$ref": "#/$defs/Usd"
+          },
+          "total_usd": {
+            "$ref": "#/$defs/Usd"
+          }
+        },
+        "required": [
+          "input_usd",
+          "output_usd",
+          "cache_read_usd",
+          "cache_creation_usd",
+          "total_usd"
+        ]
+      },
+      "Usd": {
+        "description": "A monetary amount denominated in US dollars.",
+        "type": "number",
+        "format": "double"
+      },
+      "SessionUsageTotals": {
+        "description": "Running token totals and cost estimate across every call an agent has seen.",
+        "type": "object",
+        "properties": {
+          "tokens": {
+            "$ref": "#/$defs/TokenUsage"
+          },
+          "estimated_usd": {
+            "description": "Sum of every priced call's estimated cost.",
+            "$ref": "#/$defs/Usd"
+          },
+          "estimated_input_usd": {
+            "description": "Cumulative estimated cost of non-cached input tokens, in USD.",
+            "$ref": "#/$defs/Usd"
+          },
+          "estimated_output_usd": {
+            "description": "Cumulative estimated cost of output tokens, in USD.",
+            "$ref": "#/$defs/Usd"
+          },
+          "estimated_cache_read_usd": {
+            "description": "Cumulative estimated cost of cache-read tokens, in USD.",
+            "$ref": "#/$defs/Usd"
+          },
+          "estimated_cache_creation_usd": {
+            "description": "Cumulative estimated cost of cache-creation tokens, in USD.",
+            "$ref": "#/$defs/Usd"
+          },
+          "unpriced_calls": {
+            "description": "Calls with nonzero usage but no catalog pricing, which `estimated_usd`\ntherefore leaves out.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "tokens",
+          "estimated_usd",
+          "estimated_input_usd",
+          "estimated_output_usd",
+          "estimated_cache_read_usd",
+          "estimated_cache_creation_usd",
+          "unpriced_calls"
+        ]
+      }
+    }
+  },
+  "ContextUsage": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ContextUsage",
+    "description": "One agent's context window after its most recent LLM call.",
+    "type": "object",
+    "properties": {
+      "usage_ratio": {
+        "description": "`input_tokens` as a fraction of `context_limit`, when the limit is known.",
+        "type": [
+          "number",
+          "null"
+        ],
+        "format": "double",
+        "default": null
+      },
+      "context_limit": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Tokens"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "input_tokens": {
+        "description": "Input tokens on the most recent call, i.e. the current size of the context.",
+        "$ref": "#/$defs/Tokens",
+        "default": 0
+      }
+    },
+    "$defs": {
+      "Tokens": {
+        "description": "A count of tokens. Sums saturate instead of wrapping.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      }
+    }
+  },
+  "JudgeRubricResponse": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "JudgeRubricResponse",
+    "description": "The raw rubric response the judge model is expected to return.",
+    "type": "object",
+    "properties": {
+      "criteria": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/JudgeCriterionResponse"
+        }
+      },
+      "overall_reason": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false,
+    "required": [
+      "criteria",
+      "overall_reason"
+    ],
+    "$defs": {
+      "JudgeCriterionResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "score",
+          "reason"
+        ]
+      }
+    }
+  },
+  "JudgeSummary": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "JudgeSummary",
+    "description": "The graded result of running a judge: an overall pass/score plus per-criterion detail.",
+    "type": "object",
+    "properties": {
+      "passed": {
+        "type": "boolean"
+      },
+      "score": {
+        "type": "number",
+        "format": "double"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "criteria": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/JudgeCriterionSummary"
+        }
+      }
+    },
+    "additionalProperties": false,
+    "required": [
+      "passed",
+      "score",
+      "reason",
+      "criteria"
+    ],
+    "$defs": {
+      "JudgeCriterionSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "weight": {
+            "type": "number",
+            "format": "double"
+          },
+          "threshold": {
+            "type": "number",
+            "format": "double"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "blocking",
+          "weight",
+          "threshold",
+          "score",
+          "passed",
+          "reason"
+        ]
+      }
+    }
+  },
+  "JudgeCriterionSpec": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "JudgeCriterionSpec",
+    "description": "A single rubric criterion scored on a normalized 0.0..=1.0 scale.",
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      },
+      "blocking": {
+        "type": "boolean",
+        "default": true
+      },
+      "weight": {
+        "type": "number",
+        "format": "double",
+        "default": 1
+      },
+      "threshold": {
+        "type": "number",
+        "format": "double",
+        "default": 1
+      }
+    },
+    "additionalProperties": false,
+    "required": [
+      "id",
+      "description"
+    ]
+  }
+}

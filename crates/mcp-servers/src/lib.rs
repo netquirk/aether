@@ -1,19 +1,25 @@
 #![doc = include_str!("../README.md")]
 
-pub mod error;
+#[cfg(any(feature = "coding", feature = "subagents"))]
+mod background_tasks;
 
-#[cfg(feature = "coding")]
-pub(crate) mod search;
+#[cfg(any(feature = "coding", feature = "review"))]
+mod request_context;
+
+#[cfg(any(feature = "coding", feature = "skills", feature = "tasks", feature = "subagents"))]
+mod displayed;
+#[cfg(any(feature = "coding", feature = "skills", feature = "tasks", feature = "subagents"))]
+pub use displayed::Displayed;
 
 pub mod workspace_paths;
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod testing;
 
-#[cfg(any(feature = "all", feature = "subagents"))]
+#[cfg(feature = "subagents")]
 pub mod setup;
-#[cfg(any(feature = "all", feature = "subagents"))]
-pub use setup::McpBuilderExt;
+#[cfg(feature = "subagents")]
+pub use setup::{Builtin, McpBuilderExt, agent_mcp};
 
 #[cfg(feature = "file-ops")]
 pub mod file_ops;
@@ -36,9 +42,8 @@ pub mod subagents;
 #[cfg(feature = "review")]
 pub mod review;
 
-// Re-export primary types for convenience
 #[cfg(feature = "coding")]
-pub use coding::{CodingMcp, CodingMcpArgs, CodingTools, DefaultCodingTools, PermissionMode};
+pub use coding::{CodingMcp, CodingMcpArgs, PermissionMode};
 
 #[cfg(feature = "coding")]
 pub use lsp::LspRegistry;
@@ -54,5 +59,16 @@ pub use subagents::{SubAgentsMcp, SubAgentsMcpArgs};
 
 #[cfg(feature = "review")]
 pub use review::{
-    DocumentSource, HtmlAnnotation, HtmlSource, ReviewArtifactInput, ReviewArtifactOutput, ReviewMcp, ReviewMcpArgs,
+    ArtifactFormat, ArtifactSource, HtmlAnnotation, ReviewArtifactInput, ReviewArtifactOutput, ReviewMcp, ReviewMcpArgs,
 };
+
+#[cfg(any(feature = "coding", feature = "skills", feature = "tasks", feature = "review"))]
+pub(crate) fn server_config(
+    name: &str,
+    capabilities: rmcp::model::ServerCapabilities,
+    instructions: impl Into<String>,
+) -> rmcp::model::ServerConfig {
+    rmcp::model::ServerConfig::new(capabilities)
+        .with_server_info(rmcp::model::Implementation::new(name, env!("CARGO_PKG_VERSION")))
+        .with_instructions(instructions)
+}

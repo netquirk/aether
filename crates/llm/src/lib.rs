@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod alloyed;
+mod assistant_reply;
 pub mod catalog;
 mod chat_message;
 mod context;
@@ -20,15 +21,16 @@ mod tools;
 pub mod types;
 pub mod usage;
 
+pub use assistant_reply::{AssistantContent, AssistantReply, EncryptedReasoningContent};
 pub use catalog::LlmModel;
-pub use chat_message::{AssistantReasoning, ChatMessage, ContentBlock, EncryptedReasoningContent};
+pub use chat_message::{ChatMessage, ContentBlock};
 pub use context::Context;
 pub use credential::ProviderCredential;
 pub use error::{LlmError, ProviderError, ProviderErrorKind, Result};
 pub use llm_response::{LlmResponse, StopReason};
 pub use message_id::MessageId;
 pub use model_settings::ModelSettings;
-pub use provider::{LlmResponseStream, ProviderFactory, StreamingModelProvider};
+pub use provider::{LlmResponseStream, StreamingModelProvider};
 pub use provider_connection::{
     ProviderAuthMode, ProviderConnectionConfig, ProviderConnectionOverride, ProviderConnectionOverrides,
 };

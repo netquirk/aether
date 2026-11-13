@@ -6,12 +6,6 @@ use std::time::Duration;
 /// interruption), the agent waits `delay` and re-issues the same request.
 /// Each successful turn resets the attempt counter.
 ///
-/// With `resume_partial`, a mid-stream interruption that already produced
-/// output is not re-sent from scratch: the partial reply (text, reasoning and
-/// any tool calls that finished streaming) is kept in the conversation and the
-/// model is asked to continue from the cut. Such resumes share the
-/// `max_attempts` budget with plain retries.
-///
 /// Backoff doubles each attempt: `base_delay`, `2 * base_delay`, `4 * base_delay`,
 /// ... capped at `max_delay`.
 #[derive(Debug, Clone, Copy)]
@@ -19,17 +13,11 @@ pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
-    pub resume_partial: bool,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        Self {
-            max_attempts: 5,
-            base_delay: Duration::from_millis(200),
-            max_delay: Duration::from_secs(30),
-            resume_partial: true,
-        }
+        Self { max_attempts: 5, base_delay: Duration::from_millis(200), max_delay: Duration::from_secs(30) }
     }
 }
 
@@ -52,12 +40,8 @@ mod tests {
 
     #[test]
     fn exponential_backoff_doubles_per_attempt() {
-        let config = RetryConfig {
-            max_attempts: 5,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(30),
-            resume_partial: true,
-        };
+        let config =
+            RetryConfig { max_attempts: 5, base_delay: Duration::from_millis(100), max_delay: Duration::from_secs(30) };
         assert_eq!(config.compute_delay(1), Duration::from_millis(100));
         assert_eq!(config.compute_delay(2), Duration::from_millis(200));
         assert_eq!(config.compute_delay(3), Duration::from_millis(400));
@@ -70,7 +54,6 @@ mod tests {
             max_attempts: 10,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_millis(500),
-            resume_partial: true,
         };
         assert_eq!(config.compute_delay(10), Duration::from_millis(500));
     }
@@ -81,7 +64,6 @@ mod tests {
             max_attempts: 100,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(30),
-            resume_partial: true,
         };
         assert_eq!(config.compute_delay(99), Duration::from_secs(30));
     }

@@ -2,163 +2,171 @@
 
 #![allow(dead_code)]
 
-use aether_lspd::testing::TestProject;
+use clankerdiff_lspd::testing::{TestDaemon, TestDaemonBuilder};
 use mcp_servers::coding::CodingMcp;
+use mcp_servers::coding::tools::web_fetch::WebFetcher;
 use mcp_servers::skills::{
     SkillsMcp,
     tools::{LoadSkillsInput, SkillRequest},
 };
-use mcp_utils::client::{McpClient, client_capabilities};
-use mcp_utils::testing::{ElicitationScript, connect};
-use rmcp::RoleClient;
+use mcp_servers::testing::{FakeHttpClient, TestWorkspace};
+use mcp_utils::client::{ClientOptions, McpClient};
+use mcp_utils::testing::{ElicitationScript, args, call, elicitation_host};
+use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ElicitResult, Implementation,
+    CallToolRequestParams, CallToolResponse, CallToolResult, DetailedTask, ElicitResult, GetTaskParams, TaskPayload,
+    TaskStatus,
 };
-use rmcp::service::RunningService;
-use rmcp::{RoleServer, Service};
 use serde::Serialize;
-use std::fs::{create_dir_all, read_to_string};
+use serde_json::{Value, json};
+use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use tempfile::{TempDir, tempdir};
-use tokio::sync::mpsc;
+use std::process::Command;
+use std::time::Duration;
 
-/// Default timeout for polling operations (60 seconds).
-const POLL_TIMEOUT: Duration = Duration::from_mins(1);
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TYPESCRIPT_PACKAGE: &str = "typescript@7.0.2";
 
-pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-pub fn test_client_info() -> ClientConfig {
-    ClientConfig::new(ClientCapabilities::default(), Implementation::new("test-client", "0.1.0"))
+pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+pub(crate) async fn connect(server: impl ServerHandler, options: ClientOptions) -> McpClient {
+    mcp_utils::testing::connect("test", server, &options).await
 }
 
-/// Client info declaring the same capabilities `McpManager` advertises in
-/// production: form + url elicitation and MCP tasks.
-pub fn production_client_info() -> ClientConfig {
-    ClientConfig::new(client_capabilities(), Implementation::new("test-client", "0.1.0"))
+pub(crate) fn cancels_prompts() -> ClientOptions {
+    elicitation_host().0
 }
 
-/// An `McpClient` whose elicitation events go nowhere; elicitation-dependent
-/// calls resolve as Cancel.
-pub fn silent_mcp_client(server_name: &str) -> McpClient {
-    let (event_tx, _event_rx) = mpsc::channel(8);
-    McpClient::new(production_client_info(), server_name.to_string(), event_tx)
+/// A client that answers its first elicitation with `response`.
+pub(crate) fn scripted(response: ElicitResult) -> (ClientOptions, ElicitationScript) {
+    ElicitationScript::answering([response])
 }
 
-/// An `McpClient` plus a script answering the next elicitation request with
-/// `response` and capturing what arrived for assertions.
-pub fn scripted_mcp_client(server_name: &str, response: ElicitResult) -> (McpClient, ElicitationScript) {
-    let (event_tx, event_rx) = mpsc::channel(8);
-    let client = McpClient::new(production_client_info(), server_name.to_string(), event_tx);
-    (client, ElicitationScript::spawn(event_rx, [response]))
+pub(crate) fn tool_request(tool: &str, arguments: impl Serialize) -> CallToolRequestParams {
+    let arguments = serde_json::to_value(arguments).expect("tool arguments serialize to JSON");
+    CallToolRequestParams::new(tool.to_string()).with_arguments(args(arguments))
 }
 
-pub fn test_error(message: impl Into<String>) -> std::io::Error {
-    std::io::Error::other(message.into())
+pub(crate) fn taskless() -> ClientOptions {
+    ClientOptions::default().without_tasks()
 }
 
-/// An isolated workspace connected to a `CodingMcp` through the public MCP protocol.
-pub struct CodingWorkspace {
-    root: TempDir,
-    pub client: TestClient<CodingMcp>,
+pub(crate) trait McpClientExt {
+    async fn call_raw(&self, tool: &str, args: impl Serialize) -> TestResult<CallToolResult>;
+
+    async fn call(&self, tool: &str, args: impl Serialize) -> TestResult<Value>;
+
+    async fn call_displayed(&self, tool: &str, args: impl Serialize) -> TestResult<(Value, Value)>;
 }
 
-impl CodingWorkspace {
-    pub async fn new() -> TestResult<Self> {
-        Self::start(|root| CodingMcp::new().with_root_dir(root.to_path_buf())).await
+impl McpClientExt for McpClient {
+    async fn call_raw(&self, tool: &str, args: impl Serialize) -> TestResult<CallToolResult> {
+        Ok(call(self, tool, serde_json::to_value(args)?).await?)
     }
 
-    pub async fn new_with_lsp() -> TestResult<Self> {
-        Self::start(|root| CodingMcp::new().with_lsp(root.to_path_buf())).await
-    }
-
-    async fn start(configure: impl FnOnce(&Path) -> CodingMcp) -> TestResult<Self> {
-        let root = tempdir()?;
-        let client = TestClient::start(|| configure(root.path())).await?;
-        Ok(Self { root, client })
-    }
-
-    pub fn root(&self) -> &Path {
-        self.root.path()
-    }
-
-    pub fn path(&self, relative_path: impl AsRef<Path>) -> PathBuf {
-        self.root.path().join(relative_path)
-    }
-
-    pub fn write(&self, relative_path: impl AsRef<Path>, content: &str) -> TestResult<PathBuf> {
-        let path = self.path(relative_path);
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
-        }
-        std::fs::write(&path, content)?;
-        Ok(path)
-    }
-
-    pub fn read(&self, relative_path: impl AsRef<Path>) -> TestResult<String> {
-        Ok(read_to_string(self.path(relative_path))?)
-    }
-}
-
-/// Generic test client wrapping a connected MCP server.
-pub struct TestClient<T: Service<RoleServer>, U: Service<RoleClient> = ClientConfig> {
-    _server_handle: RunningService<RoleServer, T>,
-    client: RunningService<RoleClient, U>,
-}
-
-impl<T: Service<RoleServer>> TestClient<T, ClientConfig> {
-    /// Connect a default test `ClientConfig` to a server built by `configure`.
-    pub async fn start(configure: impl FnOnce() -> T) -> TestResult<Self> {
-        let (server_handle, client) = connect(configure(), test_client_info()).await?;
-        Ok(Self { _server_handle: server_handle, client })
-    }
-}
-
-impl<T: Service<RoleServer>, U: Service<RoleClient>> TestClient<T, U> {
-    pub async fn start_with(configure_server: impl FnOnce() -> T, client: U) -> TestResult<Self> {
-        let (server_handle, client) = connect(configure_server(), client).await?;
-        Ok(Self { _server_handle: server_handle, client })
-    }
-
-    pub async fn call<V: Serialize>(&self, tool: &str, args: V) -> TestResult<serde_json::Value> {
+    async fn call(&self, tool: &str, args: impl Serialize) -> TestResult<Value> {
         let result = self.call_raw(tool, args).await?;
         let text = result
             .content
             .first()
-            .and_then(|c| c.as_text())
-            .ok_or_else(|| test_error(format!("{tool} should return text content")))?;
-        Ok(serde_json::from_str(&text.text)?)
+            .and_then(|content| content.as_text())
+            .ok_or_else(|| test_error(format!("{tool} returned no text content: {result:?}")))?;
+        serde_json::from_str(&text.text)
+            .map_err(|error| test_error(format!("{tool} returned non-JSON text ({error}): {}", text.text)).into())
     }
 
-    pub async fn call_raw<V: Serialize>(&self, tool: &str, args: V) -> TestResult<CallToolResult> {
-        let args = serde_json::to_value(args)?;
-        let arguments =
-            args.as_object().ok_or_else(|| test_error("tool arguments must serialize to a JSON object"))?.clone();
-        Ok(self.client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments)).await?)
-    }
-
-    pub fn raw(&self) -> &RunningService<RoleClient, U> {
-        &self.client
+    async fn call_displayed(&self, tool: &str, args: impl Serialize) -> TestResult<(Value, Value)> {
+        let result = self.call_raw(tool, args).await?;
+        let meta = result.meta.map(|meta| Value::Object(meta.0)).unwrap_or_default();
+        let output = result.structured_content.ok_or_else(|| test_error(format!("{tool} returned no output")))?;
+        Ok((output, meta))
     }
 }
 
-pub async fn connect_lsp(
-    project: &impl TestProject,
-) -> (RunningService<RoleServer, CodingMcp>, RunningService<RoleClient, ClientConfig>) {
-    let server = CodingMcp::new().with_lsp(project.root().to_path_buf());
-    connect(server, test_client_info()).await.expect("Failed to connect")
+pub(crate) fn test_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(message.into())
 }
 
-pub async fn call_tool_error(
-    client: &RunningService<RoleClient, ClientConfig>,
-    name: &str,
-    args: serde_json::Value,
-) -> String {
-    match client
-        .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args.as_object().unwrap().clone()))
-        .await
-    {
+/// An isolated workspace connected to a `CodingMcp` through the public MCP protocol.
+pub(crate) struct CodingWorkspace {
+    pub client: McpClient,
+    // Fields drop in order: stop the daemon before deleting the files it watches.
+    daemon: Option<TestDaemon>,
+    workspace: TestWorkspace,
+}
+
+impl CodingWorkspace {
+    pub(crate) async fn new() -> Self {
+        Self::with(TestWorkspace::new(), |root| CodingMcp::new(root)).await
+    }
+
+    pub(crate) async fn with_lsp(workspace: TestWorkspace) -> Self {
+        Self::with(workspace, |root| CodingMcp::new(root).with_lsp()).await
+    }
+
+    pub(crate) async fn with_daemon(workspace: TestWorkspace, daemon: TestDaemonBuilder) -> Self {
+        let daemon = daemon.spawn().expect("Failed to start LSP daemon");
+        Self { daemon: Some(daemon), ..Self::with_lsp(workspace).await }
+    }
+
+    pub(crate) async fn advance_daemon_time(&self, duration: Duration) {
+        self.daemon.as_ref().expect("workspace has a daemon").advance_time(duration).await;
+    }
+
+    pub(crate) async fn with_http(http: FakeHttpClient) -> Self {
+        Self::with(TestWorkspace::new(), |root| CodingMcp::new(root).with_web_fetcher(WebFetcher::with_client(http)))
+            .await
+    }
+
+    pub(crate) async fn with(workspace: TestWorkspace, configure: impl FnOnce(&Path) -> CodingMcp) -> Self {
+        let client = connect(configure(workspace.root()), ClientOptions::default()).await;
+        Self { workspace, client, daemon: None }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.workspace.root()
+    }
+
+    pub(crate) fn path(&self, relative_path: impl AsRef<Path>) -> PathBuf {
+        self.workspace.path(relative_path)
+    }
+
+    pub(crate) fn write(&self, relative_path: impl AsRef<Path>, content: &str) -> PathBuf {
+        self.workspace.write(relative_path, content)
+    }
+
+    pub(crate) fn read(&self, relative_path: impl AsRef<Path>) -> TestResult<String> {
+        Ok(read_to_string(self.path(relative_path))?)
+    }
+
+    pub(crate) async fn read_then_edit(&self, relative_path: &str, old: &str, new: &str) -> TestResult {
+        let path = self.path(relative_path);
+        self.client.call("read_file", json!({ "filePath": path })).await?;
+        self.client
+            .call("edit_file", json!({ "filePath": path, "edits": [{ "oldString": old, "newString": new }] }))
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn check_errors(&self, relative_path: &str) -> TestResult<Value> {
+        self.client.call("lsp_check_errors", json!({ "filePath": self.path(relative_path) })).await
+    }
+
+    pub(crate) async fn poll_workspace_errors(&self, predicate: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            if let Ok(result) = self.client.call("lsp_check_errors", json!({})).await
+                && predicate(&result)
+            {
+                return result;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+pub(crate) async fn call_tool_error(client: &McpClient, name: &str, args: Value) -> String {
+    match client.call_raw(name, args).await {
         Ok(result) => {
             assert!(result.is_error.unwrap_or(false), "tool call should fail: {result:?}");
             let content = result.content.first().expect("Expected error content");
@@ -169,118 +177,66 @@ pub async fn call_tool_error(
     }
 }
 
-pub async fn call_tool(
-    client: &RunningService<RoleClient, ClientConfig>,
-    name: &str,
-    args: serde_json::Value,
-) -> serde_json::Value {
-    try_call_tool(client, name, args).await.unwrap_or_else(|| panic!("Tool '{name}' did not return valid JSON"))
+pub(crate) async fn call_task(client: &McpClient, tool: &str, arguments: Value) -> TestResult<CallToolResult> {
+    let response = client.peer().call_tool_once(tool_request(tool, arguments)).await?;
+    let CallToolResponse::Task(created) = response else {
+        return Err(test_error(format!("expected task response: {response:?}")).into());
+    };
+    assert_eq!(created.task.status, TaskStatus::Working);
+
+    let task = await_terminal_task(client, &created.task.task_id).await?;
+    let TaskPayload::Completed { result } = task.payload else {
+        return Err(test_error(format!("expected completed task: {task:?}")).into());
+    };
+    Ok(serde_json::from_value(Value::Object(result))?)
 }
 
-pub async fn try_call_tool(
-    client: &RunningService<RoleClient, ClientConfig>,
-    name: &str,
-    args: serde_json::Value,
-) -> Option<serde_json::Value> {
-    let result = match client
-        .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args.as_object().unwrap().clone()))
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("[try_call_tool] {name} RPC error: {error}");
-            return None;
-        }
-    };
-    let Some(text) = result.content.first().and_then(|c| c.as_text()) else {
-        eprintln!("[try_call_tool] {name} no text content in response");
-        return None;
-    };
-    if let Ok(value) = serde_json::from_str(&text.text) {
-        Some(value)
-    } else {
-        eprintln!("[try_call_tool] {name} non-JSON response: {}", text.text);
-        None
-    }
-}
-
-pub async fn poll_diagnostics(
-    client: &RunningService<RoleClient, ClientConfig>,
-    file_path: Option<&str>,
-    predicate: impl Fn(&serde_json::Value) -> bool,
-) -> serde_json::Value {
-    let args = match file_path {
-        Some(path) => serde_json::json!({ "filePath": path }),
-        None => serde_json::json!({}),
-    };
-    poll_lsp_tool(client, "lsp_check_errors", args, predicate).await
-}
-
-pub async fn poll_lsp_tool(
-    client: &RunningService<RoleClient, ClientConfig>,
-    tool_name: &str,
-    args: serde_json::Value,
-    predicate: impl Fn(&serde_json::Value) -> bool,
-) -> serde_json::Value {
-    let start = Instant::now();
-    let mut last_result = None;
-    while start.elapsed() < POLL_TIMEOUT {
-        if let Some(result) = try_call_tool(client, tool_name, args.clone()).await {
-            if predicate(&result) {
-                return result;
-            }
-            last_result = Some(result);
+pub(crate) async fn await_terminal_task(client: &McpClient, task_id: &str) -> TestResult<DetailedTask> {
+    loop {
+        let task = client.peer().get_task(GetTaskParams::new(task_id.to_string())).await?.task;
+        if task.status().is_terminal() {
+            return Ok(task);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!(
-        "poll_lsp_tool({tool_name}) timed out after {POLL_TIMEOUT:?}. Last result: {}",
-        last_result.as_ref().map_or_else(|| "(no valid response)".to_string(), ToString::to_string)
-    );
 }
 
-fn error_count(result: &serde_json::Value) -> Option<u64> {
+fn error_count(result: &Value) -> Option<u64> {
     result.get("summary")?.get("errors")?.as_u64()
 }
 
-pub fn has_errors(result: &serde_json::Value) -> bool {
+pub(crate) fn cargo_project(name: &str) -> TestWorkspace {
+    let manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    TestWorkspace::new()
+        .file("Cargo.toml", manifest)
+        .file("src/main.rs", "fn main() {\n    println!(\"Hello, world!\");\n}\n")
+}
+
+pub(crate) fn node_project(name: &str) -> TestWorkspace {
+    let package = format!("{{\n  \"name\": \"{name}\",\n  \"version\": \"0.1.0\"\n}}");
+    let tsconfig = "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"noEmit\": true\n  }\n}";
+    let project =
+        TestWorkspace::new().file("package.json", package).file("tsconfig.json", tsconfig).file("src/index.ts", "");
+    let args = ["install", "--save-dev", "--no-audit", "--no-fund", "--prefer-offline", TYPESCRIPT_PACKAGE];
+    let output = Command::new("npm").args(args).current_dir(project.root()).output().expect("failed to run npm");
+    assert!(output.status.success(), "npm {} failed:\n{}", args.join(" "), String::from_utf8_lossy(&output.stderr));
+    project
+}
+
+pub(crate) fn has_errors(result: &Value) -> bool {
     error_count(result).is_some_and(|n| n > 0)
 }
 
-pub fn has_no_errors(result: &serde_json::Value) -> bool {
+pub(crate) fn has_no_errors(result: &Value) -> bool {
     error_count(result).is_some_and(|n| n == 0)
 }
 
-pub async fn cleanup_daemon(project: &impl TestProject) {
-    use aether_lspd::{LanguageId, socket_path};
-    for lang in [LanguageId::Rust, LanguageId::TypeScript] {
-        let sock = socket_path(project.root(), lang);
-        let _ = tokio::fs::remove_file(&sock).await;
-        let _ = tokio::fs::remove_file(sock.with_extension("lock")).await;
-        let _ = tokio::fs::remove_file(sock.with_extension("log")).await;
-    }
-}
-
-/// Creates files and directories (including parents) from `(path, content)`
-/// pairs inside a fresh temp dir.
-pub fn create_test_files(files: &[(&str, &str)]) -> TempDir {
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    for (path, content) in files {
-        let full_path = temp_dir.path().join(path);
-        if let Some(parent) = full_path.parent() {
-            create_dir_all(parent).unwrap_or_else(|_| panic!("Failed to create directory for {path}"));
-        }
-        std::fs::write(&full_path, content).unwrap_or_else(|_| panic!("Failed to write file {path}"));
-    }
-    temp_dir
-}
-
 /// A skills server serving the `skills` directory of `test_dir`.
-pub fn skills_server(test_dir: &Path) -> SkillsMcp {
-    SkillsMcp::new(&[test_dir.join("skills")])
+pub(crate) fn skills_server(test_dir: &Path) -> SkillsMcp {
+    SkillsMcp::new(test_dir, &[test_dir.join("skills")])
 }
 
-pub fn load_skills_input(requests: &[(&str, Option<&str>)]) -> LoadSkillsInput {
+pub(crate) fn load_skills_input(requests: &[(&str, Option<&str>)]) -> LoadSkillsInput {
     LoadSkillsInput {
         requests: requests
             .iter()

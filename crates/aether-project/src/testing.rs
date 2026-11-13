@@ -3,28 +3,29 @@
 //! Compiled for the crate's own tests and for any consumer that enables the
 //! `testing` feature. Prefer these over hand-rolling per-suite fixtures.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
-use crate::{AgentConfig, PromptSource, SKILL_FILENAME};
+use crate::prompt_file::{PromptFile, PromptTriggers};
+use crate::{AetherSettings, AgentConfig, McpSourceSpec, PromptSource};
 use aether_core::agent_spec::{AgentSpec, AgentSpecExposure};
-use llm::{ModelSettings, ProviderConnectionOverrides};
-use mcp_utils::client::ToolFilter;
+use aether_core::core::Prompt;
+pub use utils::testing::TestWorkspace;
 
 /// The model id every shared agent fixture resolves to.
 pub const DEFAULT_MODEL: &str = "anthropic:claude-sonnet-4-5";
 
-/// A temporary project directory for tests that need on-disk settings, prompts, or skills.
-pub fn project() -> TestProject {
-    TestProject { root: temp_dir("project") }
+pub fn mcp_json(server: &str) -> String {
+    json!({ "servers": { server: { "command": format!("{server}-server") } } }).to_string()
 }
 
-/// A temporary user home directory for tests that exercise `AETHER_HOME` lookups.
-pub fn home() -> TestHome {
-    TestHome { root: temp_dir("home") }
+pub fn project() -> TestWorkspace {
+    TestWorkspace::new()
+}
+
+pub fn home() -> TestWorkspace {
+    TestWorkspace::new()
 }
 
 /// A minimal user-invocable [`AgentConfig`] as it would be parsed from `settings.json`.
@@ -65,91 +66,110 @@ pub fn agent_config(name: &str) -> AgentConfig {
     AgentConfig { prompts: vec![PromptSource::file("PROMPT.md")], ..settings_agent(name, &format!("{name} agent")) }
 }
 
+pub fn settings_with_mcps(mcps: Vec<McpSourceSpec>) -> AetherSettings {
+    AetherSettings { agents: vec![AgentConfig { mcps, ..agent_config("alpha") }], ..AetherSettings::default() }
+}
+
+pub fn has_prompt_file(spec: &AgentSpec, expected: impl AsRef<Path>) -> bool {
+    spec.prompts.iter().any(|prompt| matches!(prompt, Prompt::File { path, .. } if path.ends_with(&expected)))
+}
+
+/// A [`PromptFile`] with valid defaults, built fluently for tests that exercise
+/// skill parsing, writing, and rating behavior.
+pub fn prompt_file(name: &str) -> PromptFileBuilder {
+    PromptFileBuilder {
+        file: PromptFile {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            body: format!("# {name}\n\nSkill body."),
+            path: PathBuf::new(),
+            user_invocable: true,
+            agent_invocable: true,
+            argument_hint: None,
+            tags: Vec::new(),
+            triggers: PromptTriggers::default(),
+            agent_authored: false,
+            helpful: 0,
+            harmful: 0,
+        },
+    }
+}
+
 /// A minimal [`AgentSpec`] with the given name and exposure.
 pub fn fake_spec(name: &str, exposure: AgentSpecExposure) -> AgentSpec {
     AgentSpec {
         name: name.to_string(),
         description: format!("{name} agent"),
         model: DEFAULT_MODEL.to_string(),
-        fallback_model: None,
-        reasoning_effort: None,
-        model_settings: ModelSettings::default(),
-        context_window: None,
-        max_turns: None,
-        prompts: vec![],
-        provider_connections: ProviderConnectionOverrides::default(),
-        mcp_config_sources: Vec::new(),
         exposure,
-        tools: ToolFilter::default(),
-        tool_output: None,
+        ..AgentSpec::default()
     }
 }
 
-/// A temporary project directory whose files are set up fluently.
-pub struct TestProject {
-    root: TempDir,
+/// A fluent builder for test [`PromptFile`]s; see [`prompt_file`].
+pub struct PromptFileBuilder {
+    file: PromptFile,
 }
 
-impl TestProject {
-    /// The project root path.
-    pub fn root(&self) -> &Path {
-        self.root.path()
-    }
-
-    /// Writes `content` to `path` relative to the project root, creating parent directories.
-    pub fn file(self, path: &str, content: &str) -> Self {
-        self.write(path, content);
+impl PromptFileBuilder {
+    /// The skill description shown to users selecting the skill.
+    pub fn description(mut self, description: &str) -> Self {
+        self.file.description = description.to_string();
         self
     }
 
-    /// Writes `content` to `<name>/SKILL.md`, creating the skill directory.
-    pub fn skill(self, name: &str, content: &str) -> Self {
-        self.file(&format!("{name}/{SKILL_FILENAME}"), content)
-    }
-
-    /// Writes a file after the fixture exists, e.g. to exercise a state transition.
-    pub fn write(&self, path: &str, content: &str) {
-        write_file(self.root.path(), path, content);
-    }
-}
-
-/// A temporary home directory whose `.aether` contents are set up fluently.
-pub struct TestHome {
-    root: TempDir,
-}
-
-impl TestHome {
-    /// The `.aether` directory inside this home.
-    pub fn aether(&self) -> PathBuf {
-        self.root.path().join(".aether")
-    }
-
-    /// The home root path.
-    pub fn root(&self) -> &Path {
-        self.root.path()
-    }
-
-    /// Writes `content` to `path` relative to the home root, creating parent directories.
-    pub fn file(self, path: &str, content: &str) -> Self {
-        write_file(self.root.path(), path, content);
+    /// The skill body below the frontmatter.
+    pub fn body(mut self, body: &str) -> Self {
+        self.file.body = body.to_string();
         self
     }
 
-    /// Writes user settings to `.aether/settings.json`.
-    pub fn settings(self, json: &str) -> Self {
-        self.file(".aether/settings.json", json)
-    }
-}
-
-fn temp_dir(label: &str) -> TempDir {
-    TempDir::new().unwrap_or_else(|error| panic!("failed to create temp {label} dir: {error}"))
-}
-
-fn write_file(root: &Path, path: &str, content: &str) {
-    let full_path = root.join(path);
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).expect("failed to create fixture parent directories");
+    /// Whether the user can invoke the skill as a slash command.
+    pub fn user_invocable(mut self, user_invocable: bool) -> Self {
+        self.file.user_invocable = user_invocable;
+        self
     }
 
-    fs::write(full_path, content).expect("failed to write fixture file");
+    /// Whether the agent can invoke the skill on its own.
+    pub fn agent_invocable(mut self, agent_invocable: bool) -> Self {
+        self.file.agent_invocable = agent_invocable;
+        self
+    }
+
+    /// The argument hint shown to users when invoking the skill.
+    pub fn argument_hint(mut self, argument_hint: &str) -> Self {
+        self.file.argument_hint = Some(argument_hint.to_string());
+        self
+    }
+
+    /// The skill's tags.
+    pub fn tags(mut self, tags: &[&str]) -> Self {
+        self.file.tags = tags.iter().map(ToString::to_string).collect();
+        self
+    }
+
+    /// Read-trigger glob patterns activating the skill when matching files are read.
+    pub fn read_triggers(mut self, patterns: &[&str]) -> Self {
+        self.file.triggers = PromptTriggers::new(patterns.iter().map(ToString::to_string).collect())
+            .expect("read_triggers patterns must be valid globs");
+        self
+    }
+
+    /// Whether the agent authored this skill.
+    pub fn agent_authored(mut self, agent_authored: bool) -> Self {
+        self.file.agent_authored = agent_authored;
+        self
+    }
+
+    /// The helpful/harmful rating counts collected for this skill.
+    pub fn ratings(mut self, helpful: u32, harmful: u32) -> Self {
+        self.file.helpful = helpful;
+        self.file.harmful = harmful;
+        self
+    }
+
+    /// The finished [`PromptFile`].
+    pub fn build(self) -> PromptFile {
+        self.file
+    }
 }

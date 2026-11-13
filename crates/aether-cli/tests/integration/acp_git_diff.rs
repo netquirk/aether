@@ -1,11 +1,12 @@
 use acp_utils::notifications::{GitDiffClosePayload, GitDiffCommandPayload, WorkspaceStatusPayload};
 use aether_cli::acp::testing::AcpTestHarness;
-use aether_cli::workspace::testing::{git, init_repo};
-use agent_client_protocol::schema::v2::AbsolutePath;
+use aether_cli::workspace::testing::init_repo;
+use agent_client_protocol::v2::schema::AbsolutePath;
 use clankerdiff_core::{DiffScope, RepositoryAction};
 use clankerdiff_protocol::client::ClientCommand;
 use clankerdiff_protocol::shared::{DocumentUpdate, Event, FileEntry, LIVE_PROTOCOL_VERSION};
 use std::fs;
+use utils::testing::git;
 
 #[tokio::test(flavor = "current_thread")]
 async fn git_diff_open_publishes_snapshot_over_duplex() {
@@ -21,12 +22,16 @@ async fn git_diff_open_publishes_snapshot_over_duplex() {
         let Event::Document(update) = next_event(&mut harness).await else {
             panic!("open must publish a document");
         };
-        assert_eq!(update.scope, DiffScope::Both);
+        assert_eq!(update.target, DiffScope::Both.into());
         assert!(
             changed_paths(&update).iter().any(|path| path == "changed.txt"),
             "unexpected files: {:?}",
             changed_paths(&update)
         );
+        let Event::Files(files) = next_event(&mut harness).await else {
+            panic!("open must list the worktree's files");
+        };
+        assert!(files.iter().any(|path| path.as_str() == "changed.txt"), "unexpected listing: {files:?}");
         close(&harness, "s1");
     })
     .await;
@@ -45,12 +50,13 @@ async fn git_diff_refresh_tracks_scope_and_reports_status_ref() {
         initialize(&harness, "s1", DiffScope::Both);
         let _ = next_event(&mut harness).await;
         let _ = next_event(&mut harness).await;
+        let _ = next_event(&mut harness).await;
 
-        send(&harness, "s1", ClientCommand::SetScope(DiffScope::Staged));
+        send(&harness, "s1", ClientCommand::SetTarget(DiffScope::Staged.into()));
         let Event::Document(update) = next_event(&mut harness).await else {
             panic!("set scope must publish a document");
         };
-        assert_eq!(update.scope, DiffScope::Staged);
+        assert_eq!(update.target, DiffScope::Staged.into());
         assert!(changed_paths(&update).iter().any(|path| path == "committed.txt"), "staged change must be visible");
         assert!(matches!(next_event(&mut harness).await, Event::RequestResult(Ok(()))));
 
@@ -60,7 +66,7 @@ async fn git_diff_refresh_tracks_scope_and_reports_status_ref() {
             .block_task()
             .await
             .expect("status succeeds");
-        assert!(!status.display_dir.is_empty());
+        assert_ne!(status.display_dir, "");
     })
     .await;
 }
@@ -75,6 +81,7 @@ async fn git_diff_apply_stage_commit_reaches_clean_tree() {
         live(&harness, "s1", &repo).await;
 
         initialize(&harness, "s1", DiffScope::Both);
+        let _ = next_event(&mut harness).await;
         let _ = next_event(&mut harness).await;
         let _ = next_event(&mut harness).await;
 
@@ -132,7 +139,7 @@ async fn git_diff_commands_for_unknown_sessions_are_ignored() {
 }
 
 async fn live(harness: &AcpTestHarness, session_id: &str, cwd: &std::path::Path) {
-    use agent_client_protocol::schema::v2::ResumeSessionRequest;
+    use agent_client_protocol::v2::schema::ResumeSessionRequest;
     harness
         .client_cx
         .send_request(ResumeSessionRequest::new(session_id, AbsolutePath::new(cwd)))
@@ -142,7 +149,11 @@ async fn live(harness: &AcpTestHarness, session_id: &str, cwd: &std::path::Path)
 }
 
 fn initialize(harness: &AcpTestHarness, session_id: &str, scope: DiffScope) {
-    send(harness, session_id, ClientCommand::Initialize { protocol_version: LIVE_PROTOCOL_VERSION, scope });
+    send(
+        harness,
+        session_id,
+        ClientCommand::Initialize { protocol_version: LIVE_PROTOCOL_VERSION, target: scope.into() },
+    );
 }
 
 fn close(harness: &AcpTestHarness, session_id: &str) {

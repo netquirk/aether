@@ -1,8 +1,7 @@
 //! Tests for [`ToolPolicy`](aether_core::core::ToolPolicy): a tool call that the
 //! policy refuses must surface on the event stream as
-//! [`ToolEvent::Refused`](aether_core::events::ToolEvent::Refused), record the
-//! refusal reason in the conversation context, and place a synthetic tool result
-//! in the assistant turn so the next LLM call has something to react to.
+//! [`ToolEvent::Refused`](aether_core::events::ToolEvent::Refused) and record the
+//! refusal reason in the conversation context, so the next LLM call can react.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -64,15 +63,9 @@ async fn refused_tool_call_emits_refused_event_with_reason() -> Result<(), Box<d
     assert_eq!(refused_request.arguments, tool_request.to_string());
     assert_eq!(refused_reason, "bash is not permitted by policy");
 
-    // No tool actually executed; the trace must NOT contain an ExecutionStarted event
-    // for the refused call, nor any Result/Error.
+    // No tool actually executed: the refused call must not produce a tool
+    // result or a tool error.
     let observer_events = events.lock().unwrap();
-    assert!(
-        !observer_events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::Tool(ToolEvent::ExecutionStarted { tool_id, .. }) if tool_id == "call_1")),
-        "refused call must not be marked as executing"
-    );
     assert!(
         !observer_events
             .iter()
@@ -108,7 +101,7 @@ async fn refused_tool_call_records_refusal_in_context_for_next_turn() -> Result<
         .run_with_context()
         .await?;
 
-    let contexts = result.captured_contexts.lock().unwrap();
+    let contexts = &result.contexts;
     assert!(contexts.len() >= 2, "expected at least two LLM calls (initial and after refusal)");
 
     let second_context = &contexts[1];
@@ -132,7 +125,6 @@ async fn refused_tool_call_records_refusal_in_context_for_next_turn() -> Result<
 #[tokio::test]
 async fn tool_policy_that_returns_none_lets_the_call_proceed() -> Result<(), Box<dyn Error>> {
     let tool_request = json!({ "a": 1, "b": 2 });
-    let _tool_result = json!({ "sum": 3 });
     let llm_responses = [
         llm_response().tool_call("call_1", "test__add_numbers", &[&tool_request.to_string()]).build(),
         llm_response().text(&["the sum is 3"]).build(),

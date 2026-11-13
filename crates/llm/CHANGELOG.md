@@ -2,6 +2,135 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.19](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.18...aether-llm-v0.9.19) - 2026-11-03
+
+### Added
+
+- add gpt-6.1-terra to codex subscription models ([#642](https://github.com/contextbridge/aether/pull/642))
+- ACP native subagents ([#627](https://github.com/contextbridge/aether/pull/627))
+
+### Other
+
+- Update models ([#638](https://github.com/contextbridge/aether/pull/638))
+- Update models ([#628](https://github.com/contextbridge/aether/pull/628))
+
+## [0.9.18](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.17...aether-llm-v0.9.18) - 2026-10-20
+
+### Fixed
+
+- *(llm)* send adaptive thinking to Claude and replay reasoning in order ([#622](https://github.com/contextbridge/aether/pull/622))
+
+## [0.9.17](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.16...aether-llm-v0.9.17) - 2026-10-20
+
+### Fixed
+
+- *(aether-telemetry)* mark cache token reporting as inclusive for PostHog ([#613](https://github.com/contextbridge/aether/pull/613))
+
+## [0.9.16](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.15...aether-llm-v0.9.16) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-auth, aether-llm-codegen
+
+## [0.9.15](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.14...aether-llm-v0.9.15) - 2026-10-19
+
+### Fixed
+
+- share provider connections and credentials across agents ([#607](https://github.com/contextbridge/aether/pull/607))
+
+### Other
+
+- Update models ([#608](https://github.com/contextbridge/aether/pull/608))
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.9.14](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.13...aether-llm-v0.9.14) - 2026-10-12
+
+### Added
+
+- Support sigv4 auth mechanism for MCP servers. ([#597](https://github.com/contextbridge/aether/pull/597))
+
+### Other
+
+- Update models ([#594](https://github.com/contextbridge/aether/pull/594))
+
+## [0.9.13](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.12...aether-llm-v0.9.13) - 2026-10-10
+
+### Fixed
+
+- Provider stream stalls hangs the agent loop ([#590](https://github.com/contextbridge/aether/pull/590))
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.9.12](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.11...aether-llm-v0.9.12) - 2026-10-08
+
+### Fixed
+
+- *(llm)* finalize responses streams at terminal events ([#584](https://github.com/contextbridge/aether/pull/584))
+
+### Other
+
+- unify LLM provider stream assembly ([#583](https://github.com/contextbridge/aether/pull/583))
+
+## [0.9.11](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.10...aether-llm-v0.9.11) - 2026-10-05
+
+### Other
+
+- Update models ([#570](https://github.com/contextbridge/aether/pull/570))
+
+## [0.9.10](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.9...aether-llm-v0.9.10) - 2026-10-03
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm-codegen
+
+## [0.9.9](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.8...aether-llm-v0.9.9) - 2026-10-01
+
+### Added
+
+- add gpt-6.1-sol to codex subscription models ([#548](https://github.com/contextbridge/aether/pull/548))
+
+### Fixed
+
+- support bedrock gpt-6.1-sol routing and clean up dependencies ([#553](https://github.com/contextbridge/aether/pull/553))
+- enable codex parallel tool calls through typed request policy ([#550](https://github.com/contextbridge/aether/pull/550))
+
+### Other
+
+- Update models ([#552](https://github.com/contextbridge/aether/pull/552))
+- Update models ([#547](https://github.com/contextbridge/aether/pull/547))
+
+## [0.9.8](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.7...aether-llm-v0.9.8) - 2026-09-28
+
+### Other
+
+- Update models ([#534](https://github.com/contextbridge/aether/pull/534))
+
+## [0.9.7](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.6...aether-llm-v0.9.7) - 2026-09-27
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm-codegen
+
+## [0.9.6](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.5...aether-llm-v0.9.6) - 2026-09-24
+
+### Fixed
+
+- route Bedrock US GPT-6 profiles through Runtime Responses ([#517](https://github.com/contextbridge/aether/pull/517))
+
+## [0.9.5](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.4...aether-llm-v0.9.5) - 2026-09-23
+
+### Added
+
+- *(llm)* add Xiaomi provider ([#505](https://github.com/contextbridge/aether/pull/505))
+- add Codex GPT-6 subscription models ([#513](https://github.com/contextbridge/aether/pull/513))
+
+### Other
+
+- *(deps)* bump async-openai from 0.41.3 to 0.42.0 ([#510](https://github.com/contextbridge/aether/pull/510))
+
 ## [0.9.4](https://github.com/contextbridge/aether/compare/aether-llm-v0.9.3...aether-llm-v0.9.4) - 2026-09-21
 
 ### Other

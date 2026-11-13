@@ -1,20 +1,15 @@
 mod common;
 
+mod builtin_servers;
 mod coding_mcp_tools;
 mod coding_permissions;
 mod lsp_check_errors_contract;
-mod lsp_diagnostics_e2e;
-mod lsp_operations_e2e;
-mod lsp_ts_diagnostics_e2e;
-mod lsp_ts_operations_e2e;
-mod lsp_workspace_search_contract;
+mod lsp_smoke_real;
 mod plugins_mcp_agents;
 mod plugins_mcp_skills;
 mod review_mcp;
-mod skills_self_improvement;
 mod stdio_transport;
 mod test_bash;
 mod test_read_before_edit_safety;
 mod test_read_file_rule_meta;
 mod test_web_fetch;
-mod tool_output_cap_e2e;

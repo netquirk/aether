@@ -1,9 +1,7 @@
 //! LSP-specific error types
 
-use aether_lspd::{ClientError, UriError};
+use clankerdiff_lspd::{ClientError, UriError};
 use thiserror::Error;
-
-use crate::search::SearchError;
 
 #[doc = include_str!("../docs/lsp_error.md")]
 #[derive(Debug, Error)]
@@ -36,20 +34,9 @@ pub enum LspError {
     #[error("Invalid source position: {0}")]
     InvalidPosition(String),
 
-    /// The requested query was empty or otherwise invalid.
-    #[error("Invalid query: {0}")]
-    InvalidQuery(String),
-
     /// An LSP edit produced an invalid or unsupported change.
     #[error("Invalid edit: {0}")]
     InvalidEdit(String),
-
-    /// A backing file search failed.
-    #[error("Search error: {0}")]
-    Search(#[from] SearchError),
-
-    #[error("Transport error: {0}")]
-    Transport(String),
 }
 
 impl From<UriError> for LspError {
@@ -57,6 +44,3 @@ impl From<UriError> for LspError {
         Self::InvalidPath(error.to_string())
     }
 }
-
-/// Result type alias for LSP operations
-pub type Result<T> = std::result::Result<T, LspError>;

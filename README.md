@@ -136,22 +136,24 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
        events::{AgentEvent, Command, MessageEvent, TurnEvent, TurnOutcome},
        mcp::mcp,
    };
-   use llm::providers::anthropic::AnthropicProvider;
+   use llm::providers::generic::{ANTHROPIC, GenericProvider};
+   use aether_core::mcp::McpConfig;
    use std::io::{self, Write};
 
    #[tokio::main]
    async fn main() -> Result<(), Box<dyn std::error::Error>> {
        // 1. Create a provider (reads ANTHROPIC_API_KEY from env)
-       let llm = AnthropicProvider::new(None)?;
+       let llm = GenericProvider::from_env(&ANTHROPIC)?;
 
-       // 2. Spawn MCP tool servers from one or more mcp.json files
-       let mut mcp_runtime = mcp(".").from_json_files(&["mcp.json"])?.spawn().await?;
-       let snapshot = mcp_runtime.block_until_ready().await.ok_or("MCP bootstrap aborted")?;
+       // 2. Spawn MCP tool servers from an mcp.json file
+       let config = McpConfig::from_json_file("mcp.json")?;
+       let mcp = mcp(".").with_config(config)?.spawn()?;
+       mcp.ready().await;
 
        // 3. Build and spawn the agent
        let (tx, mut rx, _handle) = agent(llm)
            .system_prompt(Prompt::file("AGENTS.md", "."))
-           .tools(mcp_runtime.handle().clone(), snapshot.tool_definitions())
+           .mcp(mcp)
            .spawn()
            .await?;
 
@@ -164,7 +166,7 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
                    if !is_complete { print!("{chunk}"); io::stdout().flush()?; }
                }
                Some(AgentEvent::Turn(TurnEvent::Ended { outcome })) => {
-                   if let TurnOutcome::Failed { error } = outcome { eprintln!("Error: {error}"); }
+                   if let TurnOutcome::Failed { error, .. } = outcome { eprintln!("Error: {error}"); }
                    break;
                }
                _ => {}
@@ -184,9 +186,8 @@ Use `aether-agent-core` as a Rust library to build your own agent in ~25 lines. 
 | [`llm`](crates/llm) | Multi-provider LLM abstraction ([docs](https://docs.rs/aether-llm)) |
 | [`wisp`](crates/wisp) | Terminal UI for AI agents, built on ACP ([docs](https://aether-agent.io/aether/terminal/overview/)) |
 | [`aether-agent-cli`](crates/aether-cli) | Headless CLI and ACP server for editor integration ([docs](https://aether-agent.io/aether/running/headless/)) |
-| [`mcp-servers`](crates/mcp-servers) | Pre-built MCP tool servers (coding, LSP, skills, tasks, sub-agents, survey) ([docs](https://aether-agent.io/aether/built-in-servers/coding/)) |
+| [`mcp-servers`](crates/mcp-servers) | Pre-built MCP tool servers (coding, skills, tasks, sub-agents, review) ([docs](https://aether-agent.io/aether/built-in-servers/coding/)) |
 | [`aether-evals`](crates/aether-evals) | Automated testing (evals) for LLM agents ([docs](https://docs.rs/aether-evals)) |
-| [`aether-lspd`](crates/aether-lspd) | LSP daemon — shares language servers across agents |
 | [`aether-project`](crates/aether-project) | Project configuration and agent catalog from `.aether/settings.json` |
 
 ## TypeScript packages

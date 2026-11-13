@@ -5,6 +5,13 @@ default:
 run:
     cargo run -p aether-wisp -- -a 'cargo run -p aether-agent-cli acp'
 
+desktop:
+    cargo run -p aether-desktop -- --agent 'cargo run -p aether-agent-cli acp'
+
+desktop-release:
+    cargo build --release -p aether-agent-cli
+    cargo run --release -p aether-desktop -- --agent '{{justfile_directory()}}/target/release/aether acp'
+
 # Build the workspace
 build:
     cargo build
@@ -41,6 +48,9 @@ fmt:
 lint *PKGS:
     cargo clippy --all-targets --all-features {{ if PKGS == "" { "--workspace" } else { PKGS } }} -- -D warnings
 
+desktop-style-check:
+    scripts/desktop-style-check
+
 # Verify checked SQL queries match the session-index schema
 sqlx-check:
     #!/usr/bin/env bash
@@ -62,6 +72,17 @@ doc-test *PKGS:
 # Regenerate the AetherSettings JSON Schema consumed by the website and SDK
 gen-schema:
     cargo run -q -p aether-project --bin aether-settings-schema > packages/website/src/data/aether-settings.schema.json
+
+# Lint the browser ACP client (@aether-agent/browser) for wasm32
+wasm-check:
+    cargo clippy -p aether-browser --target wasm32-unknown-unknown -- -D warnings
+
+# Run the browser ACP client's wasm tests in Node against a fake agent
+wasm-test: (fake-agent "wasm-pack" "test" "--node" "packages/aether-browser")
+
+# Serve a fake agent on the `aether server` port, so the playground runs without a model
+fake-agent *ARGS:
+    cargo run -q -p aether-acp-utils --features testing,websocket --example fake_agent_server -- {{ARGS}}
 
 # Install Node dependencies for the TypeScript SDK
 sdk-install:
@@ -100,10 +121,12 @@ private-lint:
     cargo run -q -p internal-lints --bin private-lint
 
 # Run all CI checks
-ci: fmt-check lint test-ci doc-test doc-check sqlx-check error-lint wait-lint readme-check sdk-version-check private-lint
+ci: fmt-check lint desktop-style-check test-ci doc-test doc-check sqlx-check wasm-check wasm-test error-lint wait-lint readme-check sdk-version-check private-lint
     pnpm fmt-check
     pnpm sdk:typecheck
     pnpm sdk:test
+    pnpm browser:build
+    pnpm browser:typecheck
 
 # Initialize or update cargo-dist configuration and CI workflows
 dist-init:
@@ -144,10 +167,6 @@ sweep-installed:
 # Build the sandbox image from the eval example Dockerfile
 build-sandbox TAG="aether-sandbox:latest":
     docker build -t {{TAG}} -f crates/internal-evals/examples/Dockerfile .
-
-# Run wisp + aether agent inside the sandbox
-run-sandbox:
-    cargo run -p aether-wisp -- -a 'cargo run -p aether-agent-cli -- --sandbox-image aether-sandbox:latest acp'
 
 # Install aether-cli and wisp binaries locally
 install:

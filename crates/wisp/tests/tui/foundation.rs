@@ -1,61 +1,6 @@
 use super::support::*;
 
 #[test]
-fn app_exposes_initial_config_option_selections() {
-    let options =
-        vec![select_option("model", "opus"), select_option("mode", "plan"), select_option("reasoning", "high")];
-    let app = TestUiBuilder::new().config_options(options).build();
-
-    let selections: Vec<_> = app
-        .app()
-        .config_options()
-        .iter()
-        .map(|option| (option.id.as_str(), option.current_value().expect("expected select option")))
-        .collect();
-
-    assert_eq!(selections, [("model", "opus"), ("mode", "plan"), ("reasoning", "high")]);
-}
-
-#[test]
-fn config_option_update_replaces_current_selections() {
-    let mut app = TestUiBuilder::new().config_options(vec![select_option("model", "opus")]).build();
-
-    app.acp_event(session_update(acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(vec![
-        select_option("model", "sonnet"),
-        select_option("mode", "code"),
-    ]))));
-
-    assert_eq!(app.app().config_options().len(), 2);
-    assert_eq!(app.app().config_options()[0].current_value(), Some("sonnet"));
-}
-
-#[test]
-fn auth_methods_update_replaces_current_auth_methods() {
-    let initial = vec![acp::AuthMethod::Agent(acp::AuthMethodAgent::new("initial", "Initial"))];
-    let mut app = TestUiBuilder::new().auth_methods(initial).build();
-    let updated = vec![acp::AuthMethod::Agent(acp::AuthMethodAgent::new("updated", "Updated"))];
-
-    app.acp_event(AcpEvent::AuthMethodsUpdated(AuthMethodsUpdatedParams { auth_methods: updated }));
-
-    assert_eq!(app.app().auth_methods().len(), 1);
-    assert_eq!(app.app().auth_methods()[0].method_id().0.as_ref(), "updated");
-}
-
-#[test]
-fn composer_soft_wraps_and_tracks_cursor() {
-    let mut composer = Composer::new();
-    composer.insert_str("abcdefgh");
-    composer.move_left();
-    composer.move_left();
-
-    let layout = composer.layout(6, &Theme::default());
-
-    assert_eq!(layout.lines.len(), 4);
-    assert_eq!(layout.cursor.x, 4);
-    assert_eq!(layout.cursor.y, 2);
-}
-
-#[test]
 fn composer_moves_vertically_before_recalling_history() {
     let mut composer = Composer::new();
     composer.insert_str("one\nsecond");
@@ -73,20 +18,18 @@ fn command_picker_filters_and_applies_selected_command() {
     let mut composer = Composer::new();
     composer.insert_char('/');
     composer.open_command_picker(vec![
-        CommandEntry {
+        SlashCommand::Agent(CommandEntry {
             name: "search".to_string(),
             description: "Search the workspace".to_string(),
             has_input: true,
             hint: Some("query".to_string()),
-            builtin: false,
-        },
-        CommandEntry {
+        }),
+        SlashCommand::Agent(CommandEntry {
             name: "status".to_string(),
             description: "Show status".to_string(),
             has_input: false,
             hint: None,
-            builtin: false,
-        },
+        }),
     ]);
     composer.insert_str("sea");
     composer.refresh_overlay_query();
@@ -95,21 +38,16 @@ fn command_picker_filters_and_applies_selected_command() {
     assert!(completion_contains(&mut composer, "/search"));
 
     let selected = composer.accept_command().unwrap();
-    assert_eq!(selected.name, "search");
+    assert_eq!(selected.name(), "search");
     assert_eq!(composer.text(), "/search");
     assert!(!composer.has_completion());
 }
 
 #[test]
 fn file_picker_filters_and_inserts_a_mention() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::create_dir(directory.path().join("src")).unwrap();
-    std::fs::write(directory.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(directory.path().join("README.md"), "# demo\n").unwrap();
-
     let mut composer = Composer::new();
     composer.insert_char('@');
-    open_file_picker(&mut composer, directory.path());
+    open_file_picker(&mut composer, &["src/main.rs", "README.md"]);
     composer.insert_str("main");
     composer.refresh_overlay_query();
 
@@ -124,55 +62,43 @@ fn file_picker_filters_and_inserts_a_mention() {
 
 #[test]
 fn selected_file_is_sent_as_an_acp_resource_attachment() {
-    let mut app = make_app_in("/workspace".into());
-    app.executor_mut().filesystem_mut().write_file("/workspace/context.txt", b"attached context");
+    let mut app = TestUiBuilder::new().file("context.txt", b"attached context").dimensions(160, 15).build();
 
     app.key(key(KeyCode::Char('@')));
-    app.settle_tasks();
     app.key(key(KeyCode::Char('c')));
     app.key(key(KeyCode::Enter));
     assert_eq!(app.app().composer().text(), "@context.txt ");
     app.key(key(KeyCode::Enter));
-    app.settle_tasks();
 
-    let AgentCommand::Prompt { text, content, .. } = app.next_agent_command().unwrap() else {
-        panic!("expected a prompt command");
-    };
-    assert_eq!(text, "@context.txt ");
-    assert!(matches!(content.as_deref(), Some([acp::ContentBlock::Resource(_)])));
-    let mut blocks = vec![acp::ContentBlock::from(text)];
-    blocks.extend(content.unwrap());
-    let expanded = acp_utils::content::map_content_blocks_to_text(blocks);
+    let prompt = app.agent().prompt.try_recv().expect("the agent received the prompt").prompt;
+    assert!(
+        matches!(&prompt[..], [acp::ContentBlock::Text(text), acp::ContentBlock::Resource(_)] if text.text == "@context.txt ")
+    );
+    let expanded = acp_utils::content::map_content_blocks_to_text(&prompt);
     assert!(expanded.contains("attached context"), "the model receives the file contents");
-    app.acp_event(session_update(acp::SessionUpdate::UserMessage(
-        acp::UserMessage::new("attached-user").content(vec![acp::ContentBlock::from(expanded)]),
-    )));
-    app.draw();
     app.assert_viewport_contains("@context.txt");
-    assert!(!app.conversation_text().contains("attached context"));
+    app.assert_viewport_contains(&format!("file://{}", app.workspace().join("context.txt").display()));
+    app.assert_conversation_not_contains("attached context");
 }
 
 #[test]
 fn file_picker_renders_in_the_live_viewport_not_scrollback() {
-    let mut ui = TestUiBuilder::new().working_dir("/workspace").build();
-    ui.executor_mut().filesystem_mut().write_file("/workspace/context.txt", b"attached context");
+    let mut ui = TestUiBuilder::new().file("context.txt", b"attached context").build();
 
     ui.key(key(KeyCode::Char('@')));
-    ui.settle_tasks();
     ui.key(key(KeyCode::Char('c')));
-    ui.draw();
 
-    assert!(ui.viewport_text().contains("context.txt"));
-    assert!(!ui.history_text().contains("context.txt"));
+    ui.assert_viewport_contains("context.txt");
+    ui.assert_history_not_contains("context.txt");
 }
 
 #[test]
 fn composer_history_restores_the_unsubmitted_draft() {
     let mut composer = Composer::new();
     composer.insert_str("first");
-    let (text, pending) = composer.take_submission();
-    assert_eq!(text, "first");
-    assert!(pending.is_empty());
+    let submission = composer.take_submission();
+    assert_eq!(submission.text, "first");
+    assert_eq!(submission.attachments().len(), 0);
     composer.insert_str("draft");
 
     assert!(composer.recall_previous());
@@ -194,7 +120,7 @@ fn composer_edits_unicode_without_splitting_graphemes() {
     composer.insert_newline();
     composer.insert_str("é");
     assert_eq!(composer.cursor_position(), (1, 1));
-    assert_eq!(composer.take_submission().0, "a\né🙂");
+    assert_eq!(composer.take_submission().text, "a\né🙂");
 }
 
 #[test]
@@ -204,8 +130,6 @@ fn markdown_styles_stream_live_and_finalize_once() {
     ui.submit("render markdown");
     ui.acp_event(text_chunk("# Heading\n\n**boldword** and *italicword*"));
 
-    ui.draw();
-
     let conversation = ui.conversation();
     assert!(buffer_text(&conversation).contains("# Heading"));
     assert!(has_cell(&conversation, "H", |cell| cell.fg == heading && cell.modifier.contains(Modifier::BOLD)));
@@ -213,8 +137,6 @@ fn markdown_styles_stream_live_and_finalize_once() {
     assert!(has_cell(&conversation, "i", |cell| cell.modifier.contains(Modifier::ITALIC)));
 
     ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
-    ui.draw();
 
     let conversation = ui.conversation_text();
     assert_eq!(conversation.matches("Heading").count(), 1);
@@ -225,11 +147,7 @@ fn markdown_styles_stream_live_and_finalize_once() {
 fn fenced_code_info_string_is_syntax_highlighted_with_token_colors() {
     let mut ui = TestUi::new();
     let code_background = ui.app().theme().code_bg;
-    ui.submit("show code");
-    ui.acp_event(text_chunk("```rust title=\"example.rs\"\nfn highlighted() {}\n```"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-
-    ui.draw();
+    ui.turn("show code", "```rust title=\"example.rs\"\nfn highlighted() {}\n```");
 
     let conversation = ui.conversation();
     assert!(buffer_text(&conversation).contains("fn highlighted()"));
@@ -259,20 +177,15 @@ fn fenced_code_streamed_across_chunks_is_syntax_highlighted() {
     ui.acp_event(text_chunk("```rust\n"));
     ui.draw();
     ui.acp_event(text_chunk("fn highlighted() {}\n"));
-    ui.draw();
 
     assert!(has_cell(&ui.viewport(), "f", |cell| cell.bg == code_background));
 
     ui.acp_event(text_chunk("```\n"));
     ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
-    ui.draw();
 
     let conversation = ui.conversation();
-    let row = row_containing(&conversation, "fn highlighted()").expect("rendered code line");
-    let cells = (conversation.area.left()..conversation.area.right())
-        .filter_map(|x| conversation.cell((x, row)))
-        .collect::<Vec<_>>();
+    let cells =
+        row_cells(&conversation, row_containing(&conversation, "fn highlighted()").expect("rendered code line"));
     let keyword = cells.iter().find(|cell| cell.symbol() == "f").expect("fn keyword");
     let identifier = cells.iter().find(|cell| cell.symbol() == "h").expect("highlighted identifier");
     assert_eq!(keyword.bg, code_background);
@@ -284,17 +197,11 @@ fn fenced_code_streamed_across_chunks_is_syntax_highlighted() {
 fn fenced_code_line_comment_does_not_consume_following_code() {
     let mut ui = TestUi::new();
     let code_background = ui.app().theme().code_bg;
-    ui.submit("show documented code");
-    ui.acp_event(text_chunk("```python\n# Documentation\nif condition:\n    pass\n```"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-
-    ui.draw();
+    ui.turn("show documented code", "```python\n# Documentation\nif condition:\n    pass\n```");
 
     let conversation = ui.conversation();
     let row = row_containing(&conversation, "if condition").expect("Python conditional after line comment");
-    let cells = (conversation.area.left()..conversation.area.right())
-        .filter_map(|x| conversation.cell((x, row)))
-        .collect::<Vec<_>>();
+    let cells = row_cells(&conversation, row);
     let keyword_color = cells.iter().find(|cell| cell.symbol() == "i").expect("if keyword").fg;
     let identifier_color = cells.iter().find(|cell| cell.symbol() == "c").expect("condition identifier").fg;
     assert_ne!(keyword_color, identifier_color, "line comments must not disable highlighting on following lines");
@@ -310,18 +217,11 @@ fn completed_tool_diff_is_themed_and_rendered_once() {
     ui.acp_event(tool_call("edit-1", "Edit src/main.rs"));
     ui.acp_event(tool_completed_with_diff("edit-1"));
 
-    ui.draw();
-    ui.draw();
-
     let conversation = ui.conversation();
     let text = buffer_text(&conversation);
     assert_eq!(text.matches("old_name").count(), 1);
     assert_eq!(text.matches("new_name").count(), 1);
-    let row_has_background = |row, background| {
-        (conversation.area.left()..conversation.area.right())
-            .filter_map(|x| conversation.cell((x, row)))
-            .any(|cell| cell.bg == background)
-    };
+    let row_has_background = |row, background| row_cells(&conversation, row).iter().any(|cell| cell.bg == background);
     let removed_row = row_containing(&conversation, "old_name").expect("rendered removed diff row");
     let added_row = row_containing(&conversation, "new_name").expect("rendered added diff row");
     assert!(row_has_background(removed_row, removed_background));
@@ -334,8 +234,6 @@ fn wide_diff_uses_side_by_side_layout() {
     ui.submit("edit file");
     ui.acp_event(tool_call("edit-1", "Edit src/main.rs"));
     ui.acp_event(tool_completed_with_diff("edit-1"));
-
-    ui.draw();
 
     let text = buffer_text(&ui.conversation());
     assert!(text.lines().any(|line| line.contains("old_name") && line.contains("new_name")), "{text}");
@@ -352,10 +250,7 @@ fn wide_diff_marks_truncated_panel_content() {
         &format!("new_{}\n", "y".repeat(80)),
     ));
 
-    ui.draw();
-
-    let text = buffer_text(&ui.conversation());
-    assert!(text.contains('…'), "expected visibly truncated split diff:\n{text}");
+    ui.assert_conversation_contains("…");
 }
 
 #[test]
@@ -365,10 +260,7 @@ fn markdown_blockquote_prefixes_inline_code_first_content() {
         ui.app().theme().review().markdown.inline_code_background,
         ui.app().theme().review().diff.background,
     );
-    ui.submit("quote this");
-    ui.acp_event(text_chunk("> `quoted`"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("quote this", "> `quoted`");
 
     let conversation = ui.conversation();
     let row = row_containing(&conversation, "quoted").expect("blockquote content should render");
@@ -382,10 +274,7 @@ fn markdown_blockquote_prefixes_inline_code_first_content() {
 #[test]
 fn markdown_horizontal_rule_uses_available_width() {
     let mut ui = TestUi::with_dimensions(24, 15);
-    ui.submit("add a rule");
-    ui.acp_event(text_chunk("---"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("add a rule", "---");
 
     let conversation = ui.conversation();
     let row = row_containing(&conversation, "─").expect("horizontal rule should render");
@@ -395,10 +284,7 @@ fn markdown_horizontal_rule_uses_available_width() {
 #[test]
 fn transcript_markdown_wraps_at_content_width() {
     let mut ui = TestUi::with_dimensions(13, 15);
-    ui.submit("wrap words");
-    ui.acp_event(text_chunk("alpha beta gamma"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("wrap words", "alpha beta gamma");
 
     let conversation = ui.conversation();
     let alpha = row_containing(&conversation, "alpha").expect("first word should render");
@@ -409,10 +295,7 @@ fn transcript_markdown_wraps_at_content_width() {
 #[test]
 fn transcript_markdown_separates_a_heading_from_its_paragraph() {
     let mut ui = TestUi::with_dimensions(44, 15);
-    ui.submit("heading test");
-    ui.acp_event(text_chunk("# Heading\n\nParagraph text."));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("heading test", "# Heading\n\nParagraph text.");
 
     let conversation = ui.conversation();
     let heading = row_containing(&conversation, "Heading").expect("heading should render");
@@ -425,10 +308,7 @@ fn transcript_markdown_separates_a_heading_from_its_paragraph() {
 #[test]
 fn transcript_wrapping_expands_tabs() {
     let mut ui = TestUi::with_dimensions(8, 15);
-    ui.submit("hello");
-    ui.acp_event(text_chunk("a\tb"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("hello", "a\tb");
 
     let conversation = ui.conversation();
     let a_row = row_containing(&conversation, "a").expect("tab-expanded row should render");
@@ -440,10 +320,7 @@ fn transcript_wrapping_expands_tabs() {
 #[test]
 fn transcript_wrapping_never_exceeds_a_one_column_allocation() {
     let mut ui = TestUi::with_dimensions(5, 15);
-    ui.submit("x");
-    ui.acp_event(text_chunk("界"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("x", "界");
 
     let conversation = ui.conversation();
     assert!(!has_cell(&conversation, "界", |_| true), "the wide glyph must not spill past the one-column allocation");
@@ -457,8 +334,6 @@ fn trailing_newline_does_not_add_an_empty_user_content_row() {
     ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
     ui.key(key(KeyCode::Enter));
 
-    ui.draw();
-
     let styled_rows = rows_with_background(&ui.conversation(), user_background);
     assert_eq!(styled_rows, 3);
 }
@@ -467,10 +342,7 @@ fn trailing_newline_does_not_add_an_empty_user_content_row() {
 fn markdown_renders_lists_strikethrough_and_tables() {
     let mut ui = TestUi::with_dimensions(44, 15);
     let markdown = "- first\n- second\n\n~~removed~~\n\n| Name | Value |\n| --- | --- |\n| alpha | beta |";
-    ui.submit("render table");
-    ui.acp_event(text_chunk(markdown));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
+    ui.turn("render table", markdown);
 
     let conversation = ui.conversation();
     let text = buffer_text(&conversation);
@@ -491,23 +363,18 @@ fn streaming_markdown_reuses_unchanged_renders_and_finalizes_once() {
     ui.submit("stream cache");
 
     ui.acp_event(text_chunk("# First"));
-    ui.draw();
     ui.assert_viewport_contains("# First");
 
     ui.acp_event(text_chunk("\n\nSecond paragraph"));
-    ui.draw();
     ui.assert_viewport_contains("# First");
     ui.assert_viewport_contains("Second paragraph");
 
     // A frame with nothing new draws the same output: the unchanged prefix's
     // render is reused instead of being rebuilt.
     let before = ui.viewport_text();
-    ui.draw();
     assert_eq!(ui.viewport_text(), before);
 
     ui.complete_prompt(acp::StopReason::EndTurn);
-    ui.draw();
-    ui.draw();
 
     let conversation = ui.conversation_text();
     assert_eq!(conversation.matches("# First").count(), 1, "intermediate prefix leaked:\n{conversation}");
@@ -544,25 +411,18 @@ fn theme_loads_semantic_colors_from_json_file() {
 #[test]
 fn markdown_rendering_preserves_semantic_content_and_styles() {
     let mut ui = TestUi::new();
-    ui.submit("markdown rendering");
-    ui.acp_event(text_chunk("# Heading\n\n**bold** and `code`"));
-    ui.complete_prompt(acp::StopReason::EndTurn);
+    ui.turn("markdown rendering", "# Heading\n\n**bold** and `code`");
 
-    ui.draw();
-
-    let conversation = ui.conversation_text();
-    assert!(conversation.contains("Heading"), "heading should be rendered: {conversation}");
-    assert!(conversation.contains("bold"), "bold text should be rendered: {conversation}");
-    assert!(conversation.contains("code"), "inline code should be rendered: {conversation}");
-    assert!(!conversation.contains("**"), "markdown markers should not leak into the terminal: {conversation}");
+    ui.assert_conversation_contains("Heading");
+    ui.assert_conversation_contains("bold");
+    ui.assert_conversation_contains("code");
+    ui.assert_conversation_not_contains("**");
 }
 
 #[test]
 fn syntax_highlighting_and_plain_code_fallback_are_explicit() {
     let theme = Theme::default();
-    let mut highlighter = SyntaxHighlighter::new();
-
-    let highlighted = highlighter.highlight("fn main() { println!(\"hi\"); }", "rust", &theme);
+    let highlighted = highlight("fn main() { println!(\"hi\"); }", "rust", &theme);
     let highlighted_text: String =
         highlighted.iter().flat_map(|line| line.spans.iter()).map(|span| span.content.as_ref()).collect();
     assert_eq!(highlighted_text, "fn main() { println!(\"hi\"); }");
@@ -574,7 +434,7 @@ fn syntax_highlighting_and_plain_code_fallback_are_explicit() {
         "known Rust syntax should receive a semantic highlight style"
     );
 
-    let plain = highlighter.highlight("not highlighted", "not-a-language", &theme);
+    let plain = highlight("not highlighted", "not-a-language", &theme);
     assert_eq!(plain.len(), 1);
     assert_eq!(plain[0].spans[0].content, "not highlighted");
     assert_eq!(plain[0].spans[0].style.fg, Some(theme.code_fg));
@@ -590,15 +450,7 @@ fn invalid_theme_paths_return_errors() {
 #[test]
 fn large_markdown_history_preserves_order_across_scrollback_and_viewport() {
     let mut ui = TestUi::new();
-    let mut markdown = String::new();
-    for index in 0..40 {
-        writeln!(markdown, "paragraph-{index}\n").unwrap();
-    }
-    ui.submit("long response");
-    ui.acp_event(text_chunk(&markdown));
-    ui.complete_prompt(acp::StopReason::EndTurn);
-
-    ui.draw();
+    ui.turn("long response", &numbered_lines("paragraph", 40));
 
     let conversation = ui.conversation();
     let text = buffer_text(&conversation);
@@ -636,20 +488,14 @@ fn one_row_inline_viewport_draws_without_panicking() {
 /// first would briefly show a viewport that does not yet reflect that insertion.
 #[test]
 fn history_is_inserted_before_the_live_viewport_is_drawn() {
-    let mut ui = TestUi::with_backend(RecordingBackend::new(40, 15));
+    let mut ui = TestUi::with_backend(InstrumentedBackend::new(40, 15));
     ui.draw();
-    ui.backend_mut().clear_events();
+    ui.backend_mut().take_events();
 
-    let mut response = String::new();
-    for index in 0..20 {
-        writeln!(response, "line-{index}\n").unwrap();
-    }
-    ui.submit("hello");
-    ui.acp_event(text_chunk(&response));
-    ui.complete_prompt(acp::StopReason::EndTurn);
+    ui.turn("hello", &numbered_lines("line", 20));
     ui.draw();
 
-    let events: Vec<BackendEvent> = ui.backend().events().to_vec();
+    let events = ui.backend_mut().take_events();
     let draw = events.iter().position(|event| *event == BackendEvent::ShowCursor).unwrap();
     let insert = events.iter().position(|event| matches!(event, BackendEvent::Scroll)).unwrap();
     assert!(insert < draw, "expected history insertion before viewport draw: {events:?}");
@@ -666,27 +512,19 @@ fn status_line_is_never_inserted_into_scrollback() {
     ui.draw();
 
     ui.submit("hello");
-    ui.draw();
 
-    let scrollback = ui.history_text();
-    assert!(!scrollback.contains("working"), "{scrollback}");
-    assert!(!scrollback.contains("esc to cancel"), "{scrollback}");
-    assert!(!scrollback.contains("aether"), "{scrollback}");
+    ui.assert_history_not_contains("working");
+    ui.assert_history_not_contains("esc to cancel");
+    ui.assert_history_not_contains("aether");
 }
 
 #[test]
 fn scrollback_insertion_does_not_duplicate_status_line() {
-    let mut ui = TestUi::with_backend(RecordingBackend::new(120, 15));
+    let mut ui = TestUi::with_backend(InstrumentedBackend::new(120, 15));
     ui.acp_event(session_update(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(20_000, 200_000))));
     ui.draw();
 
-    let mut response = String::new();
-    for index in 0..20 {
-        writeln!(response, "line-{index}\n").unwrap();
-    }
-    ui.submit("hello");
-    ui.acp_event(text_chunk(&response));
-    ui.complete_prompt(acp::StopReason::EndTurn);
+    ui.turn("hello", &numbered_lines("line", 20));
     ui.acp_event(session_update(acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(40_000, 200_000))));
 
     ui.draw();
@@ -703,14 +541,15 @@ fn fitting_content_stays_visible_in_a_small_viewport() {
 
     ui.resize(40, 10);
     ui.submit("queued while small");
-    ui.draw();
 
-    assert!(!ui.history_text().contains("queued while small"));
-    assert!(ui.viewport_text().contains("queued while small"));
+    ui.assert_history_not_contains("queued while small");
+    ui.assert_viewport_contains("queued while small");
 
     ui.resize(40, 15);
     ui.draw();
 
-    assert!(ui.app().conversation_items().iter().any(|item| item.text() == Some("queued while small")));
-    assert!(ui.viewport_text().contains("queued while small"));
+    assert!(
+        ui.app().core().conversation().items().iter().any(|item| item.text().as_deref() == Some("queued while small"))
+    );
+    ui.assert_viewport_contains("queued while small");
 }

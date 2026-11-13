@@ -28,13 +28,16 @@ Parse a `"provider:model"` string into a provider, build a context, and stream t
 ```rust,no_run
 use llm::parser::ModelProviderParser;
 use llm::types::IsoString;
-use llm::{ChatMessage, ContentBlock, Context, LlmResponse, MessageId, StreamingModelProvider};
+use llm::{
+    ChatMessage, ContentBlock, Context, LlmResponse, MessageId, ProviderConnectionOverrides, StreamingModelProvider,
+};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> llm::Result<()> {
     let parser = ModelProviderParser::default();
-    let (provider, _model) = parser.parse("anthropic:claude-sonnet-4-5-20250929").await?;
+    let connections = ProviderConnectionOverrides::default();
+    let (provider, _model) = parser.parse("anthropic:claude-sonnet-4-5-20250929", &connections).await?;
 
     let context = Context::new(
         vec![ChatMessage::User {
@@ -87,6 +90,9 @@ Define tools with JSON Schema, then feed results back after execution:
 use llm::types::IsoString;
 use llm::{
     AssistantReasoning, ChatMessage, ContentBlock, Context, MessageId, ToolCallResult, ToolDefinition,
+
+    AssistantContent, AssistantReply, ChatMessage, ContentBlock, Context, MessageId, ToolCallRequest, ToolCallResult,
+    ToolDefinition,
 };
 
 let tools = vec![ToolDefinition::new(
@@ -110,14 +116,23 @@ let mut context = Context::new(
 
 // After streaming the response and executing the tool call,
 // feed the result back into the context:
+let arguments = r#"{"city":"Tokyo"}"#;
+let reply = AssistantReply::from(vec![
+    AssistantContent::text("Let me check the weather."),
+    AssistantContent::ToolCall(ToolCallRequest {
+        id: "call_1".into(),
+        name: "get_weather".into(),
+        arguments: arguments.into(),
+    }),
+]);
 context.push_assistant_turn(
     MessageId::new(),
-    "Let me check the weather.",
-    AssistantReasoning::default(),
+    "anthropic:claude-sonnet-4-5-20250929".parse().ok(),
+    reply,
     vec![Ok(ToolCallResult {
         id: "call_1".into(),
         name: "get_weather".into(),
-        arguments: r#"{"city":"Tokyo"}"#.into(),
+        arguments: arguments.into(),
         result: "72F, sunny".into(),
     })],
 );
@@ -131,17 +146,19 @@ context.push_assistant_turn(
 ```rust,no_run
 # async fn example() {
 use llm::parser::ModelProviderParser;
+use llm::ProviderConnectionOverrides;
 
 let parser = ModelProviderParser::default();
+let connections = ProviderConnectionOverrides::default();
 
 // Cloud providers (need API keys in env)
-let (provider, _) = parser.parse("anthropic:claude-sonnet-4-5-20250929").await.unwrap();
-let (provider, _) = parser.parse("openai:gpt-4o").await.unwrap();
-let (provider, _) = parser.parse("openrouter:moonshotai/kimi-k2").await.unwrap();
+let (provider, _) = parser.parse("anthropic:claude-sonnet-4-5-20250929", &connections).await.unwrap();
+let (provider, _) = parser.parse("openai:gpt-4o", &connections).await.unwrap();
+let (provider, _) = parser.parse("openrouter:moonshotai/kimi-k2", &connections).await.unwrap();
 
 // Local models (no API key needed)
-let (provider, _) = parser.parse("ollama:llama3.2").await.unwrap();
-let (provider, _) = parser.parse("llamacpp").await.unwrap();
+let (provider, _) = parser.parse("ollama:llama3.2", &connections).await.unwrap();
+let (provider, _) = parser.parse("llamacpp", &connections).await.unwrap();
 # }
 ```
 
@@ -150,11 +167,11 @@ let (provider, _) = parser.parse("llamacpp").await.unwrap();
 When you need fine-grained control, construct the provider directly and configure request settings on the context:
 
 ```rust,no_run
-# async fn example() {
-use llm::providers::anthropic::AnthropicProvider;
-use llm::{Context, ModelSettings, ProviderFactory};
+# fn example() {
+use llm::providers::generic::{ANTHROPIC, GenericProvider};
+use llm::{Context, ModelSettings};
 
-let provider = AnthropicProvider::from_env().await
+let provider = GenericProvider::from_env(&ANTHROPIC)
     .unwrap()
     .with_model("claude-sonnet-4-5-20250929");
 
@@ -174,6 +191,7 @@ context.set_model_settings(ModelSettings {
 | Anthropic | `anthropic:claude-sonnet-4-5-20250929` | `ANTHROPIC_API_KEY` |
 | `OpenAI` | `openai:gpt-4o` | `OPENAI_API_KEY` |
 | `OpenRouter` | `openrouter:moonshotai/kimi-k2` | `OPENROUTER_API_KEY` |
+| Xiaomi | `xiaomi:mimo-v2.6-pro` | `XIAOMI_API_KEY` |
 | ZAI | `zai:GLM-4.6` | `ZAI_API_KEY` |
 | AWS Bedrock | `bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0` | AWS credentials |
 | Ollama | `ollama:llama3.2` | None (local) |

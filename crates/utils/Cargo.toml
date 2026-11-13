@@ -1,6 +1,6 @@
 [package]
 name = "aether-utils"
-version = "0.2.16"
+version = "0.3.1"
 edition = "2024"
 description = "Shared utilities for the Aether AI agent framework"
 license = "MIT"
@@ -23,16 +23,23 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints]
 workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 futures = { workspace = true }
 regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "process"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
 tracing = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

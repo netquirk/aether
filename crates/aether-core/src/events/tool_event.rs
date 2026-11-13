@@ -1,51 +1,81 @@
 use super::SubAgentProgressPayload;
-use llm::types::IsoString;
 use llm::{ChatMessage, ContentBlock, MessageId, ToolCallError, ToolCallRequest, ToolCallResult, ToolDefinition};
-use mcp_utils::display_meta::ToolResultMeta;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utils::display_meta::ToolResultMeta;
 
 /// Tool call lifecycle events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolEvent {
-    /// The LLM requested a tool call; arguments may still be streaming.
-    Call { request: ToolCallRequest },
-    /// A chunk of streamed tool call arguments.
-    CallUpdate { tool_call_id: String, chunk: String },
-    /// The tool began executing.
-    ExecutionStarted { tool_id: String, tool_name: String },
-    /// Progress reported by an executing tool.
-    Progress { request: ToolCallRequest, progress: f64, total: Option<f64>, message: Option<String> },
-    /// Progress from a sub-agent spawned by this tool call, carrying the child's own event.
-    SubAgentProgress { request: ToolCallRequest, payload: Box<SubAgentProgressPayload> },
-    /// An executing tool refreshed how it should be displayed.
-    DisplayUpdate { request: ToolCallRequest, meta: ToolResultMeta },
-    /// A background task was created by a tool call response.
-    TaskCreated { request: ToolCallRequest, task_id: String, status_message: Option<String> },
-    /// The background task reported a new status.
-    TaskStatus { request: ToolCallRequest, task_id: String, status: String, status_message: Option<String> },
-    /// The background task completed successfully.
+    InputStarted {
+        id: String,
+        name: String,
+    },
+    InputDelta {
+        id: String,
+        chunk: String,
+    },
+    Call {
+        request: ToolCallRequest,
+    },
+    Progress {
+        request: ToolCallRequest,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<String>,
+    },
+    SubAgentProgress {
+        request: ToolCallRequest,
+        payload: Box<SubAgentProgressPayload>,
+    },
+    DisplayUpdate {
+        request: ToolCallRequest,
+        meta: ToolResultMeta,
+    },
+    TaskCreated {
+        request: ToolCallRequest,
+        task_id: String,
+        status_message: Option<String>,
+    },
+    TaskStatus {
+        request: ToolCallRequest,
+        task_id: String,
+        status: String,
+        status_message: Option<String>,
+    },
     TaskCompleted {
         request: ToolCallRequest,
         task_id: String,
         result: ToolCallResult,
         result_meta: Option<ToolResultMeta>,
     },
-    /// The background task failed.
-    TaskFailed { request: ToolCallRequest, task_id: String, error: ToolCallError },
-    /// The background task was cancelled.
-    TaskCancelled { request: ToolCallRequest, task_id: String },
-    /// The tool completed successfully.
-    Result { result: ToolCallResult, result_meta: Option<ToolResultMeta> },
-    /// The tool failed.
-    Error { error: ToolCallError },
+    TaskFailed {
+        request: ToolCallRequest,
+        task_id: String,
+        error: ToolCallError,
+    },
+    TaskCancelled {
+        request: ToolCallRequest,
+        task_id: String,
+    },
+    Result {
+        result: ToolCallResult,
+        result_meta: Option<ToolResultMeta>,
+    },
+    Error {
+        error: ToolCallError,
+    },
     /// The tool call was refused before execution (e.g. by a [`ToolPolicy`](crate::core::ToolPolicy)).
     /// The `reason` is a human-readable string describing why execution was declined; the full
     /// `request` is preserved so the transcript records exactly what was rejected.
-    Refused { request: ToolCallRequest, reason: String },
-    /// The set of available tool definitions changed.
-    DefinitionsUpdated { tools: Vec<ToolDefinition> },
+    Refused {
+        request: ToolCallRequest,
+        reason: String,
+    },
+    DefinitionsUpdated {
+        tools: Vec<ToolDefinition>,
+    },
 }
 
 /// Build the [`ChatMessage`] that tells the model a tool call was refused by policy,
@@ -57,13 +87,9 @@ pub fn refusal_context_message(request: &ToolCallRequest, reason: &str) -> ChatM
         escape_xml(reason),
         escape_xml(reason),
     );
-    let mut message_id = MessageId::new();
-    if let Some(stripped) = request.id.strip_prefix("tool-result:") {
-        message_id = MessageId::tool_result(stripped);
-    } else if !request.id.is_empty() {
-        message_id = MessageId::tool_result(&request.id);
-    }
-    ChatMessage::User { message_id, content: vec![ContentBlock::text(content)], timestamp: IsoString::now() }
+    let message_id =
+        if request.id.is_empty() { MessageId::new() } else { MessageId::tool_result(&request.id) };
+    ChatMessage::user_with_id(message_id, vec![ContentBlock::text(content)])
 }
 
 impl ToolEvent {
@@ -97,11 +123,6 @@ pub enum TaskOutcomeState {
 }
 
 impl TaskOutcome {
-    pub fn context_message(&self) -> ChatMessage {
-        let (status, body) = self.status_body();
-        task_result_message(&self.request, &self.task_id, status, body)
-    }
-
     pub fn content_blocks(&self) -> Vec<ContentBlock> {
         let (status, body) = self.status_body();
         task_result_content(&self.request, &self.task_id, status, body)
@@ -143,11 +164,7 @@ pub fn task_created_result(request: &ToolCallRequest, task_id: &str) -> ToolCall
 const TASK_CANCELLED_BODY: &str = "The background task was cancelled and will not produce a result.";
 
 fn task_result_message(request: &ToolCallRequest, task_id: &str, status: &str, body: &str) -> ChatMessage {
-    ChatMessage::User {
-        message_id: MessageId::task_result(task_id),
-        content: task_result_content(request, task_id, status, body),
-        timestamp: IsoString::now(),
-    }
+    ChatMessage::user_with_id(MessageId::task_result(task_id), task_result_content(request, task_id, status, body))
 }
 
 fn task_result_content(request: &ToolCallRequest, task_id: &str, status: &str, body: &str) -> Vec<ContentBlock> {

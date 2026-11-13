@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/contextbridge/aether/compare/aether-schemas-v0.3.0...aether-schemas-v0.3.1) - 2026-11-03
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.3.0](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.24...aether-schemas-v0.3.0) - 2026-10-20
+
+### Added
+
+- *(evals)* [**breaking**] fetch git fixtures once and grant container users workspace access ([#621](https://github.com/contextbridge/aether/pull/621))
+
+## [0.2.24](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.23...aether-schemas-v0.2.24) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project, aether-agent-cli, aether-evals
+
+## [0.2.23](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.22...aether-schemas-v0.2.23) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-evals, aether-llm, aether-agent-core, aether-project, aether-agent-cli
+
+## [0.2.22](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.21...aether-schemas-v0.2.22) - 2026-10-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.21](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.20...aether-schemas-v0.2.21) - 2026-10-12
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project, aether-agent-cli, aether-evals
+
+## [0.2.20](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.19...aether-schemas-v0.2.20) - 2026-10-10
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project, aether-agent-cli, aether-evals
+
+## [0.2.19](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.18...aether-schemas-v0.2.19) - 2026-10-08
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.18](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.17...aether-schemas-v0.2.18) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project, aether-agent-cli, aether-evals
+
+## [0.2.17](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.16...aether-schemas-v0.2.17) - 2026-10-04
+
+### Other
+
+- updated the following local packages: aether-project, aether-agent-cli, aether-evals
+
+## [0.2.16](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.15...aether-schemas-v0.2.16) - 2026-10-04
+
+### Other
+
+- updated the following local packages: aether-evals
+
+## [0.2.15](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.14...aether-schemas-v0.2.15) - 2026-10-03
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.14](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.13...aether-schemas-v0.2.14) - 2026-10-01
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.13](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.12...aether-schemas-v0.2.13) - 2026-09-28
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-agent-cli, aether-evals, aether-project
+
+## [0.2.12](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.11...aether-schemas-v0.2.12) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
+## [0.2.11](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.10...aether-schemas-v0.2.11) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project, aether-agent-cli, aether-evals
+
+## [0.2.10](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.9...aether-schemas-v0.2.10) - 2026-09-23
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.2.9](https://github.com/contextbridge/aether/compare/aether-schemas-v0.2.8...aether-schemas-v0.2.9) - 2026-09-21
 
 ### Other

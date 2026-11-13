@@ -1,11 +1,12 @@
-use crate::conversation::ContextUsageDisplay;
-use crate::session::session_config_view::{LocalConfigOption, LocalConfigView};
-use crate::session::workspace_status::WorkspaceStatus;
 use crate::settings::{ResolvedStatusLineSettings, StatusLineSegmentConfig, StatusLineStyle};
-use crate::view::reasoning_bar::{reasoning_bar, reasoning_color, slot_bar};
 use crate::theme::Theme;
+use crate::view::reasoning_bar::{reasoning_bar, reasoning_color, slot_bar};
 use crate::view::wrap::{truncate_spans, truncate_to_width};
 use acp_utils::config_option_id::ConfigOptionId;
+use agent_client_protocol::v2::schema as acp;
+use client_core::format::token_count;
+use client_core::session_config_view::{LocalConfigOption, LocalConfigView};
+use client_core::session_model::WorkspaceStatus;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -29,6 +30,31 @@ pub struct StatusLineModel<'a> {
     pub exit_confirmation: bool,
 }
 
+/// Context-window usage as the status line displays it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsageDisplay {
+    pub used_tokens: u32,
+    pub limit_tokens: u32,
+}
+
+impl ContextUsageDisplay {
+    pub fn used_ratio(self) -> f64 {
+        if self.limit_tokens == 0 {
+            return 0.0;
+        }
+        (f64::from(self.used_tokens) / f64::from(self.limit_tokens)).clamp(0.0, 1.0)
+    }
+}
+
+impl From<&acp::UsageUpdate> for ContextUsageDisplay {
+    fn from(usage: &acp::UsageUpdate) -> Self {
+        Self {
+            used_tokens: u32::try_from(usage.used).unwrap_or(u32::MAX),
+            limit_tokens: u32::try_from(usage.size).unwrap_or(u32::MAX),
+        }
+    }
+}
+
 /// The bottom status bar: workspace on the left, session state on the right.
 ///
 /// Built once per frame and rendered by reference, so measuring its height does
@@ -46,7 +72,7 @@ impl StatusLine {
         // The configured right-hand segments always render; only the exit
         // confirmation replaces them.
         let right = if model.exit_confirmation {
-            vec![Span::styled("Ctrl-C again to exit", Style::new().fg(theme.warning))]
+            vec![Span::styled("Ctrl-C again to exit", theme.warning)]
         } else {
             render_segments(model, &settings.right, theme)
         };
@@ -112,7 +138,7 @@ fn render_segments(
             continue;
         }
         if !spans.is_empty() {
-            spans.push(Span::styled(model.settings.separator.clone(), Style::new().fg(theme.text_secondary)));
+            spans.push(Span::styled(model.settings.separator.clone(), theme.text_secondary));
         }
         spans.extend(segment_spans);
     }
@@ -127,22 +153,22 @@ fn render_segment(
 ) -> Vec<Span<'static>> {
     match segment {
         StatusLineSegmentConfig::Cwd { max_width } => {
-            vec![styled(clamp(&model.workspace.display_dir, *max_width), theme.text_secondary)]
+            vec![Span::styled(clamp(&model.workspace.display_dir, *max_width), theme.text_secondary)]
         }
         StatusLineSegmentConfig::GitRef => model
             .workspace
             .git_ref
             .as_deref()
-            .map(|git_ref| vec![styled(git_ref.to_string(), theme.success)])
+            .map(|git_ref| vec![Span::styled(git_ref.to_string(), theme.success)])
             .unwrap_or_default(),
-        StatusLineSegmentConfig::Agent => vec![styled(model.agent_name.to_string(), theme.info)],
+        StatusLineSegmentConfig::Agent => vec![Span::styled(model.agent_name.to_string(), theme.info)],
         StatusLineSegmentConfig::Mode => config
             .current_display_name(ConfigOptionId::Mode)
-            .map(|mode| vec![styled(mode, theme.text_secondary)])
+            .map(|mode| vec![Span::styled(mode, theme.text_secondary)])
             .unwrap_or_default(),
         StatusLineSegmentConfig::Model { max_width } => config
             .current_display_name(ConfigOptionId::Model)
-            .map(|model| vec![styled(clamp(&model, *max_width), theme.success)])
+            .map(|model| vec![Span::styled(clamp(&model, *max_width), theme.success)])
             .unwrap_or_default(),
         StatusLineSegmentConfig::Reasoning => {
             let levels = config.reasoning_levels();
@@ -151,11 +177,11 @@ fn render_segment(
             }
             let effort = config.reasoning_effort();
             let label = ReasoningEffort::config_str(effort);
-            vec![styled(reasoning_bar(effort, &levels, label.len()), reasoning_color(effort, &levels, theme))]
+            vec![Span::styled(reasoning_bar(effort, &levels, label.len()), reasoning_color(effort, &levels, theme))]
         }
         StatusLineSegmentConfig::Context => model
             .context_usage
-            .map(|usage| vec![styled(context_bar(usage), context_color(usage, theme))])
+            .map(|usage| vec![Span::styled(context_bar(usage), context_color(usage, theme))])
             .unwrap_or_default(),
         StatusLineSegmentConfig::ServerHealth => {
             let count = model.unhealthy_servers;
@@ -164,16 +190,12 @@ fn render_segment(
             }
             let message =
                 if count == 1 { "1 server needs auth".to_string() } else { format!("{count} servers unhealthy") };
-            vec![styled(message, theme.warning)]
+            vec![Span::styled(message, theme.warning)]
         }
         StatusLineSegmentConfig::Text { value, style } => {
-            vec![styled(value.clone(), style.map_or(theme.text_secondary, |style| semantic_color(style, theme)))]
+            vec![Span::styled(value.clone(), style.map_or(theme.text_secondary, |style| semantic_color(style, theme)))]
         }
     }
-}
-
-fn styled(text: String, color: Color) -> Span<'static> {
-    Span::styled(text, Style::new().fg(color))
 }
 
 fn clamp(text: &str, max_width: Option<u16>) -> String {
@@ -198,8 +220,8 @@ fn context_bar(usage: ContextUsageDisplay) -> String {
     format!(
         "ctx {} {} / {}",
         slot_bar((filled as usize).min(TOTAL as usize), TOTAL as usize),
-        format_tokens(usage.used_tokens),
-        format_tokens(usage.limit_tokens)
+        token_count(u64::from(usage.used_tokens)),
+        token_count(u64::from(usage.limit_tokens))
     )
 }
 
@@ -211,22 +233,5 @@ fn context_color(usage: ContextUsageDisplay, theme: &Theme) -> Color {
         theme.warning
     } else {
         theme.text_secondary
-    }
-}
-
-fn format_tokens(count: u32) -> String {
-    match count {
-        count if count < 1_000 => count.to_string(),
-        count if count < 1_000_000 => format_with_unit(f64::from(count) / 1_000.0, "k"),
-        count => format_with_unit(f64::from(count) / 1_000_000.0, "M"),
-    }
-}
-
-fn format_with_unit(value: f64, unit: &str) -> String {
-    let rounded = (value * 10.0).round() / 10.0;
-    if (rounded - rounded.trunc()).abs() < f64::EPSILON {
-        format!("{rounded:.0}{unit}")
-    } else {
-        format!("{rounded:.1}{unit}")
     }
 }

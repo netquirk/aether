@@ -1,3 +1,4 @@
+use llm::{ToolCallError, ToolCallRequest, ToolCallResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,35 @@ impl AgentEvent {
         Self::Turn(TurnEvent::Ended { outcome })
     }
 
+    pub fn tool_call(id: &str, name: &str, arguments: &str) -> Self {
+        Self::Tool(ToolEvent::Call {
+            request: ToolCallRequest { id: id.into(), name: name.into(), arguments: arguments.into() },
+        })
+    }
+
+    pub fn tool_result(id: &str, name: &str, arguments: &str, result: &str) -> Self {
+        Self::Tool(ToolEvent::Result {
+            result: ToolCallResult {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+                result: result.into(),
+            },
+            result_meta: None,
+        })
+    }
+
+    pub fn tool_error(id: &str, name: &str, arguments: &str, error: &str) -> Self {
+        Self::Tool(ToolEvent::Error {
+            error: ToolCallError {
+                id: id.into(),
+                name: name.into(),
+                arguments: Some(arguments.into()),
+                error: error.into(),
+            },
+        })
+    }
+
     /// Human-readable text content of this event, if any.
     pub fn content(&self) -> Option<String> {
         match self {
@@ -68,6 +98,15 @@ impl AgentEvent {
             _ => None,
         }
     }
+
+    pub fn is_stream_delta(&self) -> bool {
+        matches!(
+            self,
+            Self::Message(
+                MessageEvent::Text { is_complete: false, .. } | MessageEvent::Thought { is_complete: false, .. }
+            ) | Self::Tool(ToolEvent::InputDelta { .. })
+        )
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +114,7 @@ mod tests {
     use super::*;
     use crate::events::{CompactionOutcome, LlmCallOutcome};
     use llm::{ContextUsage, LlmCallPurpose};
+    use utils::display_meta::ToolDisplayMeta;
 
     #[test]
     fn serializes_nested_event_contract() {
@@ -103,12 +143,12 @@ mod tests {
             AgentEvent::SessionUsage(llm::testing::session_usage_event(1, llm::TokenUsage::new(1, 2))),
             AgentEvent::Tool(ToolEvent::DisplayUpdate {
                 request: llm::ToolCallRequest { id: "call".into(), name: "read".into(), arguments: "{}".into() },
-                meta: mcp_utils::display_meta::ToolDisplayMeta::new("Read file", "main.rs").into(),
+                meta: ToolDisplayMeta::new("Read file", "main.rs").into(),
             }),
             AgentEvent::Tool(ToolEvent::SubAgentProgress {
                 request: llm::ToolCallRequest { id: "call".into(), name: "spawn".into(), arguments: "{}".into() },
                 payload: Box::new(crate::events::SubAgentProgressPayload {
-                    task_id: "task_0".into(),
+                    session_id: "session_0".into(),
                     agent_name: "explorer".into(),
                     event: AgentEvent::turn_ended(TurnOutcome::Completed),
                 }),
@@ -130,7 +170,6 @@ mod tests {
                 http_status: Some(200),
                 provider_request_id: Some("req-1".into()),
                 provider_error_code: Some("server_error".into()),
-                kind: None,
             },
         });
         assert_eq!(
@@ -162,7 +201,6 @@ mod tests {
         assert!(outcome.get("http_status").is_none());
         assert!(outcome.get("provider_request_id").is_none());
         assert!(outcome.get("provider_error_code").is_none());
-        assert!(outcome.get("kind").is_none(), "absent provider kind must stay out of the serialized shape: {value:?}");
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), minimal);
     }
 
@@ -198,5 +236,23 @@ mod tests {
         assert_eq!(AgentEvent::turn_ended(TurnOutcome::Completed).turn_outcome(), Some(&TurnOutcome::Completed));
         assert_eq!(AgentEvent::text("m", "text", StreamState::Complete).turn_outcome(), None);
         assert_eq!(AgentEvent::Turn(TurnEvent::Started { content: vec![] }).turn_outcome(), None);
+    }
+
+    #[test]
+    fn only_partial_chunks_and_tool_input_deltas_are_stream_deltas() {
+        let deltas = [
+            AgentEvent::text("m", "par", StreamState::Partial),
+            AgentEvent::thought("m", "par", StreamState::Partial),
+            AgentEvent::Tool(ToolEvent::InputDelta { id: "call".into(), chunk: "{".into() }),
+        ];
+        let complete = [
+            AgentEvent::text("m", "partial", StreamState::Complete),
+            AgentEvent::thought("m", "partial", StreamState::Complete),
+            AgentEvent::Tool(ToolEvent::InputStarted { id: "call".into(), name: "read".into() }),
+            AgentEvent::tool_call("call", "read", "{}"),
+            AgentEvent::turn_ended(TurnOutcome::Completed),
+        ];
+        assert!(deltas.iter().all(AgentEvent::is_stream_delta));
+        assert!(!complete.iter().any(AgentEvent::is_stream_delta));
     }
 }

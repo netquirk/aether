@@ -78,8 +78,6 @@ aether headless --model bedrock:anthropic.claude-sonnet-4-5-20250929-v1:0 \
 | `--events`          | comma-separated list     | Event kinds to emit. Omit to emit all.                                                            |
 | `--provider`        | `provider.field=value`   | Provider override. Supports `PROVIDER.url`, `PROVIDER.auth`, `PROVIDER.request-model`, and `bedrock.inference-profile-arn`. |
 
-`--sandbox-image` is a global CLI flag, so it can appear before the subcommand or in the subcommand options shown by help.
-
 ## Output formats
 
 <Tabs>
@@ -143,7 +141,7 @@ Available event kinds:
 | ---------------------------- | -------------------------------------------------------------- |
 | `text`                       | Final text chunks.                                             |
 | `thought`                    | Final reasoning/thought chunks.                                |
-| `tool_call`                  | Tool invocation.                                               |
+| `tool_call`                  | Tool invocation with its complete arguments.                   |
 | `tool_result`                | Tool return value.                                             |
 | `tool_error`                 | Tool failure.                                                  |
 | `auto_continue`              | Agent auto-continuing.                                         |
@@ -160,7 +158,6 @@ Available event kinds:
 | `llm_retry_scheduled`        | LLM retry backoff was scheduled.                               |
 | `llm_call_started`           | LLM call began, including retries.                             |
 | `llm_call_ended`             | LLM call completed, failed, or was cancelled.                  |
-| `tool_execution_started`     | Tool execution began.                                          |
 | `tool_definitions_updated`   | Available tool definitions changed.                            |
 
 When `--events` is set, terminal outcomes are shown only if `turn_ended` is explicitly listed.
@@ -190,7 +187,7 @@ Print the fully assembled system prompt for debugging:
 aether show-prompt --agent Researcher
 ```
 
-`show-prompt` accepts `--cwd`, settings overrides, MCP config overrides, `--system-prompt`, `--agent`, and `--sandbox-image`.
+`show-prompt` accepts `--cwd`, settings overrides, MCP config overrides, `--system-prompt`, and `--agent`.
 
 ### `generate`
 
@@ -215,7 +212,7 @@ cat schema.json | aether generate --model zai:glm-5.1 --prompt-file -
 | `--temperature`      | `number`                                      | Sampling temperature.                                                    |
 | `--top-p`            | `number`                                      | Nucleus sampling probability mass.                                       |
 | `--max-tokens`       | `number`                                      | Upper bound on generated tokens.                                         |
-| `--reasoning-effort` | `minimal \| low \| medium \| high \| xhigh \| max` | Reasoning effort for models that support extended thinking.              |
+| `--reasoning-effort` | `default \| disabled \| minimal \| low \| medium \| high \| xhigh \| max` | Reasoning effort for models that support extended thinking. `disabled` requires model and adapter support; unsupported disabling is rejected. |
 | `--output`           | `text \| pretty \| json`                      | Output format. `text` prints the raw response; `json`/`pretty` wrap it as `{ "text": "<response>", "model": "<model>" }`. Defaults to `text`. |
 
 See [Getting Started](/getting-started/overview/) and [Settings](/aether/settings/overview/#agents) for project scaffolding details.

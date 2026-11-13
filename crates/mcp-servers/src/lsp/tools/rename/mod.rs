@@ -1,19 +1,24 @@
 //! LSP-powered rename refactoring tool
 
+use std::cmp::Reverse;
+use std::path::Path;
+
 use lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp, WorkspaceEdit};
-use mcp_utils::display_meta::{ToolDisplayMeta, ToolResultMeta, basename};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utils::display_meta::{ToolDisplayMeta, basename};
 
-use crate::lsp::common::uri_to_path;
+use crate::Displayed;
+use crate::lsp::common::uri_display;
 use crate::lsp::error::LspError;
 use crate::lsp::registry::LspRegistry;
+use crate::lsp::render::{SourceLine, render_locations};
 
 /// Input for the `lsp_rename` tool
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LspRenameInput {
-    /// The file path containing the symbol to rename
+    /// The file containing the symbol to rename, absolute or relative to the workspace root
     #[serde(alias = "file_path")]
     pub file_path: String,
     /// The symbol name to rename (used for position resolution if line not provided)
@@ -24,32 +29,6 @@ pub struct LspRenameInput {
     /// Optional 1-indexed line hint. Stale hints fall back to automatic symbol resolution.
     #[serde(default)]
     pub line: Option<u32>,
-}
-
-/// A single text edit in a file
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct FileEdit {
-    /// The file path
-    pub file_path: String,
-    /// The text edits for this file
-    pub edits: Vec<TextEdit>,
-}
-
-/// A text edit with range information
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TextEdit {
-    /// 1-indexed start line
-    pub start_line: u32,
-    /// 1-indexed start column
-    pub start_column: u32,
-    /// 1-indexed end line
-    pub end_line: u32,
-    /// 1-indexed end column
-    pub end_column: u32,
-    /// The new text to insert
-    pub new_text: String,
 }
 
 /// A raw LSP text edit grouped by file path.
@@ -71,61 +50,71 @@ pub struct LspRenameOutput {
     pub total_edits: usize,
     /// Number of files affected
     pub files_affected: usize,
-    /// The edits grouped by file
-    pub changes: Vec<FileEdit>,
+    /// Edited lines grouped by file (relative to the workspace root): `path: 3, 18`
+    pub changes: String,
     /// Whether the rename was successful
     pub success: bool,
     /// Error message if rename failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Display metadata for TUI rendering
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)]
-    pub meta: Option<ToolResultMeta>,
+}
+
+impl LspRenameOutput {
+    async fn applied(input: &LspRenameInput, changes: &[LspFileEdit], project_root: &Path) -> Displayed<Self> {
+        let edited: Vec<SourceLine> = changes
+            .iter()
+            .flat_map(|file_edit| {
+                file_edit.edits.iter().map(|edit| SourceLine::from_range(file_edit.file_path.clone(), &edit.range))
+            })
+            .collect();
+        let total_edits = edited.len();
+        let files_affected = changes.len();
+
+        let output = Self {
+            old_name: input.symbol.clone(),
+            new_name: input.new_name.clone(),
+            total_edits,
+            files_affected,
+            changes: render_locations(&edited, project_root, None).await,
+            success: true,
+            ..Default::default()
+        };
+        Displayed::new(output, rename_success_meta(input, total_edits, files_affected))
+    }
+
+    fn failed(input: &LspRenameInput, error: String) -> Displayed<Self> {
+        let output = Self {
+            old_name: input.symbol.clone(),
+            new_name: input.new_name.clone(),
+            success: false,
+            error: Some(error),
+            ..Default::default()
+        };
+        Displayed::new(output, rename_failure_meta(input))
+    }
 }
 
 /// Execute the rename operation
-pub async fn execute_lsp_rename(input: LspRenameInput, registry: &LspRegistry) -> Result<LspRenameOutput, LspError> {
+pub async fn execute_lsp_rename(
+    mut input: LspRenameInput,
+    registry: &LspRegistry,
+) -> Result<Displayed<LspRenameOutput>, LspError> {
+    input.file_path = registry.resolve_file(&input.file_path)?;
     let resolved = registry.resolve_symbol(&input.file_path, &input.symbol, input.line).await?;
 
     let workspace_edit =
         resolved.client.rename(resolved.uri, resolved.line, resolved.column, input.new_name.clone()).await?;
 
     let Some(edit) = workspace_edit else {
-        return Ok(rename_failure(&input, "No changes returned from LSP server".to_string()));
+        return Ok(LspRenameOutput::failed(&input, "No changes returned from LSP server".to_string()));
     };
 
-    let raw_changes = match collect_workspace_text_edits(&edit) {
+    let changes = match collect_workspace_text_edits(&edit) {
         Ok(changes) => changes,
-        Err(error) => return Ok(rename_failure(&input, error.to_string())),
+        Err(error) => return Ok(LspRenameOutput::failed(&input, error.to_string())),
     };
-    let changes = convert_lsp_file_edits(&raw_changes);
-
-    apply_workspace_text_edits(&raw_changes).await?;
-    let total_edits: usize = changes.iter().map(|f| f.edits.len()).sum();
-    let files_affected = changes.len();
-
-    Ok(LspRenameOutput {
-        old_name: input.symbol.clone(),
-        new_name: input.new_name.clone(),
-        total_edits,
-        files_affected,
-        changes,
-        success: true,
-        meta: Some(rename_success_meta(&input, total_edits, files_affected).into()),
-        ..Default::default()
-    })
-}
-
-fn rename_failure(input: &LspRenameInput, error: String) -> LspRenameOutput {
-    LspRenameOutput {
-        old_name: input.symbol.clone(),
-        new_name: input.new_name.clone(),
-        success: false,
-        error: Some(error),
-        meta: Some(rename_failure_meta(input).into()),
-        ..Default::default()
-    }
+    apply_workspace_text_edits(&changes).await?;
+    Ok(LspRenameOutput::applied(&input, &changes, registry.root_path()).await)
 }
 
 /// Convert LSP `WorkspaceEdit` to grouped raw text edits.
@@ -136,7 +125,7 @@ fn collect_workspace_text_edits(edit: &WorkspaceEdit) -> Result<Vec<LspFileEdit>
         changes
             .iter()
             .filter(|&(_uri, text_edits)| !text_edits.is_empty())
-            .map(|(uri, text_edits)| LspFileEdit { file_path: uri_to_path(uri), edits: text_edits.clone() })
+            .map(|(uri, text_edits)| LspFileEdit { file_path: uri_display(uri), edits: text_edits.clone() })
             .collect()
     } else {
         Vec::new()
@@ -152,15 +141,9 @@ fn collect_document_changes(doc_changes: &DocumentChanges) -> Result<Vec<LspFile
             .iter()
             .filter_map(|doc_edit| collect_text_document_edit(&doc_edit.text_document.uri, &doc_edit.edits))
             .collect()),
-        DocumentChanges::Operations(ops) => ops
-            .iter()
-            .map(collect_document_change_operation)
-            .filter_map(|result| match result {
-                Ok(Some(edit)) => Some(Ok(edit)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect(),
+        DocumentChanges::Operations(ops) => {
+            ops.iter().map(collect_document_change_operation).filter_map(Result::transpose).collect()
+        }
     }
 }
 
@@ -169,14 +152,13 @@ fn collect_document_change_operation(op: &DocumentChangeOperation) -> Result<Opt
         DocumentChangeOperation::Edit(doc_edit) => {
             Ok(collect_text_document_edit(&doc_edit.text_document.uri, &doc_edit.edits))
         }
-        DocumentChangeOperation::Op(ResourceOp::Create(_)) => {
-            Err(LspError::InvalidEdit("Rename returned unsupported workspace operation: create".to_string()))
-        }
-        DocumentChangeOperation::Op(ResourceOp::Rename(_)) => {
-            Err(LspError::InvalidEdit("Rename returned unsupported workspace operation: rename".to_string()))
-        }
-        DocumentChangeOperation::Op(ResourceOp::Delete(_)) => {
-            Err(LspError::InvalidEdit("Rename returned unsupported workspace operation: delete".to_string()))
+        DocumentChangeOperation::Op(op) => {
+            let kind = match op {
+                ResourceOp::Create(_) => "create",
+                ResourceOp::Rename(_) => "rename",
+                ResourceOp::Delete(_) => "delete",
+            };
+            Err(LspError::InvalidEdit(format!("Rename returned unsupported workspace operation: {kind}")))
         }
     }
 }
@@ -186,7 +168,7 @@ fn collect_text_document_edit(
     edits: &[OneOf<lsp_types::TextEdit, lsp_types::AnnotatedTextEdit>],
 ) -> Option<LspFileEdit> {
     let edits = edits.iter().map(extract_one_of_text_edit).collect::<Vec<_>>();
-    (!edits.is_empty()).then(|| LspFileEdit { file_path: uri_to_path(uri), edits })
+    (!edits.is_empty()).then(|| LspFileEdit { file_path: uri_display(uri), edits })
 }
 
 fn extract_one_of_text_edit(edit: &OneOf<lsp_types::TextEdit, lsp_types::AnnotatedTextEdit>) -> lsp_types::TextEdit {
@@ -194,16 +176,6 @@ fn extract_one_of_text_edit(edit: &OneOf<lsp_types::TextEdit, lsp_types::Annotat
         OneOf::Left(edit) => edit.clone(),
         OneOf::Right(edit) => edit.text_edit.clone(),
     }
-}
-
-fn convert_lsp_file_edits(edits: &[LspFileEdit]) -> Vec<FileEdit> {
-    edits
-        .iter()
-        .map(|file_edit| FileEdit {
-            file_path: file_edit.file_path.clone(),
-            edits: file_edit.edits.iter().map(convert_text_edit).collect(),
-        })
-        .collect()
 }
 
 async fn apply_workspace_text_edits(changes: &[LspFileEdit]) -> Result<(), LspError> {
@@ -217,14 +189,8 @@ async fn apply_workspace_text_edits(changes: &[LspFileEdit]) -> Result<(), LspEr
 
 fn apply_file_text_edits(content: &str, edits: &[lsp_types::TextEdit]) -> Result<String, LspError> {
     let mut edits = edits.to_vec();
-    edits.sort_by(|a, b| {
-        b.range
-            .start
-            .line
-            .cmp(&a.range.start.line)
-            .then(b.range.start.character.cmp(&a.range.start.character))
-            .then(b.range.end.line.cmp(&a.range.end.line))
-            .then(b.range.end.character.cmp(&a.range.end.character))
+    edits.sort_by_key(|e| {
+        Reverse((e.range.start.line, e.range.start.character, e.range.end.line, e.range.end.character))
     });
 
     let mut result = content.to_string();
@@ -289,16 +255,6 @@ fn lsp_position_to_byte_offset(content: &str, position: lsp_types::Position) -> 
     }
 }
 
-fn convert_text_edit(edit: &lsp_types::TextEdit) -> TextEdit {
-    TextEdit {
-        start_line: edit.range.start.line + 1,
-        start_column: edit.range.start.character + 1,
-        end_line: edit.range.end.line + 1,
-        end_column: edit.range.end.character + 1,
-        new_text: edit.new_text.clone(),
-    }
-}
-
 fn rename_success_meta(input: &LspRenameInput, total_edits: usize, files_affected: usize) -> ToolDisplayMeta {
     ToolDisplayMeta::new(
         "LSP rename",
@@ -314,162 +270,79 @@ fn rename_failure_meta(input: &LspRenameInput) -> ToolDisplayMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_types::{
-        CreateFile, DocumentChangeOperation, OptionalVersionedTextDocumentIdentifier, Range, ResourceOp,
-        TextDocumentEdit, TextEdit as LspTextEdit, Uri,
-    };
+    use crate::lsp::test_fixtures::{text_edit, uri};
+    use lsp_types::{CreateFile, OptionalVersionedTextDocumentIdentifier, Position, TextDocumentEdit};
     use std::collections::HashMap;
-    use std::str::FromStr;
 
-    fn make_uri(path: &str) -> Uri {
-        Uri::from_str(&format!("file://{path}")).unwrap()
+    fn document_edit(path: &str, edit: lsp_types::TextEdit) -> TextDocumentEdit {
+        TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier { uri: uri(path), version: Some(1) },
+            edits: vec![OneOf::Left(edit)],
+        }
     }
 
     #[test]
     #[allow(clippy::mutable_key_type)]
     fn test_convert_simple_changes() {
-        let mut changes = HashMap::new();
-        changes.insert(
-            make_uri("/src/main.rs"),
-            vec![
-                LspTextEdit {
-                    range: Range {
-                        start: lsp_types::Position { line: 0, character: 5 },
-                        end: lsp_types::Position { line: 0, character: 10 },
-                    },
-                    new_text: "new_name".to_string(),
-                },
-                LspTextEdit {
-                    range: Range {
-                        start: lsp_types::Position { line: 5, character: 0 },
-                        end: lsp_types::Position { line: 5, character: 8 },
-                    },
-                    new_text: "new_name".to_string(),
-                },
-            ],
-        );
+        let changes = HashMap::from([(
+            uri("/src/main.rs"),
+            vec![text_edit(0, 5, 10, "new_name"), text_edit(5, 0, 8, "new_name")],
+        )]);
+        let edit = WorkspaceEdit { changes: Some(changes), ..Default::default() };
 
-        let edit = WorkspaceEdit { changes: Some(changes), document_changes: None, change_annotations: None };
-
-        let raw = collect_workspace_text_edits(&edit).unwrap();
-        let result = convert_lsp_file_edits(&raw);
+        let result = collect_workspace_text_edits(&edit).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_path, "/src/main.rs");
-        assert_eq!(result[0].edits.len(), 2);
-        assert_eq!(result[0].edits[0].start_line, 1);
-        assert_eq!(result[0].edits[0].start_column, 6);
+        assert_eq!(result[0].edits, [text_edit(0, 5, 10, "new_name"), text_edit(5, 0, 8, "new_name")]);
     }
 
     #[test]
     fn test_convert_document_changes() {
-        let doc_edit = TextDocumentEdit {
-            text_document: OptionalVersionedTextDocumentIdentifier { uri: make_uri("/src/lib.rs"), version: Some(1) },
-            edits: vec![OneOf::Left(LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 10, character: 2 },
-                    end: lsp_types::Position { line: 10, character: 6 },
-                },
-                new_text: "renamed".to_string(),
-            })],
-        };
+        let doc_edit = document_edit("/src/lib.rs", text_edit(10, 2, 6, "renamed"));
+        let edit =
+            WorkspaceEdit { document_changes: Some(DocumentChanges::Edits(vec![doc_edit])), ..Default::default() };
 
-        let edit = WorkspaceEdit {
-            changes: None,
-            document_changes: Some(DocumentChanges::Edits(vec![doc_edit])),
-            change_annotations: None,
-        };
-
-        let raw = collect_workspace_text_edits(&edit).unwrap();
-        let result = convert_lsp_file_edits(&raw);
+        let result = collect_workspace_text_edits(&edit).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_path, "/src/lib.rs");
-        assert_eq!(result[0].edits[0].start_line, 11);
-        assert_eq!(result[0].edits[0].start_column, 3);
-        assert_eq!(result[0].edits[0].new_text, "renamed");
+        assert_eq!(result[0].edits, [text_edit(10, 2, 6, "renamed")]);
     }
 
     #[test]
     #[allow(clippy::mutable_key_type)]
     fn test_document_changes_take_precedence_over_changes() {
-        let mut changes = HashMap::new();
-        changes.insert(
-            make_uri("/src/changes.rs"),
-            vec![LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 0, character: 0 },
-                    end: lsp_types::Position { line: 0, character: 3 },
-                },
-                new_text: "old".to_string(),
-            }],
-        );
-
-        let doc_edit = TextDocumentEdit {
-            text_document: OptionalVersionedTextDocumentIdentifier {
-                uri: make_uri("/src/document_changes.rs"),
-                version: Some(1),
-            },
-            edits: vec![OneOf::Left(LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 1, character: 0 },
-                    end: lsp_types::Position { line: 1, character: 3 },
-                },
-                new_text: "new".to_string(),
-            })],
-        };
-
         let edit = WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: Some(DocumentChanges::Edits(vec![doc_edit])),
+            changes: Some(HashMap::from([(uri("/src/changes.rs"), vec![text_edit(0, 0, 3, "old")])])),
+            document_changes: Some(DocumentChanges::Edits(vec![document_edit(
+                "/src/document_changes.rs",
+                text_edit(1, 0, 3, "new"),
+            )])),
             change_annotations: None,
         };
 
-        let raw = collect_workspace_text_edits(&edit).unwrap();
-        let result = convert_lsp_file_edits(&raw);
+        let result = collect_workspace_text_edits(&edit).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_path, "/src/document_changes.rs");
     }
 
     #[test]
     fn test_rejects_unsupported_resource_operations() {
+        let create = CreateFile { uri: uri("/src/new.rs"), options: None, annotation_id: None };
         let edit = WorkspaceEdit {
-            changes: None,
             document_changes: Some(DocumentChanges::Operations(vec![DocumentChangeOperation::Op(ResourceOp::Create(
-                CreateFile { uri: make_uri("/src/new.rs"), options: None, annotation_id: None },
+                create,
             ))])),
-            change_annotations: None,
+            ..Default::default()
         };
 
         let err = collect_workspace_text_edits(&edit).unwrap_err().to_string();
-        assert!(err.contains("unsupported workspace operation"));
-        assert!(err.contains("create"));
+        assert!(err.contains("unsupported workspace operation: create"), "{err}");
     }
 
     #[test]
     fn test_apply_file_text_edits_replaces_multiple_ranges_from_end() {
         let content = "fn greet() {\n    greet();\n    greet();\n}\n";
-        let edits = vec![
-            LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 0, character: 3 },
-                    end: lsp_types::Position { line: 0, character: 8 },
-                },
-                new_text: "hello".to_string(),
-            },
-            LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 1, character: 4 },
-                    end: lsp_types::Position { line: 1, character: 9 },
-                },
-                new_text: "hello".to_string(),
-            },
-            LspTextEdit {
-                range: Range {
-                    start: lsp_types::Position { line: 2, character: 4 },
-                    end: lsp_types::Position { line: 2, character: 9 },
-                },
-                new_text: "hello".to_string(),
-            },
-        ];
+        let edits = [text_edit(0, 3, 8, "hello"), text_edit(1, 4, 9, "hello"), text_edit(2, 4, 9, "hello")];
 
         let updated = apply_file_text_edits(content, &edits).unwrap();
         assert_eq!(updated, "fn hello() {\n    hello();\n    hello();\n}\n");
@@ -477,11 +350,11 @@ mod tests {
 
     #[test]
     fn test_lsp_position_to_byte_offset_handles_utf16_columns() {
-        let content = "a😀z\n";
+        let offsets: Vec<_> = [0, 1, 3, 4]
+            .into_iter()
+            .map(|character| lsp_position_to_byte_offset("a😀z\n", Position::new(0, character)).unwrap())
+            .collect();
 
-        assert_eq!(lsp_position_to_byte_offset(content, lsp_types::Position { line: 0, character: 0 }).unwrap(), 0);
-        assert_eq!(lsp_position_to_byte_offset(content, lsp_types::Position { line: 0, character: 1 }).unwrap(), 1);
-        assert_eq!(lsp_position_to_byte_offset(content, lsp_types::Position { line: 0, character: 3 }).unwrap(), 5);
-        assert_eq!(lsp_position_to_byte_offset(content, lsp_types::Position { line: 0, character: 4 }).unwrap(), 6);
+        assert_eq!(offsets, [0, 1, 5, 6]);
     }
 }

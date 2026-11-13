@@ -6,12 +6,13 @@ use thiserror::Error;
 
 mod git;
 mod registry;
+#[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod testing;
 
-use git::GitError;
 pub(crate) use git::current_ref;
 use registry::{RegistryError, WorkspaceRegistry};
+use utils::git::GitError;
 
 /// Warning to print when `cwd` is not inside a git repository, or `None` when it is.
 /// A run started outside a repository produces changes that cannot be diffed.

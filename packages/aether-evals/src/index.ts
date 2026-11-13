@@ -1,16 +1,20 @@
 export { DockerAgent } from "./DockerAgent.js";
 export type { DockerAgentOptions } from "./DockerAgent.js";
-export { AetherEvalError } from "./errors.js";
+export { CONTAINER_AETHER_HOME, evalEnvVars } from "./env.js";
+export { AetherEvalError, AetherCommandExitError } from "./errors.js";
 export type { AetherEvalErrorCode } from "./errors.js";
 export { Container, ContainerBuilder, Image } from "./containers/index.js";
 export type {
   BindMount,
   ContainerExecOptions,
+  ContainerRuntime,
   ContainerStreamingOptions,
   ExecOutput,
   ImageBuildOptions,
+  RuntimeExec,
+  RuntimeExecOptions,
 } from "./containers/index.js";
-export type { Agent } from "./Agent.js";
+export type { Agent, AgentRunOptions } from "./Agent.js";
 export { FakeAgent } from "./FakeAgent.js";
 export { Task } from "./task.js";
 export { diffStatsFromDiff } from "./diff.js";
@@ -44,19 +48,16 @@ export {
   ToolCall,
   turnEnded,
 } from "./transcript.js";
-export type { TurnUsage } from "./transcript.js";
-export { createGitBundle, Workspace } from "./workspace.js";
-export type {
-  GitBundleSpec,
-  GitRepoSpec,
-  RetainedWorkspaceInfo,
-  WorkspaceSource,
-} from "./workspace.js";
+export { Workspace } from "./workspace.js";
+export type { RetainedWorkspaceInfo, WorkspaceOptions } from "./workspace.js";
+export { GitFixture } from "./gitFixture.js";
 export type {
   AgentEvent,
   ContextEvent,
   ContextUsage,
   FileDiff,
+  GitSource,
+  GitSpec,
   LlmCallOutcome,
   LlmCallPurpose,
   MessageEvent,

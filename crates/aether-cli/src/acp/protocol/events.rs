@@ -1,19 +1,19 @@
 use crate::acp::session::actor::SessionIo;
-use acp_utils::notifications::{
-    ContextClearedParams, SessionUsageParams, SubAgentEvent, SubAgentProgressParams, SubAgentToolCallUpdate,
-    SubAgentToolError, SubAgentToolRequest, SubAgentToolResult,
-};
+use acp_utils::content::map_user_content_block;
+use acp_utils::notifications::{AetherMeta, ContextClearedParams, SessionUsageParams, SubAgentMeta};
 use aether_core::events::{
-    AgentEvent, CompactionOutcome, ContextEvent, MessageEvent, ModelEvent, ToolEvent, TurnEvent, TurnOutcome,
-    humanize_tool_name, parse_tool_call_chunk,
+    AgentEvent, CompactionOutcome, ContextEvent, MessageEvent, ModelEvent, SubAgentProgressPayload, ToolEvent,
+    TurnEvent, TurnOutcome, humanize_tool_name,
 };
 use agent_client_protocol::schema::MaybeUndefined;
-use agent_client_protocol::schema::v2::{
-    self as acp, ContentBlock, ContentChunk, MessageId, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, UsageUpdate,
+use agent_client_protocol::v2::schema::{
+    self as acp, ContentBlock, ContentChunk, IdleStateUpdate, MessageId, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    RunningStateUpdate, SessionUpdate, StateUpdate, ToolCallContent, ToolCallStatus, ToolCallUpdate, UsageUpdate,
 };
 use llm::{ToolCallError, ToolCallRequest, ToolCallResult};
-use mcp_utils::display_meta::{PlanMetaStatus, ToolResultMeta};
+use utils::display_meta::{PlanMetaStatus, ToolResultMeta};
+
+const SUB_AGENT_TASK_MESSAGE_ID: &str = "task";
 
 /// Sends updates in delivery order.
 pub(crate) fn project_agent_event(msg: &AgentEvent, mode: NotificationMode, io: &SessionIo) {
@@ -25,26 +25,32 @@ pub(crate) fn project_agent_event(msg: &AgentEvent, mode: NotificationMode, io: 
     {
         io.send_update(update);
     }
-    if matches!(mode, NotificationMode::Replay) {
-        return;
-    }
-    match msg {
-        AgentEvent::Tool(ToolEvent::SubAgentProgress { request, payload }) => {
-            io.send(SubAgentProgressParams {
-                parent_tool_id: request.id.clone(),
-                task_id: payload.task_id.clone(),
-                agent_name: payload.agent_name.clone(),
-                event: to_sub_agent_event(&payload.event),
-            });
+    match (msg, mode) {
+        (AgentEvent::Tool(ToolEvent::SubAgentProgress { request, payload }), _) => {
+            project_sub_agent_event(request, payload, mode, io);
         }
-        AgentEvent::Context(ContextEvent::Cleared) => io.send(ContextClearedParams::default()),
-        AgentEvent::SessionUsage(usage) => io.send(SessionUsageParams { usage: usage.clone() }),
+        (AgentEvent::Context(ContextEvent::Cleared), NotificationMode::Live) => {
+            io.send(ContextClearedParams { session_id: io.session_id().clone() });
+        }
+        (AgentEvent::SessionUsage(usage), NotificationMode::Live) => {
+            io.send(SessionUsageParams { usage: usage.clone() });
+        }
         _ => {}
     }
 }
 
+pub(crate) fn stop_reason(outcome: &TurnOutcome) -> acp::StopReason {
+    match outcome {
+        TurnOutcome::Completed => acp::StopReason::EndTurn,
+        TurnOutcome::Failed { error, .. } => {
+            acp::ErrorStopReason::new().error(acp::Error::internal_error().data(error.clone())).into()
+        }
+        TurnOutcome::Cancelled => acp::StopReason::Cancelled,
+    }
+}
+
 /// Replace the session's itemized plan with the tool result's plan snapshot.
-pub fn try_extract_plan_notification(result_meta: Option<&ToolResultMeta>) -> Option<SessionUpdate> {
+pub(crate) fn try_extract_plan_notification(result_meta: Option<&ToolResultMeta>) -> Option<SessionUpdate> {
     let plan_meta = result_meta?.plan.as_ref()?;
     let entries = plan_meta
         .entries
@@ -55,12 +61,12 @@ pub fn try_extract_plan_notification(result_meta: Option<&ToolResultMeta>) -> Op
 }
 
 #[derive(Clone, Copy)]
-pub enum NotificationMode {
+pub(crate) enum NotificationMode {
     Live,
     Replay,
 }
 
-pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode) -> Option<SessionUpdate> {
+pub(crate) fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode) -> Option<SessionUpdate> {
     match msg {
         AgentEvent::Context(ContextEvent::UsageUpdated { usage }) => map_context_usage_to_notification(usage),
 
@@ -72,11 +78,11 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
             map_message_to_notification(MessageKind::Thought, message_id, chunk, *is_complete, mode)
         }
 
-        AgentEvent::Tool(ToolEvent::Call { request, .. }) => Some(map_tool_call_to_notification(request)),
-
-        AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id, chunk, .. }) => {
-            Some(map_tool_call_update_to_notification(tool_call_id, chunk))
+        AgentEvent::Tool(ToolEvent::InputStarted { id, name }) => {
+            Some(SessionUpdate::ToolCallUpdate(tool_call_upsert(id, name)))
         }
+
+        AgentEvent::Tool(ToolEvent::Call { request }) => Some(map_tool_call_to_notification(request)),
 
         AgentEvent::Tool(
             ToolEvent::Result { result, result_meta, .. } | ToolEvent::TaskCompleted { result, result_meta, .. },
@@ -86,10 +92,13 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
             Some(map_tool_error_to_notification(error))
         }
 
-        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => Some(SessionUpdate::ToolCallUpdate(
-            ToolCallUpdate::new(request.id.clone())
-                .status(ToolCallStatus::Failed)
-                .content(vec![format!("Refused: {reason}").into()]),
+        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => Some(map_tool_error_to_notification(
+            &ToolCallError {
+                id: request.id.clone(),
+                name: request.name.clone(),
+                arguments: Some(request.arguments.clone()),
+                error: reason.clone(),
+            },
         )),
 
         AgentEvent::Tool(ToolEvent::TaskCreated { request, status_message, .. }) => {
@@ -144,35 +153,28 @@ pub fn map_agent_event_to_notification(msg: &AgentEvent, mode: NotificationMode)
                 acp::CompactionStatus::Cancelled,
             ))),
         },
-        AgentEvent::Context(ContextEvent::Cleared)
+        AgentEvent::Turn(TurnEvent::Ended { outcome: TurnOutcome::Failed { message_id, error } }) => {
+            Some(SessionUpdate::AgentMessage(
+                acp::AgentMessage::new(MessageId::new(message_id.as_str()))
+                    .content(vec![ContentBlock::from(format!("Error: {error}"))]),
+            ))
+        }
+        AgentEvent::Context(ContextEvent::Cleared | ContextEvent::ReplyRecorded { .. })
         | AgentEvent::Turn(
             TurnEvent::Started { .. }
-            | TurnEvent::Ended {
-                outcome:
-                    TurnOutcome::Completed
-                    | TurnOutcome::Cancelled
-                    | TurnOutcome::Failed { .. }
-                    | TurnOutcome::MaxTurnsReached { .. },
-            }
+            | TurnEvent::UserMessageInserted { .. }
+            | TurnEvent::UserMessageDiscarded { .. }
+            | TurnEvent::Ended { outcome: TurnOutcome::Completed | TurnOutcome::Cancelled }
             | TurnEvent::RetryScheduled { .. }
             | TurnEvent::LlmCallStarted { .. }
             | TurnEvent::LlmCallEnded { .. }
             | TurnEvent::AutoContinue { .. },
         )
         | AgentEvent::Tool(
-            ToolEvent::ExecutionStarted { .. }
-            | ToolEvent::DefinitionsUpdated { .. }
-            | ToolEvent::SubAgentProgress { .. },
+            ToolEvent::InputDelta { .. } | ToolEvent::DefinitionsUpdated { .. } | ToolEvent::SubAgentProgress { .. },
         )
-        | AgentEvent::Model(ModelEvent::Switched { .. } | ModelEvent::Fallback { .. })
+        | AgentEvent::Model(ModelEvent::Switched { .. })
         | AgentEvent::SessionUsage(_) => None,
-    }
-}
-
-fn json_patch_value(value: serde_json::Value) -> MaybeUndefined<serde_json::Value> {
-    match value {
-        serde_json::Value::Null => MaybeUndefined::Null,
-        value => MaybeUndefined::Value(value),
     }
 }
 
@@ -234,23 +236,16 @@ fn thought_message_id(message_id: &llm::MessageId) -> MessageId {
     MessageId::new(format!("{message_id}:thought"))
 }
 
-fn map_tool_call_to_notification(request: &ToolCallRequest) -> SessionUpdate {
-    let raw_input = serde_json::from_str(&request.arguments).map_or(MaybeUndefined::Undefined, json_patch_value);
-    SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(request.id.clone())
-            .title(humanize_tool_name(&request.name))
-            .status(acp::ToolCallStatus::InProgress)
-            .raw_input(raw_input)
-            .name(request.name.clone()),
-    )
+fn tool_call_upsert(id: &str, name: &str) -> ToolCallUpdate {
+    ToolCallUpdate::new(id.to_string())
+        .title(humanize_tool_name(name))
+        .status(ToolCallStatus::InProgress)
+        .name(name.to_string())
 }
 
-fn map_tool_call_update_to_notification(tool_call_id: &str, chunk: &str) -> SessionUpdate {
-    let update = ToolCallUpdate::new(tool_call_id.to_string())
-        .status(ToolCallStatus::InProgress)
-        .raw_input(json_patch_value(parse_tool_call_chunk(chunk)));
-
-    SessionUpdate::ToolCallUpdate(update)
+fn map_tool_call_to_notification(request: &ToolCallRequest) -> SessionUpdate {
+    let raw_input = MaybeUndefined::from(serde_json::from_str::<Option<serde_json::Value>>(&request.arguments).ok());
+    SessionUpdate::ToolCallUpdate(tool_call_upsert(&request.id, &request.name).raw_input(raw_input))
 }
 
 fn map_tool_result_to_notification(result: &ToolCallResult, result_meta: Option<&ToolResultMeta>) -> SessionUpdate {
@@ -263,13 +258,12 @@ fn map_tool_result_to_notification(result: &ToolCallResult, result_meta: Option<
         content.push(diff.into());
     }
 
-    let mut update = ToolCallUpdate::new(result.id.clone()).status(ToolCallStatus::Completed).content(content);
+    let update = ToolCallUpdate::new(result.id.clone()).status(ToolCallStatus::Completed).content(content);
 
-    if let Some(rm) = result_meta {
-        update = update.title(rm.display.title.clone()).meta(tool_display_meta(&rm.display.value));
-    }
-
-    SessionUpdate::ToolCallUpdate(update)
+    SessionUpdate::ToolCallUpdate(match result_meta {
+        Some(rm) => displayed(update, rm),
+        None => update,
+    })
 }
 
 fn map_tool_error_to_notification(error: &ToolCallError) -> SessionUpdate {
@@ -302,69 +296,92 @@ fn map_tool_progress_to_notification(
 }
 
 fn map_display_update_to_notification(request: &ToolCallRequest, meta: &ToolResultMeta) -> SessionUpdate {
-    let update = ToolCallUpdate::new(request.id.clone())
-        .status(ToolCallStatus::InProgress)
-        .title(meta.display.title.clone())
-        .name(request.name.clone())
-        .meta(tool_display_meta(&meta.display.value));
+    let update = ToolCallUpdate::new(request.id.clone()).status(ToolCallStatus::InProgress).name(request.name.clone());
 
-    SessionUpdate::ToolCallUpdate(update)
+    SessionUpdate::ToolCallUpdate(displayed(update, meta))
+}
+
+fn displayed(update: ToolCallUpdate, meta: &ToolResultMeta) -> ToolCallUpdate {
+    let update = update.title(meta.display.title.clone()).meta(tool_display_meta(&meta.display.value));
+    if meta.locations.is_empty() {
+        return update;
+    }
+    update.locations(
+        meta.locations
+            .iter()
+            .map(|location| acp::ToolCallLocation::new(location.path.as_str()).line(location.line))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn tool_display_meta(value: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut meta = serde_json::Map::new();
-    if !value.is_empty() {
-        meta.insert("display_value".into(), value.into());
-    }
-    meta
+    let value = if value.is_empty() { serde_json::Value::Null } else { value.into() };
+    serde_json::Map::from_iter([("display_value".to_string(), value)])
 }
 
-/// Project the full agent event down to the lightweight sub-agent wire type.
-fn to_sub_agent_event(event: &AgentEvent) -> SubAgentEvent {
-    match event {
-        AgentEvent::Tool(ToolEvent::Call { request }) => SubAgentEvent::ToolCall {
-            request: SubAgentToolRequest {
-                id: request.id.clone(),
-                name: request.name.clone(),
-                arguments: request.arguments.clone(),
-            },
-        },
-        AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id, chunk }) => SubAgentEvent::ToolCallUpdate {
-            update: SubAgentToolCallUpdate { id: tool_call_id.clone(), chunk: chunk.clone() },
-        },
-        AgentEvent::Tool(ToolEvent::Result { result, result_meta }) => SubAgentEvent::ToolResult {
-            result: SubAgentToolResult {
-                id: result.id.clone(),
-                name: result.name.clone(),
-                result_meta: result_meta.clone(),
-            },
-        },
-        AgentEvent::Tool(ToolEvent::Error { error }) => {
-            SubAgentEvent::ToolError { error: SubAgentToolError { id: error.id.clone(), name: error.name.clone() } }
+fn project_sub_agent_event(
+    request: &ToolCallRequest,
+    payload: &SubAgentProgressPayload,
+    mode: NotificationMode,
+    parent: &SessionIo,
+) {
+    let child = parent.for_session(payload.session_id.as_str().into());
+    match &payload.event {
+        AgentEvent::Turn(TurnEvent::Started { content }) => {
+            let cancellable = acp::SubagentSessionCapabilities::new().cancel(acp::SessionCancelCapabilities::new());
+            let announcement = match mode {
+                NotificationMode::Live => sub_agent_announcement(request, payload).capabilities(cancellable),
+                NotificationMode::Replay => sub_agent_announcement(request, payload),
+            };
+            report_sub_agent_state(announcement, StateUpdate::Running(RunningStateUpdate::new()), parent, &child);
+            child.send_update(SessionUpdate::SessionMessage(
+                acp::SessionMessage::new(SUB_AGENT_TASK_MESSAGE_ID)
+                    .sender_session_id(parent.session_id().clone())
+                    .recipient_session_id(child.session_id().clone())
+                    .content(content.iter().map(map_user_content_block).collect::<Vec<_>>()),
+            ));
         }
-        AgentEvent::Turn(TurnEvent::Ended { .. }) => SubAgentEvent::Done,
-        _ => SubAgentEvent::Other,
+        AgentEvent::Turn(TurnEvent::Ended { outcome }) => {
+            project_agent_event(&payload.event, mode, &child);
+            let idle = StateUpdate::Idle(IdleStateUpdate::new().stop_reason(stop_reason(outcome)));
+            report_sub_agent_state(sub_agent_announcement(request, payload), idle, parent, &child);
+        }
+        event => project_agent_event(event, mode, &child),
     }
+}
+
+fn sub_agent_announcement(request: &ToolCallRequest, payload: &SubAgentProgressPayload) -> acp::SubagentUpdate {
+    acp::SubagentUpdate::new(payload.session_id.as_str())
+        .title(payload.agent_name.clone())
+        .meta(SubAgentMeta::new(request.id.clone()).to_meta())
+}
+
+fn report_sub_agent_state(
+    announcement: acp::SubagentUpdate,
+    state: StateUpdate,
+    parent: &SessionIo,
+    child: &SessionIo,
+) {
+    parent.send_update(SessionUpdate::SubagentUpdate(announcement.state(state.clone())));
+    child.send_update(SessionUpdate::StateUpdate(state));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_utils::notifications::SubAgentEvent;
-    use aether_core::events::SubAgentProgressPayload;
-    use agent_client_protocol::Client;
-    use agent_client_protocol::schema::v2::TextContent;
-    use llm::{ContextUsage, ToolCallRequest};
-    use mcp_utils::display_meta::{PlanMeta, PlanMetaEntry, ToolDisplayMeta};
+    use agent_client_protocol::v2::schema::TextContent;
+    use agent_client_protocol::{Client, JsonRpcNotification};
+    use llm::ContextUsage;
     use serde_json::json;
     use tokio::sync::mpsc::unbounded_channel;
+    use utils::display_meta::{PlanMeta, PlanMetaEntry, ToolDisplayMeta, ToolLocation};
 
-    fn forwarded<N: agent_client_protocol::JsonRpcNotification + Send + 'static>(event: &AgentEvent) -> N {
+    fn forwarded<T: JsonRpcNotification + Send + 'static>(events: &[AgentEvent]) -> T {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
             tokio::task::LocalSet::new().run_until(async {
                 let (tx, mut rx) = unbounded_channel();
                 let client = Client.v2().on_receive_notification(
-                    async move |notification: N, _cx| {
+                    async move |notification: T, _cx| {
                         tx.send(notification).ok();
                         Ok(())
                     },
@@ -379,60 +396,51 @@ mod tests {
                 let pair = acp_utils::testing::connect_pair(agent, client).await;
                 pair.client.send_request(acp_utils::testing::initialize_request()).block_task().await.unwrap();
                 let io = SessionIo::new(Some(pair.agent), "session".into());
-                project_agent_event(event, NotificationMode::Live, &io);
+                for event in events {
+                    project_agent_event(event, NotificationMode::Live, &io);
+                }
                 rx.recv().await.unwrap()
             }),
         )
     }
 
-    fn sub_agent_notification(event: AgentEvent) -> SubAgentEvent {
-        let event = AgentEvent::Tool(ToolEvent::SubAgentProgress {
-            request: ToolCallRequest { id: "parent".into(), name: "spawn".into(), arguments: "{}".into() },
-            payload: Box::new(SubAgentProgressPayload { task_id: "task".into(), agent_name: "worker".into(), event }),
-        });
-        let params: SubAgentProgressParams = forwarded(&event);
-        params.event
+    #[test]
+    fn tool_input_start_announces_the_tool_and_deltas_are_not_forwarded() {
+        let started = mapped_tool(&AgentEvent::Tool(ToolEvent::InputStarted {
+            id: "call_1".into(),
+            name: "coding__read_file".into(),
+        }));
+        assert_eq!(started.title, MaybeUndefined::Value("Read file".into()));
+        assert_eq!(started.name.value().map(String::as_str), Some("coding__read_file"));
+        assert_eq!(started.status, MaybeUndefined::Value(ToolCallStatus::InProgress));
+        assert!(started.raw_input.is_undefined());
+
+        let delta = AgentEvent::Tool(ToolEvent::InputDelta { id: "call_1".into(), chunk: "{".into() });
+        assert!(map_agent_event_to_session_notification(&delta).is_none());
     }
 
     #[test]
-    fn task_status_maps_to_acp_lifecycle_status() {
-        let request = ToolCallRequest { id: "call-1".into(), name: "tasks__work".into(), arguments: "{}".into() };
-        let cases = [
-            ("working", ToolCallStatus::InProgress),
-            ("input_required", ToolCallStatus::Pending),
-            ("completed", ToolCallStatus::Completed),
-            ("failed", ToolCallStatus::Failed),
-            ("cancelled", ToolCallStatus::Cancelled),
-        ];
-
-        for (status, expected) in cases {
-            let event = AgentEvent::Tool(ToolEvent::TaskStatus {
-                request: request.clone(),
+    fn task_lifecycle_events_map_to_acp_tool_status() {
+        let status = |status: &str| {
+            AgentEvent::Tool(ToolEvent::TaskStatus {
+                request: request("{}"),
                 task_id: "task-1".into(),
                 status: status.into(),
                 status_message: None,
-            });
-            let notification = map_agent_event_to_session_notification(&event).expect("task status notification");
-            let SessionUpdate::ToolCallUpdate(update) = notification else {
-                panic!("expected tool call update");
-            };
-            assert_eq!(update.status, MaybeUndefined::Value(expected));
-        }
-    }
-
-    #[test]
-    fn cancelled_task_notification_maps_to_cancelled_tool_status() {
-        let event = AgentEvent::Tool(ToolEvent::TaskCancelled {
-            request: ToolCallRequest { id: "call-1".into(), name: "tasks__work".into(), arguments: "{}".into() },
-            task_id: "task-1".into(),
-        });
-
-        let notification = map_agent_event_to_session_notification(&event).expect("task cancellation notification");
-        let SessionUpdate::ToolCallUpdate(update) = notification else {
-            panic!("expected tool call update");
+            })
         };
-
-        assert_eq!(update.status, MaybeUndefined::Value(ToolCallStatus::Cancelled));
+        let cancelled = AgentEvent::Tool(ToolEvent::TaskCancelled { request: request("{}"), task_id: "task-1".into() });
+        let cases = [
+            (status("working"), ToolCallStatus::InProgress),
+            (status("input_required"), ToolCallStatus::Pending),
+            (status("completed"), ToolCallStatus::Completed),
+            (status("failed"), ToolCallStatus::Failed),
+            (status("cancelled"), ToolCallStatus::Cancelled),
+            (cancelled, ToolCallStatus::Cancelled),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(mapped_tool(&event).status, MaybeUndefined::Value(expected), "{event:?}");
+        }
     }
 
     #[test]
@@ -445,331 +453,99 @@ mod tests {
             },
         });
 
-        let notification = map_agent_event_to_session_notification(&event).expect("context usage notification");
-        let SessionUpdate::UsageUpdate(update) = notification else {
+        let Some(SessionUpdate::UsageUpdate(update)) = map_agent_event_to_session_notification(&event) else {
             panic!("expected usage update");
         };
-
-        assert_eq!(update.used, 75_000);
-        assert_eq!(update.size, 100_000);
+        assert_eq!((update.used, update.size), (75_000, 100_000));
     }
 
     #[test]
-    fn test_sub_agent_progress_emits_ext_notification() {
-        let payload = SubAgentProgressPayload {
-            task_id: "task_1".to_string(),
-            agent_name: "sub-agent".to_string(),
-            event: AgentEvent::Message(MessageEvent::Text {
-                message_id: "msg_1".into(),
-                chunk: "Hello".to_string(),
-                is_complete: false,
-            }),
-        };
-
-        let tool_progress = AgentEvent::Tool(ToolEvent::SubAgentProgress {
-            request: ToolCallRequest {
-                id: "call_123".to_string(),
-                name: "plugins__spawn_subagent".to_string(),
-                arguments: "{}".to_string(),
-            },
-            payload: Box::new(payload),
-        });
-
-        assert!(map_agent_event_to_session_notification(&tool_progress).is_none());
-
-        let params: SubAgentProgressParams = forwarded(&tool_progress);
-        assert_eq!(params.parent_tool_id, "call_123");
-        assert_eq!(params.task_id, "task_1");
-        assert_eq!(params.agent_name, "sub-agent");
-        assert!(matches!(params.event, SubAgentEvent::Other));
+    fn context_cleared_is_forwarded_as_an_agent_notification() {
+        let cleared: ContextClearedParams = forwarded(&[AgentEvent::Context(ContextEvent::Cleared)]);
+        assert_eq!(cleared.session_id.0.as_ref(), "session");
     }
 
     #[test]
-    fn test_tool_call_maps_to_tool_call_notification() -> Result<(), String> {
-        let message = AgentEvent::Tool(ToolEvent::Call {
-            request: ToolCallRequest {
-                id: "call_1".to_string(),
-                name: "coding__read_file".to_string(),
-                arguments: "{}".to_string(),
-            },
-        });
-
-        let notification = map_agent_event_to_session_notification(&message).ok_or("notification")?;
-
-        let tool_call = match notification {
-            acp::SessionUpdate::ToolCallUpdate(tool_call) => tool_call,
-            other => return Err(format!("Expected ToolCall, got {other:?}")),
-        };
-        assert_eq!(tool_call.tool_call_id.0.as_ref(), "call_1");
-        assert_eq!(tool_call.title, MaybeUndefined::Value("Read file".into()));
-        assert_eq!(tool_call.status, MaybeUndefined::Value(acp::ToolCallStatus::InProgress));
-        Ok(())
-    }
-
-    #[test]
-    fn test_tool_call_update_maps_to_tool_call_update_notification() -> Result<(), String> {
-        let message = AgentEvent::Tool(ToolEvent::CallUpdate {
-            tool_call_id: "call_1".to_string(),
-            chunk: r#"{"filePath":"Cargo.toml"}"#.to_string(),
-        });
-
-        let notification = map_agent_event_to_session_notification(&message).ok_or("notification")?;
-
-        let update = match notification {
-            acp::SessionUpdate::ToolCallUpdate(update) => update,
-            other => return Err(format!("Expected ToolCallUpdate, got {other:?}")),
-        };
-        assert_eq!(update.tool_call_id.0.as_ref(), "call_1");
-        assert_eq!(update.status, MaybeUndefined::Value(acp::ToolCallStatus::InProgress));
-        assert_eq!(update.raw_input, MaybeUndefined::Value(serde_json::json!({ "filePath": "Cargo.toml" })));
-        Ok(())
-    }
-
-    #[test]
-    fn test_tool_call_update_has_same_live_and_replay_mapping() -> Result<(), String> {
-        let message = AgentEvent::Tool(ToolEvent::CallUpdate {
-            tool_call_id: "call_1".to_string(),
-            chunk: r#"{"filePath":"Cargo.toml"}"#.to_string(),
-        });
-
-        let live = map_agent_event_to_session_notification(&message).ok_or("live notification")?;
-        let replay =
-            map_agent_event_to_notification(&message, NotificationMode::Replay).ok_or("replay notification")?;
-
-        let (live_update, replay_update) = match (live, replay) {
-            (acp::SessionUpdate::ToolCallUpdate(live), acp::SessionUpdate::ToolCallUpdate(replay)) => (live, replay),
-            other => return Err(format!("Expected ToolCallUpdate pair, got {other:?}")),
-        };
-        assert_eq!(live_update.tool_call_id.0, replay_update.tool_call_id.0);
-        assert_eq!(live_update.status, replay_update.status);
-        assert_eq!(live_update.raw_input, replay_update.raw_input);
-        Ok(())
-    }
-
-    #[test]
-    fn test_context_cleared_maps_to_agent_notification() {
-        let _: ContextClearedParams = forwarded(&AgentEvent::Context(ContextEvent::Cleared));
-    }
-
-    #[test]
-    fn test_tool_progress_with_invalid_json_falls_back_to_simple_message() -> Result<(), String> {
-        // Simulate a tool progress message with invalid JSON
-        let tool_progress = AgentEvent::Tool(ToolEvent::Progress {
-            request: ToolCallRequest {
-                id: "call_456".to_string(),
-                name: "some_tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-            progress: 50.0,
-            total: None,
-            message: Some("not valid json".to_string()),
-        });
-
-        let notification = map_agent_event_to_session_notification(&tool_progress);
-
-        assert!(notification.is_some());
-
-        // Should still produce a notification with the message as-is
-        let notification = notification.ok_or("expected notification")?;
-        let SessionUpdate::ToolCallUpdate(update) = notification else {
-            return Err("Expected ToolCallUpdate".to_string());
-        };
-        if let MaybeUndefined::Value(content) = &update.content
-            && let acp::ToolCallContent::Content(c) = &content[0]
-            && let acp::ContentBlock::Text(text) = &c.content
+    fn tool_progress_replaces_content_with_progress_text() {
+        for (total, message, expected) in
+            [(None, Some("not valid json"), "not valid json (50/?)"), (Some(100.0), None, "Progress: 50/100")]
         {
-            // Should contain the original message
-            assert!(text.text.contains("not valid json"));
+            let progress = AgentEvent::Tool(ToolEvent::Progress {
+                request: request("{}"),
+                progress: 50.0,
+                total,
+                message: message.map(str::to_string),
+            });
+            let tool = mapped_tool(&progress);
+            assert_eq!(tool.status, MaybeUndefined::Value(ToolCallStatus::InProgress));
+            assert_eq!(tool.content, MaybeUndefined::Value(vec![ToolCallContent::from(expected)]));
         }
-        Ok(())
-    }
-
-    #[test]
-    fn test_tool_call_notification_includes_original_tool_name() -> Result<(), String> {
-        let request = ToolCallRequest {
-            id: "call_1".to_string(),
-            name: "coding__read_file".to_string(),
-            arguments: "{}".to_string(),
-        };
-
-        let notification =
-            map_agent_event_to_session_notification(&AgentEvent::Tool(ToolEvent::Call { request })).unwrap();
-        let SessionUpdate::ToolCallUpdate(tool_call) = notification else {
-            return Err("Expected ToolCall".to_string());
-        };
-        assert_eq!(tool_call.name.value().map(String::as_str), Some("coding__read_file"));
-        assert_eq!(tool_call.title, MaybeUndefined::Value("Read file".into()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_result_with_result_meta_sets_meta() -> Result<(), String> {
-        use mcp_utils::display_meta::ToolDisplayMeta;
-
-        let result = ToolCallResult {
-            id: "call_1".to_string(),
-            name: "coding__read_file".to_string(),
-            arguments: "{}".to_string(),
-            result: "file contents".to_string(),
-        };
-        let rm: ToolResultMeta = ToolDisplayMeta::new("Read file", "Cargo.toml, 156 lines").into();
-
-        let notification = map_agent_event_to_session_notification(&AgentEvent::Tool(ToolEvent::Result {
-            result,
-            result_meta: Some(rm),
-        }))
-        .unwrap();
-        let update = match notification {
-            SessionUpdate::ToolCallUpdate(update) => update,
-            other => return Err(format!("Expected ToolCallUpdate, got {other:?}")),
-        };
-        assert_eq!(update.title.value().map(String::as_str), Some("Read file"), "native title should be set");
-        let meta = update.meta.take().ok_or("meta should be present")?;
-        assert_eq!(
-            meta.get("display_value").and_then(|v| v.as_str()),
-            Some("Cargo.toml, 156 lines"),
-            "display_value should be a flat key in _meta"
-        );
-        assert!(meta.get("display").is_none(), "old nested display object should not be in _meta");
-        Ok(())
-    }
-
-    #[test]
-    fn test_result_without_result_meta() -> Result<(), String> {
-        let result = ToolCallResult {
-            id: "call_1".to_string(),
-            name: "external__some_tool".to_string(),
-            arguments: "{}".to_string(),
-            result: "ok".to_string(),
-        };
-
-        let notification =
-            map_agent_event_to_session_notification(&AgentEvent::Tool(ToolEvent::Result { result, result_meta: None }))
-                .unwrap();
-        let update = match notification {
-            acp::SessionUpdate::ToolCallUpdate(update) => update,
-            other => return Err(format!("Expected ToolCallUpdate, got {other:?}")),
-        };
-        assert!(update.title.is_undefined());
-        assert!(update.meta.is_undefined());
-        Ok(())
     }
 
     #[test]
     fn test_plan_notification_none_when_no_plan_or_no_meta() {
-        use mcp_utils::display_meta::ToolDisplayMeta;
-
         let meta: ToolResultMeta = ToolDisplayMeta::new("Read file", "main.rs").into();
         assert!(try_extract_plan_notification(Some(&meta)).is_none());
         assert!(try_extract_plan_notification(None).is_none());
     }
 
     #[test]
-    fn test_display_update_emits_meta_update() -> Result<(), String> {
-        use mcp_utils::display_meta::ToolDisplayMeta;
-
-        let meta = ToolResultMeta::from(ToolDisplayMeta::new("Read file", "main.rs"));
-
-        let request = ToolCallRequest {
-            id: "call_789".to_string(),
-            name: "coding__read_file".to_string(),
-            arguments: "{}".to_string(),
-        };
-
-        let event = AgentEvent::Tool(ToolEvent::DisplayUpdate { request, meta });
-        let notification =
-            map_agent_event_to_session_notification(&event).ok_or("display update should produce a notification")?;
-
-        let update = match notification {
-            acp::SessionUpdate::ToolCallUpdate(update) => update,
-            other => return Err(format!("Expected ToolCallUpdate, got {other:?}")),
-        };
-        assert_eq!(&*update.tool_call_id.0, "call_789");
-        assert_eq!(update.title.value().map(String::as_str), Some("Read file"), "native title should be set");
-        let meta_map = update.meta.take().ok_or("meta should be present")?;
-        assert_eq!(
-            meta_map.get("display_value").and_then(|v| v.as_str()),
-            Some("main.rs"),
-            "display_value should be a flat key in _meta"
-        );
-        assert!(meta_map.get("display").is_none(), "old nested display object should not be in _meta");
-        assert_eq!(update.status, MaybeUndefined::Value(acp::ToolCallStatus::InProgress));
-        // Should NOT have content (no text progress fallback)
-        assert!(update.content.is_undefined());
-        Ok(())
-    }
-
-    #[test]
-    fn test_sub_agent_tool_result_includes_display_fields() {
-        use mcp_utils::display_meta::ToolDisplayMeta;
-
-        let event = AgentEvent::Tool(ToolEvent::Result {
-            result: ToolCallResult {
-                id: "call_1".to_string(),
-                name: "coding__read_file".to_string(),
-                arguments: r#"{"filePath":"Cargo.toml"}"#.to_string(),
-                result: "ok".to_string(),
-            },
-            result_meta: Some(ToolDisplayMeta::new("Read file", "Cargo.toml, 156 lines").into()),
-        });
-
-        match sub_agent_notification(event) {
-            SubAgentEvent::ToolResult { result } => {
-                assert_eq!(result.id, "call_1");
-                assert_eq!(result.name, "coding__read_file");
-                let result_meta = result.result_meta.expect("result_meta should be present");
-                assert_eq!(result_meta.display.title, "Read file");
-                assert_eq!(result_meta.display.value, "Cargo.toml, 156 lines");
-            }
-            other => panic!("Expected ToolResult, got {other:?}"),
+    fn display_metadata_sets_native_title_and_flat_display_value() {
+        let meta = || ToolResultMeta::from(ToolDisplayMeta::new("Read file", "main.rs"));
+        let display = mapped_tool(&AgentEvent::Tool(ToolEvent::DisplayUpdate { request: request("{}"), meta: meta() }));
+        let result = mapped_tool(&result_event(Some(meta())));
+        for tool in [&display, &result] {
+            assert_eq!(tool.title, MaybeUndefined::Value("Read file".into()));
+            assert_eq!(serde_json::to_value(tool).unwrap()["_meta"], json!({"display_value": "main.rs"}));
         }
+        assert_eq!(display.status, MaybeUndefined::Value(ToolCallStatus::InProgress));
+        assert!(display.content.is_undefined(), "display updates carry no progress text");
+        assert_eq!(result.status, MaybeUndefined::Value(ToolCallStatus::Completed));
+
+        let plain = mapped_tool(&AgentEvent::tool_result("call_1", "external__some_tool", "{}", "ok"));
+        assert!(plain.title.is_undefined());
+        assert!(plain.meta.is_undefined());
     }
 
     #[test]
-    fn test_sub_agent_tool_call_update_includes_updated_fields() {
-        let event = AgentEvent::Tool(ToolEvent::CallUpdate {
-            tool_call_id: "call_1".to_string(),
-            chunk: r#"{"filePath":"Cargo.toml"}"#.to_string(),
-        });
-
-        match sub_agent_notification(event) {
-            SubAgentEvent::ToolCallUpdate { update } => {
-                assert_eq!(update.id, "call_1");
-                assert_eq!(update.chunk, r#"{"filePath":"Cargo.toml"}"#);
-            }
-            other => panic!("Expected ToolCallUpdate, got {other:?}"),
+    fn tool_locations_become_acp_locations_and_updates_without_any_keep_the_earlier_ones() {
+        let located = || {
+            ToolResultMeta::from(ToolDisplayMeta::new("Read file", "main.rs"))
+                .located(ToolLocation::new("/repo/src/main.rs", Some(4)))
+        };
+        let display =
+            mapped_tool(&AgentEvent::Tool(ToolEvent::DisplayUpdate { request: request("{}"), meta: located() }));
+        let result = mapped_tool(&result_event(Some(located())));
+        for tool in [&display, &result] {
+            assert_eq!(
+                tool.locations,
+                MaybeUndefined::Value(vec![acp::ToolCallLocation::new("/repo/src/main.rs").line(4)])
+            );
         }
-    }
 
-    #[test]
-    fn test_sub_agent_turn_end_maps_to_done() {
-        use aether_core::events::TurnOutcome;
-
-        let event = AgentEvent::turn_ended(TurnOutcome::Completed);
-        assert!(matches!(sub_agent_notification(event), SubAgentEvent::Done));
+        let unlocated = mapped_tool(&result_event(Some(ToolDisplayMeta::new("Read file", "main.rs").into())));
+        assert!(unlocated.locations.is_undefined());
     }
 
     #[test]
     fn tool_upserts_preserve_omitted_null_and_replacement_fields() {
-        let mut tool = mapped_tool(&AgentEvent::Tool(ToolEvent::Call { request: request("{\"path\":\"a\"}") }));
+        let mut tool = mapped_tool(&call("{\"path\":\"a\"}"));
+        assert_eq!(tool.tool_call_id.0.as_ref(), "tool");
+        assert_eq!(tool.status, MaybeUndefined::Value(ToolCallStatus::InProgress));
         assert_eq!(tool.title.value().map(String::as_str), Some("Read file"));
         assert_eq!(tool.raw_input, MaybeUndefined::Value(json!({"path": "a"})));
-        let omitted = mapped_tool(&AgentEvent::Tool(ToolEvent::Call { request: request("invalid json") }));
+        let omitted = mapped_tool(&call("invalid json"));
         assert!(omitted.raw_input.is_undefined());
         assert!(serde_json::to_value(&omitted).unwrap().get("rawInput").is_none());
         tool.apply_update(omitted);
         assert_eq!(tool.raw_input, MaybeUndefined::Value(json!({"path": "a"})));
 
-        let clear =
-            mapped_tool(&AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id: "tool".into(), chunk: "null".into() }));
+        let clear = mapped_tool(&call("null"));
         assert!(clear.raw_input.is_null());
         assert_eq!(serde_json::to_value(&clear).unwrap()["rawInput"], json!(null));
         tool.apply_update(clear);
         assert!(tool.raw_input.is_null());
-        tool.apply_update(mapped_tool(&AgentEvent::Tool(ToolEvent::CallUpdate {
-            tool_call_id: "tool".into(),
-            chunk: "{\"other\":1}".into(),
-        })));
+        tool.apply_update(mapped_tool(&call("{\"other\":1}")));
         assert_eq!(tool.raw_input, MaybeUndefined::Value(json!({"other": 1})));
         assert_eq!(tool.name.value().map(String::as_str), Some("coding__read_file"));
 
@@ -789,7 +565,7 @@ mod tests {
 
     #[test]
     fn metadata_replacements_preserve_tool_identity_and_clear_old_display_values() {
-        let mut tool = mapped_tool(&AgentEvent::Tool(ToolEvent::Call { request: request("{}") }));
+        let mut tool = mapped_tool(&call("{}"));
         for value in ["a.rs", ""] {
             tool.apply_update(mapped_tool(&AgentEvent::Tool(ToolEvent::DisplayUpdate {
                 request: request("{}"),
@@ -871,6 +647,10 @@ mod tests {
 
     fn request(arguments: &str) -> ToolCallRequest {
         ToolCallRequest { id: "tool".into(), name: "coding__read_file".into(), arguments: arguments.into() }
+    }
+
+    fn call(arguments: &str) -> AgentEvent {
+        AgentEvent::tool_call("tool", "coding__read_file", arguments)
     }
 
     fn result_event(result_meta: Option<ToolResultMeta>) -> AgentEvent {

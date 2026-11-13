@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,6 +23,35 @@ describe("FakeAgent", () => {
       "message:text",
       "turn:ended",
     ]);
+  });
+
+  it("stops streaming once the run is aborted", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+
+    const run = (async () => {
+      for await (const event of FakeAgent.success().run(new Task("t"), {
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        controller.abort();
+      }
+    })();
+
+    await expect(run).rejects.toMatchObject({ code: "aborted" });
+    expect(events.map(eventName)).toEqual(["message:text"]);
+  });
+
+  it("writes nothing when the run is already aborted", async () => {
+    await using ws = await Workspace.empty();
+    const agent = FakeAgent.writesFile("hello.txt", "hello").withWorkspace(ws);
+
+    const run = Transcript.fromStream(
+      agent.run(new Task("t"), { signal: AbortSignal.abort() }),
+    );
+
+    await expect(run).rejects.toMatchObject({ cause: { code: "aborted" } });
+    expect(existsSync(ws.join("hello.txt"))).toBe(false);
   });
 
   it("withToolCall() streams tool_result, text, then done", async () => {
@@ -69,18 +99,9 @@ describe("FakeAgent", () => {
       event: {
         type: "usage_updated",
         usage: {
-          input_tokens: 200,
-          output_tokens: 20,
-          cache_read_tokens: 50,
-          cache_creation_tokens: 0,
-          reasoning_tokens: 7,
           usage_ratio: 0.5,
           context_limit: 200_000,
-          total_input_tokens: 3000,
-          total_output_tokens: 600,
-          total_cache_read_tokens: 50,
-          total_cache_creation_tokens: 0,
-          total_reasoning_tokens: 7,
+          input_tokens: 200,
         },
       },
     };
@@ -101,8 +122,11 @@ describe("FakeAgent", () => {
     const result = await Transcript.fromStream(agent.run(new Task("t")));
 
     expect(result.events.map((event) => event.category)).toContain("context");
-    expect(result.usage().total_input_tokens).toBe(3000);
-    expect(result.usage().total_output_tokens).toBe(600);
+    expect(result.usage()).toEqual({
+      usage_ratio: 0.5,
+      context_limit: 200_000,
+      input_tokens: 200,
+    });
   });
 });
 

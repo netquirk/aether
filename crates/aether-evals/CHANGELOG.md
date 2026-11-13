@@ -2,6 +2,109 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1](https://github.com/contextbridge/aether/compare/aether-evals-v0.5.0...aether-evals-v0.5.1) - 2026-11-03
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm, aether-agent-core
+
+## [0.5.0](https://github.com/contextbridge/aether/compare/aether-evals-v0.4.1...aether-evals-v0.5.0) - 2026-10-20
+
+### Added
+
+- *(evals)* [**breaking**] fetch git fixtures once and grant container users workspace access ([#621](https://github.com/contextbridge/aether/pull/621))
+
+## [0.4.1](https://github.com/contextbridge/aether/compare/aether-evals-v0.4.0...aether-evals-v0.4.1) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.4.0](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.22...aether-evals-v0.4.0) - 2026-10-19
+
+### Added
+
+- *(evals)* [**breaking**] git workspaces without the gold commit, explicit agent env, abortable runs ([#609](https://github.com/contextbridge/aether/pull/609))
+
+## [0.3.22](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.21...aether-evals-v0.3.22) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.3.21](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.20...aether-evals-v0.3.21) - 2026-10-12
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.3.20](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.19...aether-evals-v0.3.20) - 2026-10-10
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.3.19](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.18...aether-evals-v0.3.19) - 2026-10-08
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.3.18](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.17...aether-evals-v0.3.18) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core
+
+## [0.3.17](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.16...aether-evals-v0.3.17) - 2026-10-04
+
+### Fixed
+
+- wait for docker eval commands before container cleanup ([#568](https://github.com/contextbridge/aether/pull/568))
+
+## [0.3.16](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.15...aether-evals-v0.3.16) - 2026-10-04
+
+### Added
+
+- *(aether-evals)* add privileged container options to evals ([#565](https://github.com/contextbridge/aether/pull/565))
+
+## [0.3.15](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.14...aether-evals-v0.3.15) - 2026-10-03
+
+### Other
+
+- updated the following local packages: aether-agent-core, aether-llm
+
+## [0.3.14](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.13...aether-evals-v0.3.14) - 2026-10-01
+
+### Fixed
+
+- support bedrock gpt-6.1-sol routing and clean up dependencies ([#553](https://github.com/contextbridge/aether/pull/553))
+
+## [0.3.13](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.12...aether-evals-v0.3.13) - 2026-09-28
+
+### Other
+
+- Fix/aether server logs when detached ([#531](https://github.com/contextbridge/aether/pull/531))
+
+## [0.3.12](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.11...aether-evals-v0.3.12) - 2026-09-27
+
+### Other
+
+- updated the following local packages: aether-agent-core, aether-project, aether-llm
+
+## [0.3.11](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.10...aether-evals-v0.3.11) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project
+
+## [0.3.10](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.9...aether-evals-v0.3.10) - 2026-09-23
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-project
+
 ## [0.3.9](https://github.com/contextbridge/aether/compare/aether-evals-v0.3.8...aether-evals-v0.3.9) - 2026-09-21
 
 ### Other

@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.17](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.16...aether-mcp-utils-v0.7.17) - 2026-11-03
+
+### Other
+
+- updated the following local packages: aether-utils, aether-auth
+
+## [0.7.16](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.15...aether-mcp-utils-v0.7.16) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-auth
+
+## [0.7.15](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.14...aether-mcp-utils-v0.7.15) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- *(deps)* bump sse-stream from 0.2.6 to 0.3.0 ([#603](https://github.com/contextbridge/aether/pull/603))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.7.14](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.13...aether-mcp-utils-v0.7.14) - 2026-10-12
+
+### Added
+
+- Support sigv4 auth mechanism for MCP servers. ([#597](https://github.com/contextbridge/aether/pull/597))
+
+### Other
+
+- Simplify MCP code around Client, Server and Gateway concepts  ([#595](https://github.com/contextbridge/aether/pull/595))
+
+## [0.7.13](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.12...aether-mcp-utils-v0.7.13) - 2026-10-10
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.7.12](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.11...aether-mcp-utils-v0.7.12) - 2026-10-08
+
+### Other
+
+- Fix flaky test ([#587](https://github.com/contextbridge/aether/pull/587))
+
+## [0.7.11](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.10...aether-mcp-utils-v0.7.11) - 2026-10-05
+
+### Fixed
+
+- preserve configured MCP HTTP headers verbatim ([#571](https://github.com/contextbridge/aether/pull/571))
+
+## [0.7.10](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.9...aether-mcp-utils-v0.7.10) - 2026-10-03
+
+### Fixed
+
+- ACP actor gets proper state when background tasks return  ([#559](https://github.com/contextbridge/aether/pull/559))
+
+## [0.7.9](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.8...aether-mcp-utils-v0.7.9) - 2026-10-01
+
+### Fixed
+
+- support bedrock gpt-6.1-sol routing and clean up dependencies ([#553](https://github.com/contextbridge/aether/pull/553))
+
+## [0.7.8](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.7...aether-mcp-utils-v0.7.8) - 2026-09-28
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.7.7](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.6...aether-mcp-utils-v0.7.7) - 2026-09-27
+
+### Added
+
+- Add a browser client package that connects to an aether server over a websocket.  ([#529](https://github.com/contextbridge/aether/pull/529))
+
+## [0.7.6](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.5...aether-mcp-utils-v0.7.6) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm
+
+## [0.7.5](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.4...aether-mcp-utils-v0.7.5) - 2026-09-23
+
+### Other
+
+- updated the following local packages: aether-llm
+
 ## [0.7.4](https://github.com/contextbridge/aether/compare/aether-mcp-utils-v0.7.3...aether-mcp-utils-v0.7.4) - 2026-09-21
 
 ### Other

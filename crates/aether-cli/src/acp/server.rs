@@ -1,6 +1,5 @@
-use super::health::{self, PrefixedStream};
 use super::state::{AcpState, ClientGuard};
-use super::{AcpArgs, AcpRunError, create_acp_state};
+use super::{AcpArgs, AcpRunError, IdleHook, SessionHooks, create_acp_state};
 use crate::output::OutputFormat;
 use crate::prompt::prompt_or_stdin;
 use acp_utils::websocket::WebSocketTransport;
@@ -10,6 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -28,22 +28,17 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub listen: SocketAddr,
 
+    /// Server workspace used to resolve settings and as the default session directory.
+    #[arg(short = 'C', long, default_value = ".")]
+    pub cwd: PathBuf,
+
     /// Initial prompt to run.
     #[arg(long)]
     pub prompt: Option<String>,
 
-    #[command(flatten)]
-    pub detached: DetachedArgs,
-
-    #[command(flatten)]
-    pub acp: AcpArgs,
-}
-
-#[derive(clap::Args, Clone, Debug, Default)]
-pub struct DetachedArgs {
-    /// Output format for when no clients are attached.
-    #[arg(long)]
-    pub output: Option<OutputFormat>,
+    /// Format for agent events written to stdout/stderr.
+    #[arg(long, default_value = "text")]
+    pub output: OutputFormat,
 
     /// How many seconds to wait after the agent becomes idle before running the --on-idle command.
     #[arg(long, requires = "on_idle")]
@@ -52,6 +47,9 @@ pub struct DetachedArgs {
     /// Shell command to spawn when the agent becomes idle.
     #[arg(long, requires = "idle_after")]
     pub on_idle: Option<String>,
+
+    #[command(flatten)]
+    pub acp: AcpArgs,
 }
 
 #[derive(Debug, Error)]
@@ -73,7 +71,7 @@ pub enum ServerRunError {
 }
 
 pub async fn run_server(args: ServerArgs) -> Result<(), ServerRunError> {
-    let cwd = canonicalize(&args.acp.cwd)
+    let cwd = canonicalize(&args.cwd)
         .and_then(|cwd| {
             if cwd.is_dir() {
                 Ok(cwd)
@@ -81,10 +79,17 @@ pub async fn run_server(args: ServerArgs) -> Result<(), ServerRunError> {
                 Err(io::Error::new(io::ErrorKind::NotADirectory, "workspace must be a directory"))
             }
         })
-        .map_err(|source| ServerRunError::Workspace { path: args.acp.cwd.clone(), source })?;
+        .map_err(|source| ServerRunError::Workspace { path: args.cwd, source })?;
 
     let prompt = prompt_or_stdin(args.prompt).map_err(ServerRunError::PromptStdin)?;
-    let state = Arc::new(create_acp_state(args.acp, &cwd, args.detached)?);
+    let hooks = SessionHooks {
+        echo: Some(args.output),
+        idle: args
+            .idle_after
+            .zip(args.on_idle)
+            .map(|(seconds, command)| IdleHook { after: Duration::from_secs(seconds), command }),
+    };
+    let state = Arc::new(create_acp_state(args.acp, &cwd, hooks)?);
     let server = AcpServer::bind(args.listen, state.clone()).await?;
     info!(address = %args.listen, cwd = %cwd.display(), "Starting Aether ACP WebSocket server");
 
@@ -173,36 +178,6 @@ impl AcpServer {
 
 #[expect(clippy::result_large_err, reason = "tungstenite's handshake callback requires an HTTP error response")]
 async fn serve_connection(socket: TcpStream, peer: SocketAddr, guard: Option<ClientGuard>, stop: CancellationToken) {
-    let mut socket = socket;
-    let head = tokio::select! {
-        biased;
-        () = stop.cancelled() => {
-            if let Some(guard) = guard {
-                guard.release().await;
-            }
-            return;
-        },
-        result = health::read_head(&mut socket) => match result {
-            Ok(head) => head,
-            Err(error) => {
-                warn!(%peer, %error, "ACP connection read failed");
-                if let Some(guard) = guard {
-                    guard.release().await;
-                }
-                return;
-            }
-        },
-    };
-    if health::is_health_request(&head) {
-        if let Some(guard) = guard {
-            guard.release().await;
-        }
-        if let Err(error) = health::write_health_response(&mut socket).await {
-            warn!(%peer, %error, "ACP health response failed");
-        }
-        return;
-    }
-
     let handshake = tokio::select! {
         biased;
         () = stop.cancelled() => {
@@ -211,7 +186,7 @@ async fn serve_connection(socket: TcpStream, peer: SocketAddr, guard: Option<Cli
             }
             return;
         },
-        result = tokio_tungstenite::accept_hdr_async(PrefixedStream::new(socket, head), |_request: &Request, response| {
+        result = tokio_tungstenite::accept_hdr_async(socket, |_request: &Request, response| {
             if guard.is_some() {
                 Ok(response)
             } else {

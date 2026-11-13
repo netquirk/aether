@@ -1,10 +1,12 @@
 use aether_core::events::{AgentEvent, ContextEvent, MessageEvent, ModelEvent, ToolEvent, TurnEvent};
+use aether_core::mcp::McpConfig;
 use aether_core::{
     core::{Prompt, agent},
     events::{Command, TurnOutcome, UserCommand},
     mcp::mcp,
 };
-use llm::{ContentBlock, providers::openrouter::OpenRouterProvider};
+use llm::ContentBlock;
+use llm::providers::generic::{GenericProvider, OPENROUTER};
 
 use std::io::{self, Write};
 
@@ -13,13 +15,14 @@ use std::io::{self, Write};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let llm = OpenRouterProvider::default("z-ai/glm-4.5-air")?;
-    let mut spawn = mcp(std::env::current_dir()?).from_json_files(&["examples/mcp.json"])?.spawn().await?;
-    let connection_details = spawn.block_until_ready().await.ok_or("MCP bootstrap aborted before completion")?;
+    let llm = GenericProvider::from_env(&OPENROUTER)?.with_model("z-ai/glm-4.5-air");
+    let config = McpConfig::from_json_file("examples/mcp.json")?;
+    let mcp = mcp(std::env::current_dir()?).with_config(config).spawn()?;
+    mcp.ready().await;
 
     let (tx, mut rx, _handle) = agent(llm)
         .system_prompt(Prompt::text("You are a helpful assistant with access to web browsing tools via Playwright."))
-        .tools(spawn.handle().clone(), connection_details.tool_definitions())
+        .mcp(mcp)
         .spawn()
         .await?;
 
@@ -72,11 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(AgentEvent::Turn(TurnEvent::Ended { outcome })) => {
                 match outcome {
                     TurnOutcome::Completed => println!("\nAgent finished"),
-                    TurnOutcome::Failed { error } => eprintln!("Error: {error}"),
+                    TurnOutcome::Failed { error, .. } => eprintln!("Error: {error}"),
                     TurnOutcome::Cancelled => println!("Cancelled"),
-                    TurnOutcome::MaxTurnsReached { max_turns } => {
-                        println!("\nAgent stopped after reaching maxTurns={max_turns}");
-                    }
                 }
                 break;
             }
@@ -113,23 +113,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(
                 AgentEvent::Tool(
-                    ToolEvent::CallUpdate { .. }
-                    | ToolEvent::ExecutionStarted { .. }
+                    ToolEvent::InputStarted { .. }
+                    | ToolEvent::InputDelta { .. }
                     | ToolEvent::DefinitionsUpdated { .. }
                     | ToolEvent::SubAgentProgress { .. }
                     | ToolEvent::DisplayUpdate { .. }
                     | ToolEvent::TaskCreated { .. },
                 )
                 | AgentEvent::Turn(
-                    TurnEvent::Started { .. } | TurnEvent::LlmCallStarted { .. } | TurnEvent::LlmCallEnded { .. },
+                    TurnEvent::Started { .. }
+                    | TurnEvent::UserMessageInserted { .. }
+                    | TurnEvent::UserMessageDiscarded { .. }
+                    | TurnEvent::LlmCallStarted { .. }
+                    | TurnEvent::LlmCallEnded { .. },
                 )
+                | AgentEvent::Context(ContextEvent::ReplyRecorded { .. })
                 | AgentEvent::SessionUsage(_),
             ) => {}
             Some(AgentEvent::Model(ModelEvent::Switched { previous, new })) => {
                 println!("Model switched: {previous} -> {new}");
-            }
-            Some(AgentEvent::Model(ModelEvent::Fallback { from, to, reason })) => {
-                println!("Provider fallback: {from} -> {to} ({reason})");
             }
             Some(AgentEvent::Context(ContextEvent::Cleared)) => {
                 println!("Context cleared");

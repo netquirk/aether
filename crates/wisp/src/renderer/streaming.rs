@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::conversation::item_view::{content_width, indent_lines};
-use crate::conversation::{ConversationItem, Revision};
 use crate::view::markdown::layout_options;
 use crate::view::wrap::as_u16;
+use acp_utils::conversation::{ConversationItem, Revision};
 use clankerdiff_ratatui::markdown::MarkdownStream;
 use clankerdiff_ratatui::{
     MarkdownCommitError, MarkdownRenderer, MarkdownRow, MarkdownStreamError, StreamingMarkdownPolicy,
@@ -51,7 +51,6 @@ impl Renderer {
                 &entry.stream,
                 layout_options(content_width(width, padding)),
                 self.theme.review(),
-                &mut self.highlighter.inner,
             )?;
 
             let update = entry.state.update_since(entry.row_revision);

@@ -1,21 +1,19 @@
-use super::agent::{AgentConfig, AutoContinue, RetryConfig};
-use super::repetition_config::RepetitionConfig;
+use super::agent::RetryConfig;
 use super::tool_policy::ToolPolicy;
 use crate::agent_spec::AgentSpec;
 use crate::context::{CompactionConfig, SessionUsageTracker};
-use crate::core::{Agent, AgentDeps, Prompt, PromptCache, Result};
-use crate::events::{AgentEvent, AgentObserver, Command};
-use crate::mcp::McpHandle;
-use llm::parser::ModelProviderParser;
-use llm::{ChatMessage, Context, ModelSettings, SessionUsageEvent, StreamingModelProvider, ToolDefinition};
+use crate::core::{Agent, AgentDeps, Prompt, Result};
+use crate::events::{AgentEvent, AgentObserver, Command, TurnOutcome};
+use crate::mcp::McpCatalog;
+use llm::{ChatMessage, ModelSettings, SessionUsageEvent, StreamingModelProvider};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
-/// Handle for communicating with a running Agent
+/// Handle to a running agent's task; dropping it aborts the agent.
 pub struct AgentHandle {
-    handle: JoinHandle<()>,
+    handle: AbortOnDropHandle<()>,
 }
 
 impl AgentHandle {
@@ -35,50 +33,43 @@ impl AgentHandle {
     }
 }
 
+pub async fn recv_agent_event(rx: &mut Receiver<AgentEvent>) -> AgentEvent {
+    rx.recv()
+        .await
+        .unwrap_or_else(|| AgentEvent::turn_ended(TurnOutcome::failed("Agent stopped before its turn ended")))
+}
+
 pub struct AgentBuilder {
-    llm: Arc<dyn StreamingModelProvider>,
-    /// Optional secondary provider the agent swaps in when the primary
-    /// fails with a 5xx (TASK-25-465). `None` keeps the pre-existing
-    /// retry-then-fail behaviour unchanged.
-    fallback: Option<Arc<dyn StreamingModelProvider>>,
-    prompts: Vec<Prompt>,
-    tool_definitions: Vec<ToolDefinition>,
-    initial_messages: Vec<ChatMessage>,
-    mcp: Option<McpHandle>,
-    channel_capacity: usize,
-    tool_timeout: Duration,
-    compaction_config: Option<CompactionConfig>,
-    max_auto_continues: u32,
-    require_tool_call: bool,
-    retry_config: RetryConfig,
-    repetition_config: RepetitionConfig,
-    context_window: Option<u32>,
-    max_turns: Option<u32>,
-    model_settings: ModelSettings,
-    observers: Vec<Box<dyn AgentObserver>>,
-    session_usage: SessionUsageTracker,
-    session_affinity_key: String,
-    tool_policy: Arc<dyn ToolPolicy>,
+    pub(super) llm: Arc<dyn StreamingModelProvider>,
+    pub(super) prompts: Vec<Prompt>,
+    pub(super) initial_messages: Vec<ChatMessage>,
+    pub(super) mcp: McpCatalog,
+    pub(super) channel_capacity: usize,
+    pub(super) tool_timeout: Duration,
+    pub(super) compaction_config: Option<CompactionConfig>,
+    pub(super) max_auto_continues: u32,
+    pub(super) retry_config: RetryConfig,
+    pub(super) context_window: Option<u32>,
+    pub(super) model_settings: ModelSettings,
+    pub(super) observers: Vec<Box<dyn AgentObserver>>,
+    pub(super) session_usage: SessionUsageTracker,
+    pub(super) session_affinity_key: String,
+    pub(super) tool_policy: Arc<dyn ToolPolicy>,
 }
 
 impl AgentBuilder {
     pub fn new(llm: Arc<dyn StreamingModelProvider>) -> Self {
         Self {
             llm,
-            fallback: None,
             prompts: Vec::new(),
-            tool_definitions: Vec::new(),
             initial_messages: Vec::new(),
-            mcp: None,
+            mcp: McpCatalog::default(),
             channel_capacity: 1000,
             tool_timeout: Duration::from_mins(60),
             compaction_config: Some(CompactionConfig::default()),
             max_auto_continues: 3,
-            require_tool_call: false,
             retry_config: RetryConfig::default(),
-            repetition_config: RepetitionConfig::default(),
             context_window: None,
-            max_turns: None,
             model_settings: ModelSettings::default(),
             observers: Vec::new(),
             session_usage: SessionUsageTracker::new("agent"),
@@ -90,33 +81,16 @@ impl AgentBuilder {
     /// Create a builder from a resolved `AgentSpec`.
     ///
     /// The LLM provider is derived from `spec.model` via `ModelProviderParser`.
-    /// `base_prompts` are prepended before the spec's own prompts.
-    pub async fn from_spec(spec: &AgentSpec, base_prompts: Vec<Prompt>, deps: &AgentDeps) -> Result<Self> {
-        let parser = ModelProviderParser::default().with_provider_connections(spec.provider_connections.clone());
-        let parser = match deps.oauth_credential_store.clone() {
-            Some(store) => parser.with_codex_provider(store),
-            None => parser,
-        };
-        let (provider, _) = parser.parse(&spec.model).await?;
-        let mut builder = Self::new(Arc::from(provider))
+    pub async fn from_spec(spec: &AgentSpec, deps: &AgentDeps) -> Result<Self> {
+        let (provider, _) = deps.model_providers().parse(&spec.model, &spec.provider_connections).await?;
+        Ok(Self::from_spec_with_llm(spec, deps, Arc::from(provider)))
+    }
+
+    pub fn from_spec_with_llm(spec: &AgentSpec, deps: &AgentDeps, llm: Arc<dyn StreamingModelProvider>) -> Self {
+        let mut builder = Self::new(llm)
             .context_window(spec.context_window)
-            .max_turns(spec.max_turns)
             .model_settings(spec.model_settings.clone())
             .session_usage(SessionUsageTracker::new(&spec.name));
-
-        // Optional fallback provider used when the primary fails with a 5xx
-        // (TASK-25-465). A bare `provider:model` is parsed the same way as
-        // `spec.model`; an alloy is not supported here because the fallback
-        // is a single second-chance provider. Empty / whitespace strings are
-        // treated as "no fallback" so a config can carry the field as
-        // documentation without enabling the path.
-        if let Some(fallback_model) = spec.fallback_model.as_deref() {
-            let trimmed = fallback_model.trim();
-            if !trimmed.is_empty() {
-                let (fallback_provider, _) = parser.parse(trimmed).await?;
-                builder = builder.fallback_provider(Arc::from(fallback_provider));
-            }
-        }
 
         if let Some(key) = &deps.session_affinity_key {
             builder = builder.session_affinity_key(key.clone());
@@ -125,15 +99,11 @@ impl AgentBuilder {
             builder = builder.observer(observer);
         }
 
-        for prompt in base_prompts {
-            builder = builder.system_prompt(prompt);
-        }
-
         for prompt in &spec.prompts {
             builder = builder.system_prompt(prompt.clone());
         }
 
-        Ok(builder)
+        builder
     }
 
     /// Add a prompt to the system prompt.
@@ -144,9 +114,8 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tools(mut self, mcp: McpHandle, tools: Vec<ToolDefinition>) -> Self {
-        self.tool_definitions = tools;
-        self.mcp = Some(mcp);
+    pub fn mcp(mut self, mcp: McpCatalog) -> Self {
+        self.mcp = mcp;
         self
     }
 
@@ -218,80 +187,15 @@ impl AgentBuilder {
         self
     }
 
-    /// Require the model to make at least one tool call before ending a turn.
-    ///
-    /// When enabled, a turn that ends with no tool call, no queued user input,
-    /// and no `EndTurn` declaration from the provider is treated as a "dead
-    /// turn": the first occurrence shares the existing auto-continue budget and
-    /// nudges the model once via [`AgentBuilder::max_auto_continues`]; the next
-    /// occurrence fails the turn with
-    /// `TurnOutcome::Failed { error: "turn ended without a tool call" }`.
-    ///
-    /// Off by default so existing chat-style agents (where an end-turn reply
-    /// without a tool call is normal) keep working unchanged.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Require a tool call on every turn, allowing one nudge before failing
-    /// agent(llm).require_tool_call(true).max_auto_continues(1)
-    /// ```
-    pub fn require_tool_call(mut self, require: bool) -> Self {
-        self.require_tool_call = require;
-        self
-    }
-
-    /// Install a fallback provider the agent swaps in when the primary
-    /// fails with a server (5xx) error. The agent records the swap as a
-    /// [`ModelEvent::Fallback`](crate::events::ModelEvent::Fallback) in the run
-    /// transcript, naming the provider that took over. The fallback is
-    /// consumed on the first
-    /// matching failure — a 5xx later in the same run does not trigger
-    /// a second swap. `None` (the default) keeps the pre-existing
-    /// retry-then-fail behaviour.
-    pub fn fallback_provider(mut self, provider: Arc<dyn StreamingModelProvider>) -> Self {
-        self.fallback = Some(provider);
-        self
-    }
-
     /// Configure retry behavior for transient LLM provider failures.
     pub fn retry(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
 
-    /// Configure the repetition detector.
-    ///
-    /// When the same assistant output (text and/or tool calls) is observed
-    /// `config.max_repeats` times in a row within one turn, the turn is
-    /// ended with [`TurnEvent::Ended`](crate::events::TurnEvent::Ended)
-    /// carrying a `TurnOutcome::Failed` error that names the repetition.
-    /// Setting the threshold to `0` (or using [`RepetitionConfig::disabled`])
-    /// turns the detector off. Default: 3.
-    pub fn repetition_config(mut self, config: RepetitionConfig) -> Self {
-        self.repetition_config = config;
-        self
-    }
-
-    /// Convenience for `repetition_config(RepetitionConfig { max_repeats })`.
-    pub fn repetition_limit(mut self, max_repeats: u32) -> Self {
-        self.repetition_config = RepetitionConfig { max_repeats };
-        self
-    }
-
     /// Override the effective model context window in tokens.
     pub fn context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
-        self
-    }
-
-    /// Cap the number of LLM chat turns in a single run.
-    ///
-    /// When `Some(n)`, the agent ends the run cleanly with
-    /// [`TurnOutcome::MaxTurnsReached`](crate::events::TurnOutcome::MaxTurnsReached)
-    /// once `n` chat turns have been started. `None` (the default) leaves the
-    /// run unbounded.
-    pub fn max_turns(mut self, max: Option<u32>) -> Self {
-        self.max_turns = max;
         self
     }
 
@@ -304,6 +208,14 @@ impl AgentBuilder {
 
     pub fn session_affinity_key(mut self, key: impl Into<String>) -> Self {
         self.session_affinity_key = key.into();
+        self
+    }
+
+    /// Install the [`ToolPolicy`] consulted before every tool call.
+    ///
+    /// The default [`AllowAllTools`](super::tool_policy::AllowAllTools) refuses nothing.
+    pub fn tool_policy(mut self, policy: Arc<dyn ToolPolicy>) -> Self {
+        self.tool_policy = policy;
         self
     }
 
@@ -327,13 +239,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Install a [`ToolPolicy`] consulted before every tool call the model requests.
-    /// The default [`AllowAllTools`](super::tool_policy::AllowAllTools) refuses nothing.
-    pub fn tool_policy(mut self, policy: Arc<dyn ToolPolicy>) -> Self {
-        self.tool_policy = policy;
-        self
-    }
-
     /// Continue session totals from the last persisted usage event, e.g. when
     /// resuming a session.
     pub fn resume_usage(mut self, last: &SessionUsageEvent) -> Self {
@@ -342,131 +247,81 @@ impl AgentBuilder {
     }
 
     pub async fn spawn(self) -> Result<(Sender<Command>, Receiver<AgentEvent>, AgentHandle)> {
-        let mut prompt_cache = PromptCache::new(self.prompts);
-        let system_content = prompt_cache.render().await?;
-        let mut messages = Vec::new();
-
-        if !system_content.is_empty() {
-            messages.push(ChatMessage::system(system_content));
-        }
-
-        messages.extend(self.initial_messages);
         let (command_tx, command_rx) = mpsc::channel::<Command>(self.channel_capacity);
         let (message_tx, agent_event_rx) = mpsc::channel::<AgentEvent>(self.channel_capacity);
-        let mut context = Context::new(messages, self.tool_definitions);
-        context.set_model_settings(self.model_settings);
-        context.set_session_affinity_key(Some(self.session_affinity_key));
+        let agent = Agent::new(self, command_rx, message_tx).await?;
+        let handle = AbortOnDropHandle::new(tokio::spawn(agent.run()));
 
-        let config = AgentConfig {
-            llm: self.llm,
-            fallback: self.fallback,
-            context,
-            mcp: self.mcp,
-            tool_timeout: self.tool_timeout,
-            compaction_config: self.compaction_config,
-            auto_continue: AutoContinue::new(self.max_auto_continues),
-            retry_config: self.retry_config,
-            repetition: self.repetition_config,
-            context_window: self.context_window,
-            max_turns: self.max_turns,
-            prompt_cache,
-            observers: self.observers,
-            session_usage: self.session_usage,
-            tool_policy: self.tool_policy,
-            require_tool_call: self.require_tool_call,
-        };
-
-        let agent = Agent::new(config, command_rx, message_tx);
-        let agent_handle = tokio::spawn(agent.run());
-
-        Ok((command_tx, agent_event_rx, AgentHandle { handle: agent_handle }))
+        Ok((command_tx, agent_event_rx, AgentHandle { handle }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_spec::AgentSpecExposure;
-    use llm::ProviderConnectionOverrides;
-    use mcp_utils::client::ToolFilter;
+    use crate::events::TurnEvent;
+    use llm::testing::FakeLlmProvider;
 
     #[tokio::test]
-    async fn test_agent_handle_is_finished() {
-        let handle = AgentHandle { handle: tokio::spawn(async {}) };
+    async fn closing_the_input_lets_the_agent_finish() {
+        let (tx, _rx, handle) = AgentBuilder::new(Arc::new(FakeLlmProvider::new(Vec::new()))).spawn().await.unwrap();
+
+        drop(tx);
+
         handle.await_completion().await;
     }
 
     #[tokio::test]
-    async fn test_agent_handle_abort() {
-        let handle = AgentHandle { handle: tokio::spawn(std::future::pending::<()>()) };
-        assert!(!handle.is_finished());
-        handle.abort();
-        while !handle.is_finished() {
-            tokio::task::yield_now().await;
-        }
+    async fn dropping_the_handle_stops_the_agent() {
+        let (_tx, mut rx, handle) =
+            AgentBuilder::new(Arc::new(FakeLlmProvider::new(Vec::new()))).spawn().await.unwrap();
+
+        drop(handle);
+
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
-    async fn system_prompt_preserves_add_order() {
-        let builder = AgentBuilder::new(Arc::new(llm::testing::FakeLlmProvider::new(vec![])))
-            .system_prompt(Prompt::text("first"))
-            .system_prompt(Prompt::text("second"))
-            .system_prompt(Prompt::text("third"));
+    async fn recv_agent_event_returns_events_from_open_channel() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(AgentEvent::Turn(TurnEvent::Started { content: vec![] })).await.unwrap();
 
-        let rendered = Prompt::build_all(&builder.prompts).await.unwrap();
+        assert_eq!(recv_agent_event(&mut rx).await, AgentEvent::Turn(TurnEvent::Started { content: vec![] }));
+    }
 
-        assert_eq!(rendered, "first\n\nsecond\n\nthird");
+    #[tokio::test]
+    async fn recv_agent_event_returns_failed_turn_end_once_channel_closes() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        drop(tx);
+
+        let event = recv_agent_event(&mut rx).await;
+
+        assert!(matches!(event.turn_outcome(), Some(TurnOutcome::Failed { .. })), "got: {event:?}");
     }
 
     #[tokio::test]
     async fn from_spec_applies_context_window_and_model_settings() {
         let settings = ModelSettings { temperature: Some(0.0), max_tokens: Some(128), ..Default::default() };
         let spec = AgentSpec {
-            name: "alloy".to_string(),
-            description: "alloy".to_string(),
             model: "ollama:llama3.2,llamacpp:local".to_string(),
-            fallback_model: None,
-            reasoning_effort: None,
             model_settings: settings.clone(),
             context_window: Some(200_000),
-            max_turns: Some(7),
-            prompts: vec![],
-            provider_connections: ProviderConnectionOverrides::default(),
-            mcp_config_sources: Vec::new(),
-            exposure: AgentSpecExposure::both(),
-            tools: ToolFilter::default(),
-            tool_output: None,
+            ..AgentSpec::default()
         };
 
         let dependencies = AgentDeps::default().with_session_affinity_key("conversation-123");
-        let builder = AgentBuilder::from_spec(&spec, vec![], &dependencies).await.unwrap();
+        let builder = AgentBuilder::from_spec(&spec, &dependencies).await.unwrap();
 
         assert_eq!(builder.context_window, Some(200_000));
-        assert_eq!(builder.max_turns, Some(7));
         assert_eq!(builder.model_settings, settings);
         assert_eq!(builder.session_affinity_key, "conversation-123");
     }
 
     #[tokio::test]
     async fn from_spec_accepts_alloy_model_specs() {
-        let spec = AgentSpec {
-            name: "alloy".to_string(),
-            description: "alloy".to_string(),
-            model: "ollama:llama3.2,llamacpp:local".to_string(),
-            fallback_model: None,
-            reasoning_effort: None,
-            model_settings: ModelSettings::default(),
-            context_window: None,
-            max_turns: None,
-            prompts: vec![],
-            provider_connections: ProviderConnectionOverrides::default(),
-            mcp_config_sources: Vec::new(),
-            exposure: AgentSpecExposure::both(),
-            tools: ToolFilter::default(),
-            tool_output: None,
-        };
+        let spec = AgentSpec { model: "ollama:llama3.2,llamacpp:local".to_string(), ..AgentSpec::default() };
 
-        let builder = AgentBuilder::from_spec(&spec, vec![], &AgentDeps::default()).await;
+        let builder = AgentBuilder::from_spec(&spec, &AgentDeps::default()).await;
         assert!(builder.is_ok());
     }
 }

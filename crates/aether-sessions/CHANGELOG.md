@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.19](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.18...aether-sessions-v0.3.19) - 2026-11-03
+
+### Added
+
+- add aether-desktop gpui client ([#635](https://github.com/contextbridge/aether/pull/635))
+- ACP native subagents ([#627](https://github.com/contextbridge/aether/pull/627))
+
+## [0.3.18](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.17...aether-sessions-v0.3.18) - 2026-10-20
+
+### Fixed
+
+- *(llm)* send adaptive thinking to Claude and replay reasoning in order ([#622](https://github.com/contextbridge/aether/pull/622))
+
+## [0.3.17](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.16...aether-sessions-v0.3.17) - 2026-10-20
+
+### Other
+
+- updated the following local packages: aether-llm, aether-acp-utils, aether-agent-core
+
+## [0.3.16](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.15...aether-sessions-v0.3.16) - 2026-10-19
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm, aether-acp-utils, aether-agent-core
+
+## [0.3.15](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.14...aether-sessions-v0.3.15) - 2026-10-19
+
+### Other
+
+- Cut lines of code  ([#606](https://github.com/contextbridge/aether/pull/606))
+- Assorted cleanups  ([#601](https://github.com/contextbridge/aether/pull/601))
+
+## [0.3.14](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.13...aether-sessions-v0.3.14) - 2026-10-12
+
+### Other
+
+- Simplify MCP code around Client, Server and Gateway concepts  ([#595](https://github.com/contextbridge/aether/pull/595))
+
+## [0.3.13](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.12...aether-sessions-v0.3.13) - 2026-10-10
+
+### Other
+
+- *(deps)* bump rust-toolchain from 1.98 to 1.99 in the rust-toolchain-minor-patch group across 1 directory ([#576](https://github.com/contextbridge/aether/pull/576))
+
+## [0.3.12](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.11...aether-sessions-v0.3.12) - 2026-10-08
+
+### Other
+
+- updated the following local packages: aether-utils, aether-llm, aether-acp-utils, aether-agent-core
+
+## [0.3.11](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.10...aether-sessions-v0.3.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-acp-utils
+
+## [0.3.10](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.9...aether-sessions-v0.3.10) - 2026-10-03
+
+### Fixed
+
+- ACP actor gets proper state when background tasks return  ([#559](https://github.com/contextbridge/aether/pull/559))
+
+## [0.3.9](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.8...aether-sessions-v0.3.9) - 2026-10-01
+
+### Fixed
+
+- Bash tool highlighting ([#551](https://github.com/contextbridge/aether/pull/551))
+
+## [0.3.8](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.7...aether-sessions-v0.3.8) - 2026-09-28
+
+### Other
+
+- Fix/aether server logs when detached ([#531](https://github.com/contextbridge/aether/pull/531))
+
+## [0.3.7](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.6...aether-sessions-v0.3.7) - 2026-09-27
+
+### Other
+
+- updated the following local packages: aether-utils, aether-acp-utils, aether-agent-core, aether-llm
+
+## [0.3.6](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.5...aether-sessions-v0.3.6) - 2026-09-24
+
+### Other
+
+- updated the following local packages: aether-llm, aether-acp-utils, aether-agent-core
+
+## [0.3.5](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.4...aether-sessions-v0.3.5) - 2026-09-23
+
+### Other
+
+- updated the following local packages: aether-llm, aether-agent-core, aether-acp-utils
+
 ## [0.3.4](https://github.com/contextbridge/aether/compare/aether-sessions-v0.3.3...aether-sessions-v0.3.4) - 2026-09-21
 
 ### Other

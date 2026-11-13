@@ -4,60 +4,38 @@ use crate::catalog::LlmModel;
 use crate::providers::bedrock::BedrockProvider;
 #[cfg(feature = "codex")]
 use crate::providers::codex::CodexProvider;
-use crate::providers::{
-    anthropic::AnthropicProvider,
-    gemini::GeminiProvider,
-    local::{llama_cpp::LlamaCppProvider, ollama::OllamaProvider},
-    openai::OpenAiProvider,
-    openai_compatible::generic::{self, GenericOpenAiProvider},
-    openrouter::OpenRouterProvider,
-};
+use crate::providers::generic::{self, GenericProvider};
 use crate::{
-    LlmError, ProviderConnectionConfig, ProviderConnectionOverrides, ProviderFactory, StreamingModelProvider,
+    LlmError, ProviderConnectionConfig, ProviderConnectionOverrides, StreamingModelProvider,
     alloyed::AlloyedModelProvider,
 };
-#[cfg(feature = "codex")]
-use aether_auth::OAuthCredentialStorage;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "codex")]
-use std::sync::Arc;
+use std::future::{Future, ready};
+use std::sync::{Arc, Mutex, PoisonError};
+use tokio::sync::OnceCell;
 
 #[doc = include_str!("docs/parser.md")]
 pub struct ModelProviderParser {
     factories: HashMap<String, CreateProviderFn>,
-    provider_connections: ProviderConnectionOverrides,
-}
-
-impl ModelProviderParser {
-    /// Create a new parser with custom provider factories
-    pub fn new(factories: HashMap<String, CreateProviderFn>) -> Self {
-        Self { factories, provider_connections: ProviderConnectionOverrides::default() }
-    }
 }
 
 impl Default for ModelProviderParser {
     /// Create a parser with all built-in providers registered
     fn default() -> Self {
-        let mut parser = Self::new(HashMap::new())
-            .with_provider::<AnthropicProvider>("anthropic")
-            .with_provider::<GeminiProvider>("gemini")
-            .with_provider::<OpenRouterProvider>("openrouter")
-            .with_provider::<OllamaProvider>("ollama")
-            .with_provider::<LlamaCppProvider>("llamacpp")
-            .with_provider::<OpenAiProvider>("openai");
+        let mut parser = Self { factories: HashMap::new() };
 
         for config in generic::BUILT_INS {
-            parser = parser.with_openai_provider(config);
+            parser = parser.with_generic_provider(config);
         }
-        // The settings-driven generic provider: `providers.custom` supplies the
-        // URL, the key and any extra headers, and the model id is free-form.
-        // Registered separately from BUILT_INS because it has no catalog entry.
-        parser = parser.with_openai_provider(&generic::CUSTOM);
 
         #[cfg(feature = "bedrock")]
         {
-            parser = parser.with_provider::<BedrockProvider>("bedrock");
+            parser = parser.register(
+                "bedrock",
+                |connection| async move { Ok(BedrockProvider::new(connection).await) },
+                BedrockProvider::with_model,
+            );
         }
 
         parser
@@ -65,57 +43,21 @@ impl Default for ModelProviderParser {
 }
 
 impl ModelProviderParser {
-    pub fn with_provider_connections(mut self, connections: ProviderConnectionOverrides) -> Self {
-        self.provider_connections = connections;
-        self
-    }
-
-    pub fn with_provider<P: ProviderFactory + StreamingModelProvider + 'static>(
-        mut self,
-        name: impl Into<String>,
-    ) -> Self {
-        self.factories.insert(
-            name.into(),
-            Box::new(|model: &str, connection: ProviderConnectionConfig| {
-                let model = model.to_string();
-                Box::pin(
-                    async move { Ok(Box::new(P::from_env_with_connection(connection).await?.with_model(&model)) as _) },
-                )
-            }),
-        );
-        self
-    }
-
     #[cfg(feature = "codex")]
-    pub fn with_codex_provider(mut self, store: Arc<dyn OAuthCredentialStorage>) -> Self {
-        self.factories.insert(
-            "codex".to_string(),
-            Box::new(move |model: &str, connection: ProviderConnectionConfig| {
-                let store = Arc::clone(&store);
-                let model = model.to_string();
-                Box::pin(async move {
-                    Ok(Box::new(CodexProvider::new(store).with_connection(connection).with_model(&model)) as _)
-                })
-            }),
-        );
-        self
+    pub fn with_codex_provider(self, codex: CodexProvider) -> Self {
+        self.register_sync(
+            "codex",
+            move |connection| Ok(codex.clone().with_connection(connection)),
+            CodexProvider::with_model,
+        )
     }
 
-    pub fn with_openai_provider(mut self, config: &'static generic::ProviderConfig) -> Self {
-        self.factories.insert(
-            config.provider.parser_name().to_string(),
-            Box::new(move |model: &str, connection: ProviderConnectionConfig| {
-                let model = model.to_string();
-                Box::pin(async move {
-                    Ok(
-                        Box::new(
-                            GenericOpenAiProvider::from_env_with_connection(config, connection)?.with_model(&model),
-                        ) as _,
-                    )
-                })
-            }),
-        );
-        self
+    pub fn with_generic_provider(self, config: &'static generic::ProviderConfig) -> Self {
+        self.register_sync(
+            config.provider.parser_name(),
+            move |connection| GenericProvider::from_env_with_connection(config, connection),
+            GenericProvider::with_model,
+        )
     }
 
     /// The provider names registered in this parser, sorted.
@@ -125,13 +67,6 @@ impl ModelProviderParser {
         let mut names: Vec<&str> = self.factories.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
-    }
-
-    /// Create a provider from a typed `LlmModel`
-    pub async fn create_provider(&self, model: &LlmModel) -> Result<Box<dyn StreamingModelProvider>> {
-        let key = model.provider();
-        let factory = self.factories.get(key).ok_or_else(|| LlmError::UnknownProvider { provider: key.to_string() })?;
-        factory(&model.model_id(), self.provider_connections.config_for(key)).await
     }
 
     /// Parse a model specification string and create a provider instance.
@@ -144,14 +79,17 @@ impl ModelProviderParser {
     /// - `"provider:model"` - Single provider (e.g., "anthropic:claude-3.5-sonnet")
     /// - `"provider1:model1,provider2:model2"` - Multiple providers create an `AlloyedModelProvider`
     ///
-    pub async fn parse(&self, models_str: &str) -> Result<(Box<dyn StreamingModelProvider>, LlmModel)> {
+    pub async fn parse(
+        &self,
+        models_str: &str,
+        connections: &ProviderConnectionOverrides,
+    ) -> Result<(Box<dyn StreamingModelProvider>, LlmModel)> {
         let provider_model_pairs: Vec<&str> = models_str.split(',').map(str::trim).collect();
         if provider_model_pairs.is_empty() {
             return Err(LlmError::EmptyModelSpec);
         }
 
-        let bedrock_has_inference_profile_arn =
-            self.provider_connections.config_for("bedrock").inference_profile_arn.is_some();
+        let bedrock_has_inference_profile_arn = connections.config_for("bedrock").inference_profile_arn.is_some();
         let mut seen_bedrock = false;
         let mut seen_request_model_providers = HashSet::new();
         let mut providers = Vec::new();
@@ -170,9 +108,8 @@ impl ModelProviderParser {
                 seen_bedrock = true;
             }
 
-            if self.provider_connections.config_for(provider_name).request_model.is_some()
-                && !seen_request_model_providers.insert(provider_name)
-            {
+            let connection = connections.config_for(provider_name);
+            if connection.request_model.is_some() && !seen_request_model_providers.insert(provider_name) {
                 return Err(LlmError::DuplicateProvider {
                     provider: provider_name.to_string(),
                     field: "requestModel".to_string(),
@@ -183,8 +120,6 @@ impl ModelProviderParser {
                 .factories
                 .get(provider_name)
                 .ok_or_else(|| LlmError::UnknownProvider { provider: provider_name.to_string() })?;
-
-            let connection = self.provider_connections.config_for(provider_name);
             providers.push(factory(model, connection).await?);
 
             if first_identity.is_none() {
@@ -204,12 +139,57 @@ impl ModelProviderParser {
     }
 }
 
-/// Factory function type for creating model providers
-///
-/// Takes a model name and returns a boxed future that resolves to a `StreamingModelProvider`
-pub type CreateProviderFn = Box<
+type CreateProviderFn = Box<
     dyn Fn(&str, ProviderConnectionConfig) -> BoxFuture<'static, Result<Box<dyn StreamingModelProvider>>> + Send + Sync,
 >;
+
+struct ProviderPool<T, U> {
+    connect: U,
+    providers: Mutex<HashMap<ProviderConnectionConfig, Arc<OnceCell<T>>>>,
+}
+
+impl<T, U, V> ProviderPool<T, U>
+where
+    T: Clone,
+    U: Fn(ProviderConnectionConfig) -> V,
+    V: Future<Output = Result<T>>,
+{
+    async fn connect(&self, config: ProviderConnectionConfig) -> Result<T> {
+        let cell = Arc::clone(
+            self.providers.lock().unwrap_or_else(PoisonError::into_inner).entry(config.clone()).or_default(),
+        );
+        cell.get_or_try_init(|| (self.connect)(config)).await.cloned()
+    }
+}
+
+impl ModelProviderParser {
+    fn register<T, U, V>(mut self, name: &str, connect: U, with_model: fn(T, &str) -> T) -> Self
+    where
+        T: StreamingModelProvider + Clone + 'static,
+        U: Fn(ProviderConnectionConfig) -> V + Send + Sync + 'static,
+        V: Future<Output = Result<T>> + Send + 'static,
+    {
+        let pool = Arc::new(ProviderPool { connect, providers: Mutex::default() });
+        let create: CreateProviderFn = Box::new(move |model, config| {
+            let (pool, model) = (Arc::clone(&pool), model.to_string());
+            Box::pin(async move {
+                let provider = pool.connect(config).await?;
+                Ok(Box::new(with_model(provider, &model)) as Box<dyn StreamingModelProvider>)
+            })
+        });
+        self.factories.insert(name.to_string(), create);
+        self
+    }
+
+    fn register_sync<T: StreamingModelProvider + Clone + 'static>(
+        self,
+        name: &str,
+        connect: impl Fn(ProviderConnectionConfig) -> Result<T> + Send + Sync + 'static,
+        with_model: fn(T, &str) -> T,
+    ) -> Self {
+        self.register(name, move |config| ready(connect(config)), with_model)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -219,8 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_llamacpp() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("llamacpp").await;
+        let result = parse("llamacpp").await;
         assert!(result.is_ok());
         let (_, model) = result.unwrap();
         assert_eq!(model, LlmModel::LlamaCpp(String::new()));
@@ -228,8 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_anthropic() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("anthropic:claude-sonnet-4-6").await;
+        let result = parse("anthropic:claude-sonnet-4-6").await;
         match result {
             Ok((_, model)) => {
                 assert_eq!(model, LlmModel::Anthropic(crate::catalog::AnthropicModel::ClaudeSonnet46));
@@ -249,8 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_ollama() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("ollama:llama3.2").await;
+        let result = parse("ollama:llama3.2").await;
         assert!(result.is_ok());
         let (_, model) = result.unwrap();
         assert_eq!(model, LlmModel::Ollama("llama3.2".to_string()));
@@ -258,8 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_openai() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("openai:gpt-4.1").await;
+        let result = parse("openai:gpt-4.1").await;
         if let Err(e) = result {
             let err = e.to_string();
             assert!(err.contains("API") || err.contains("OPENAI"), "Should fail on API key, not parsing. Got: {err}");
@@ -268,8 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_openrouter() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("openrouter:google/gemini-2.5-flash").await;
+        let result = parse("openrouter:google/gemini-2.5-flash").await;
         if let Err(e) = result {
             let err = e.to_string();
             assert!(err.contains("API") || err.contains("OPENROUTER"), "Should fail on API key, not parsing");
@@ -278,8 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_gemini() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("gemini:gemini-2.5-flash").await;
+        let result = parse("gemini:gemini-2.5-flash").await;
         if let Err(e) = result {
             let err = e.to_string();
             assert!(err.contains("API") || err.contains("GEMINI"), "Should fail on API key, not parsing");
@@ -288,18 +262,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_provider_without_model() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("anthropic").await;
+        let result = parse("anthropic").await;
         assert!(result.is_err());
     }
 
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn test_parse_rejects_bedrock_inference_profile_arn() {
-        let parser = ModelProviderParser::default();
         let spec = "bedrock:arn:aws:bedrock:us-west-2:000000000000:inference-profile/us.anthropic.claude-opus-4-7";
 
-        let error = match parser.parse(spec).await {
+        let error = match parse(spec).await {
             Ok(_) => panic!("Bedrock ARN should be rejected"),
             Err(error) => error.to_string(),
         };
@@ -310,10 +282,9 @@ mod tests {
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn test_parse_rejects_bedrock_application_inference_profile_arn() {
-        let parser = ModelProviderParser::default();
         let spec = "bedrock:arn:aws:bedrock:us-west-2:000000000000:application-inference-profile/000000000000";
 
-        let error = match parser.parse(spec).await {
+        let error = match parse(spec).await {
             Ok(_) => panic!("Bedrock ARN should be rejected"),
             Err(error) => error.to_string(),
         };
@@ -323,21 +294,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_rejects_repeated_request_model_provider() {
-        let parser = ModelProviderParser::default().with_provider_connections(ProviderConnectionOverrides::new(
-            BTreeMap::from([(
-                "azure-foundry".to_string(),
-                crate::ProviderConnectionOverride {
-                    base_url: Some("http://127.0.0.1:8787".to_string()),
-                    auth_mode: Some(crate::ProviderAuthMode::None),
-                    request_model: Some("production-coding".to_string()),
-                    inference_profile_arn: None,
-                    api_key: None,
-                    headers: BTreeMap::new(),
-                },
-            )]),
-        ));
+        let parser = ModelProviderParser::default();
+        let connections = ProviderConnectionOverrides::new(BTreeMap::from([(
+            "azure-foundry".to_string(),
+            crate::ProviderConnectionOverride {
+                base_url: Some("http://127.0.0.1:8787".to_string()),
+                auth_mode: Some(crate::ProviderAuthMode::None),
+                request_model: Some("production-coding".to_string()),
+                inference_profile_arn: None,
+                idle_timeout_secs: None,
+                api_key: None,
+                headers: BTreeMap::new(),
+            },
+        )]));
 
-        let Err(error) = parser.parse("azure-foundry:gpt-5.5,azure-foundry:gpt-5.5").await else {
+        let Err(error) = parser.parse("azure-foundry:gpt-5.5,azure-foundry:gpt-5.5", &connections).await else {
             panic!("repeated request-model provider should be rejected");
         };
         assert!(error.to_string().contains("providers.azure-foundry.requestModel"));
@@ -345,8 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_unknown_provider() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("unknown:model").await;
+        let result = parse("unknown:model").await;
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(e.to_string().contains("Unknown provider"));
@@ -354,25 +324,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_custom_provider() {
-        let parser = ModelProviderParser::default().with_provider::<OllamaProvider>("custom");
-
-        let model = LlmModel::Ollama("test-model".to_string());
-        let result = parser.create_provider(&model).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_parse_single_provider() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("llamacpp").await;
+        let result = parse("llamacpp").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_parse_multiple_providers() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("llamacpp,ollama:llama3.2").await;
+        let result = parse("llamacpp,ollama:llama3.2").await;
         assert!(result.is_ok());
         let (_, model) = result.unwrap();
         assert_eq!(model, LlmModel::LlamaCpp(String::new()));
@@ -380,8 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_with_spaces() {
-        let parser = ModelProviderParser::default();
-        let result = parser.parse("llamacpp , ollama:llama3.2").await;
+        let result = parse("llamacpp , ollama:llama3.2").await;
         assert!(result.is_ok());
     }
 
@@ -389,5 +347,9 @@ mod tests {
     fn test_parser_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ModelProviderParser>();
+    }
+
+    async fn parse(spec: &str) -> Result<(Box<dyn StreamingModelProvider>, LlmModel)> {
+        ModelProviderParser::default().parse(spec, &ProviderConnectionOverrides::default()).await
     }
 }

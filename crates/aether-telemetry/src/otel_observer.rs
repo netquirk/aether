@@ -10,7 +10,10 @@ use aether_core::events::{
     AgentEvent, AgentObserver, MessageEvent, ToolEvent, TraceContext, TurnEvent, TurnOutcome, mcp_tool_name,
 };
 use llm::catalog::Provider;
-use llm::{ContentBlock, LlmCallPurpose, ModelPricing, ToolCallError, ToolCallRequest, ToolCallResult, ToolDefinition};
+use llm::{
+    ContentBlock, LlmCallPurpose, ModelIdentity, ModelPricing, ToolCallError, ToolCallRequest, ToolCallResult,
+    ToolDefinition,
+};
 use opentelemetry::trace::{SpanBuilder, SpanKind, TraceContextExt, Tracer as _};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_sdk::trace::SdkTracer;
@@ -54,9 +57,12 @@ impl AgentObserver for OtelObserver {
             AgentEvent::Tool(ToolEvent::DefinitionsUpdated { tools }) => {
                 self.tool_definitions.clone_from(tools);
             }
+            AgentEvent::Turn(TurnEvent::LlmCallStarted { purpose, model, display_name, attempt, .. }) => {
+                self.start_llm_call(*purpose, model, display_name, *attempt);
+            }
             message => {
                 if let Some(turn) = &mut self.turn {
-                    turn.on_event(message, &self.otel, &self.tool_definitions, self.system_prompt.as_deref());
+                    turn.on_event(message, &self.otel);
                 }
             }
         }
@@ -103,6 +109,70 @@ impl OtelObserver {
         let span = SpanGuard::new(span_context, TURN_CANCEL_MESSAGE);
         self.turn = Some(TurnState::new(span, input, self.otel.content.output_messages));
     }
+
+    fn start_llm_call(&mut self, purpose: LlmCallPurpose, model: &ModelIdentity, display_name: &str, attempt: u32) {
+        let Some(turn) = &mut self.turn else { return };
+        let model_name = model.model_id.as_deref().unwrap_or(display_name).to_string();
+
+        let mut metric_attributes = vec![
+            KeyValue::new(semconv::GEN_AI_OPERATION_NAME, "chat"),
+            KeyValue::new(semconv::GEN_AI_REQUEST_MODEL, model_name.clone()),
+        ];
+
+        if let Some(provider) = &model.provider {
+            metric_attributes.push(KeyValue::new(semconv::GEN_AI_PROVIDER_NAME, genai_provider_name(provider)));
+        }
+
+        if purpose == LlmCallPurpose::Compaction {
+            metric_attributes.push(KeyValue::new(semconv::LLM_PURPOSE, "compaction"));
+        }
+
+        let mut attributes = metric_attributes.clone();
+        attributes.push(KeyValue::new(semconv::GEN_AI_REQUEST_STREAM, true));
+        attributes.push(KeyValue::new(semconv::LLM_ATTEMPT, i64::from(attempt)));
+        if let Some(pricing) = model.pricing {
+            attributes.extend(pricing_attributes(pricing));
+        }
+
+        if purpose == LlmCallPurpose::Chat {
+            if let Some(input) = turn.input.get() {
+                attributes.extend(hashed_content(
+                    semconv::GEN_AI_INPUT_MESSAGES,
+                    semconv::AETHER_INPUT_MESSAGES_SHA256,
+                    input_messages_json(input),
+                    input,
+                ));
+            }
+            if self.otel.content.tool_definitions && !self.tool_definitions.is_empty() {
+                attributes.push(KeyValue::new(
+                    semconv::GEN_AI_TOOL_DEFINITIONS,
+                    tool_definitions_json(&self.tool_definitions),
+                ));
+            }
+            if self.otel.content.system_instructions
+                && let Some(prompt) = &self.system_prompt
+            {
+                attributes.extend(hashed_content(
+                    semconv::GEN_AI_SYSTEM_INSTRUCTIONS,
+                    semconv::AETHER_SYSTEM_INSTRUCTIONS_SHA256,
+                    system_instructions_json(prompt),
+                    prompt,
+                ));
+            }
+        }
+
+        let name = if model_name.is_empty() { "chat".to_string() } else { format!("chat {model_name}") };
+        let builder = SpanBuilder::from_name(name).with_kind(SpanKind::Client).with_attributes(attributes);
+        let context = self.otel.start_span(builder, Some(turn.span.context()));
+        let state = LlmCallState::new(
+            context,
+            self.otel.metrics.clone(),
+            purpose,
+            self.otel.content.output_messages,
+            metric_attributes,
+        );
+        *turn.llm_call_slot(purpose) = Some(state);
+    }
 }
 
 impl OtelInstrumentation {
@@ -114,6 +184,7 @@ impl OtelInstrumentation {
     }
 }
 
+pub(crate) const TOOLS_CALL_METHOD: &str = "tools/call";
 const TURN_CANCEL_MESSAGE: &str = "turn cancelled";
 const TOOL_CANCEL_MESSAGE: &str = "turn ended before the tool completed";
 
@@ -127,8 +198,6 @@ struct TurnState {
     output: ContentBuffer,
     chat_call: Option<LlmCallState>,
     compaction_call: Option<LlmCallState>,
-    /// Tool-call arguments streamed before execution starts, keyed by call id.
-    streamed_arguments: HashMap<String, ContentBuffer>,
     /// Spans of currently executing tools, keyed by call id.
     executing_tools: HashMap<String, SpanGuard>,
 }
@@ -141,34 +210,12 @@ impl TurnState {
             output: ContentBuffer::new(capture_output),
             chat_call: None,
             compaction_call: None,
-            streamed_arguments: HashMap::new(),
             executing_tools: HashMap::new(),
         }
     }
 
-    fn on_event(
-        &mut self,
-        message: &AgentEvent,
-        instrumentation: &OtelInstrumentation,
-        tools: &[ToolDefinition],
-        system_prompt: Option<&str>,
-    ) {
+    fn on_event(&mut self, message: &AgentEvent, instrumentation: &OtelInstrumentation) {
         match message {
-            AgentEvent::Turn(TurnEvent::LlmCallStarted { purpose, model, display_name, attempt, .. }) => {
-                self.start_llm_call(
-                    LlmCallStart {
-                        purpose: *purpose,
-                        provider: model.provider.as_deref(),
-                        model: model.model_id.as_deref(),
-                        display_name,
-                        pricing: model.pricing,
-                        attempt: *attempt,
-                    },
-                    instrumentation,
-                    tools,
-                    system_prompt,
-                );
-            }
             AgentEvent::Turn(TurnEvent::LlmCallEnded { purpose, outcome }) => {
                 if let Some(call) = self.llm_call_slot(*purpose).take() {
                     call.finish(outcome);
@@ -185,13 +232,17 @@ impl TurnState {
             AgentEvent::Message(MessageEvent::Text { chunk, is_complete: true, .. }) => {
                 self.output.push(chunk);
             }
-            AgentEvent::Tool(ToolEvent::Call { request, .. }) => self.on_tool_call(request, instrumentation),
-            AgentEvent::Tool(ToolEvent::CallUpdate { tool_call_id, chunk, .. }) => {
-                self.on_tool_call_update(tool_call_id, chunk);
+            AgentEvent::Tool(ToolEvent::InputStarted { id, name }) => {
+                if let Some(chat) = &mut self.chat_call {
+                    chat.record_tool_input_started(id, name);
+                }
             }
-            AgentEvent::Tool(ToolEvent::ExecutionStarted { tool_id, tool_name }) => {
-                self.on_tool_execution_started(tool_id, tool_name, instrumentation);
+            AgentEvent::Tool(ToolEvent::InputDelta { .. }) => {
+                if let Some(chat) = &mut self.chat_call {
+                    chat.record_tool_input_delta();
+                }
             }
+            AgentEvent::Tool(ToolEvent::Call { request }) => self.on_tool_call(request, instrumentation),
             AgentEvent::Tool(ToolEvent::Result { result, .. }) => self.on_tool_result(result, instrumentation),
             AgentEvent::Tool(ToolEvent::Error { error, .. }) => self.on_tool_error(error),
             _ => {}
@@ -211,127 +262,29 @@ impl TurnState {
                 }
                 span.end_ok();
             }
-            TurnOutcome::Failed { error } => span.end_error(None, error.clone()),
+            TurnOutcome::Failed { error, .. } => span.end_error(None, error.clone()),
             TurnOutcome::Cancelled => span.end_error(Some(ErrorKind::Cancelled), TURN_CANCEL_MESSAGE),
-            TurnOutcome::MaxTurnsReached { max_turns } => {
-                span.set_attribute(KeyValue::new("aether.turn.max_turns", i64::from(*max_turns)));
-                span.end_ok();
-            }
         }
-    }
-
-    fn start_llm_call(
-        &mut self,
-        call: LlmCallStart<'_>,
-        instrumentation: &OtelInstrumentation,
-        tools: &[ToolDefinition],
-        system_prompt: Option<&str>,
-    ) {
-        let model_name = call.model.unwrap_or(call.display_name).to_string();
-
-        // Metrics backends key series by attribute values, so the metric set
-        // stays a small fixed vocabulary — no content, no per-call details.
-        let mut metric_attributes = vec![
-            KeyValue::new(semconv::GEN_AI_OPERATION_NAME, "chat"),
-            KeyValue::new(semconv::GEN_AI_REQUEST_MODEL, model_name.clone()),
-        ];
-
-        if let Some(provider) = call.provider {
-            metric_attributes.push(KeyValue::new(semconv::GEN_AI_PROVIDER_NAME, genai_provider_name(provider)));
-        }
-
-        if call.purpose == LlmCallPurpose::Compaction {
-            metric_attributes.push(KeyValue::new(semconv::LLM_PURPOSE, "compaction"));
-        }
-
-        let mut attributes = metric_attributes.clone();
-        attributes.push(KeyValue::new(semconv::GEN_AI_REQUEST_STREAM, true));
-        attributes.push(KeyValue::new(semconv::LLM_ATTEMPT, i64::from(call.attempt)));
-        if let Some(pricing) = call.pricing {
-            attributes.extend(pricing_attributes(pricing));
-        }
-        // Only chat calls carry the turn's input and tool definitions; a
-        // compaction call's actual input is the internal summarization prompt.
-        if call.purpose == LlmCallPurpose::Chat {
-            if let Some(input) = self.input.get() {
-                attributes.extend(hashed_content(
-                    semconv::GEN_AI_INPUT_MESSAGES,
-                    semconv::AETHER_INPUT_MESSAGES_SHA256,
-                    input_messages_json(input),
-                    input,
-                ));
-            }
-            if instrumentation.content.tool_definitions && !tools.is_empty() {
-                attributes.push(KeyValue::new(semconv::GEN_AI_TOOL_DEFINITIONS, tool_definitions_json(tools)));
-            }
-            if instrumentation.content.system_instructions
-                && let Some(prompt) = system_prompt
-            {
-                attributes.extend(hashed_content(
-                    semconv::GEN_AI_SYSTEM_INSTRUCTIONS,
-                    semconv::AETHER_SYSTEM_INSTRUCTIONS_SHA256,
-                    system_instructions_json(prompt),
-                    prompt,
-                ));
-            }
-        }
-
-        let name = if model_name.is_empty() { "chat".to_string() } else { format!("chat {model_name}") };
-        let builder = SpanBuilder::from_name(name).with_kind(SpanKind::Client).with_attributes(attributes);
-        let context = instrumentation.start_span(builder, Some(self.span.context()));
-        let state = LlmCallState::new(
-            context,
-            instrumentation.metrics.clone(),
-            call.purpose,
-            instrumentation.content.output_messages,
-            metric_attributes,
-        );
-        *self.llm_call_slot(call.purpose) = Some(state);
     }
 
     fn on_tool_call(&mut self, request: &ToolCallRequest, instrumentation: &OtelInstrumentation) {
         if let Some(chat) = &mut self.chat_call {
-            chat.record_tool_call_start(request);
+            chat.record_tool_call(request);
         }
-        let mut arguments = ContentBuffer::new(instrumentation.content.tool_calls);
-        arguments.set(&request.arguments);
-        self.streamed_arguments.insert(request.id.clone(), arguments);
-    }
-
-    fn on_tool_call_update(&mut self, tool_call_id: &str, chunk: &str) {
-        if let Some(chat) = &mut self.chat_call {
-            chat.record_tool_call_update(tool_call_id, chunk);
-        }
-        if let Some(arguments) = self.streamed_arguments.get_mut(tool_call_id) {
-            arguments.push(chunk);
-        }
-    }
-
-    fn on_tool_execution_started(&mut self, tool_id: &str, tool_name: &str, instrumentation: &OtelInstrumentation) {
-        let mut attributes = vec![
-            KeyValue::new(semconv::GEN_AI_OPERATION_NAME, "execute_tool"),
-            KeyValue::new(semconv::GEN_AI_TOOL_NAME, tool_name.to_string()),
-            KeyValue::new(semconv::GEN_AI_TOOL_CALL_ID, tool_id.to_string()),
-            KeyValue::new(semconv::MCP_METHOD_NAME, "tools/call"),
-            // The server sees the tool without our namespacing prefix, so this
-            // is what joins this span to the server's span for the same call.
-            KeyValue::new(semconv::MCP_TOOL_NAME, mcp_tool_name(tool_name).to_string()),
-        ];
-        let arguments = self.streamed_arguments.remove(tool_id);
-
-        if let Some(text) = arguments.as_ref().and_then(ContentBuffer::get) {
-            attributes.push(KeyValue::new(semconv::GEN_AI_TOOL_CALL_ARGUMENTS, text.to_string()));
+        let mut attributes = execute_tool_attributes(&request.name, mcp_tool_name(&request.name));
+        attributes.push(KeyValue::new(semconv::GEN_AI_TOOL_CALL_ID, request.id.clone()));
+        if instrumentation.content.tool_calls && !request.arguments.is_empty() {
+            attributes.push(KeyValue::new(semconv::GEN_AI_TOOL_CALL_ARGUMENTS, request.arguments.clone()));
         }
 
-        let builder = SpanBuilder::from_name(format!("execute_tool {tool_name}"))
+        let builder = SpanBuilder::from_name(format!("execute_tool {}", request.name))
             .with_kind(SpanKind::Client)
             .with_attributes(attributes);
         let context = instrumentation.start_span(builder, Some(self.span.context()));
-        self.executing_tools.insert(tool_id.to_string(), SpanGuard::new(context, TOOL_CANCEL_MESSAGE));
+        self.executing_tools.insert(request.id.clone(), SpanGuard::new(context, TOOL_CANCEL_MESSAGE));
     }
 
     fn on_tool_result(&mut self, result: &ToolCallResult, instrumentation: &OtelInstrumentation) {
-        self.streamed_arguments.remove(&result.id);
         let Some(mut span) = self.executing_tools.remove(&result.id) else { return };
 
         if instrumentation.content.tool_calls {
@@ -342,7 +295,6 @@ impl TurnState {
     }
 
     fn on_tool_error(&mut self, error: &ToolCallError) {
-        self.streamed_arguments.remove(&error.id);
         if let Some(mut span) = self.executing_tools.remove(&error.id) {
             span.end_error(Some(ErrorKind::ToolError), error.error.clone());
         }
@@ -356,22 +308,21 @@ impl TurnState {
     }
 }
 
+pub(crate) fn execute_tool_attributes(tool_name: &str, mcp_tool_name: &str) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new(semconv::GEN_AI_OPERATION_NAME, "execute_tool"),
+        KeyValue::new(semconv::GEN_AI_TOOL_NAME, tool_name.to_string()),
+        KeyValue::new(semconv::MCP_METHOD_NAME, TOOLS_CALL_METHOD),
+        // The server sees the tool without our namespacing prefix, so this is
+        // what joins this span to the server's span for the same call.
+        KeyValue::new(semconv::MCP_TOOL_NAME, mcp_tool_name.to_string()),
+    ]
+}
+
 /// Maps the agent's canonical provider name to the `GenAI` semantic-convention
 /// provider name, passing providers the catalog doesn't know through as-is.
 fn genai_provider_name(provider: &str) -> String {
     provider.parse::<Provider>().map_or_else(|_| provider.to_string(), |p| p.genai_provider_name().to_string())
-}
-
-/// Borrowed view of [`TurnEvent::LlmCallStarted`]; named fields keep the two
-/// optional strings from being swapped at the call site.
-#[derive(Clone, Copy)]
-struct LlmCallStart<'a> {
-    purpose: LlmCallPurpose,
-    provider: Option<&'a str>,
-    model: Option<&'a str>,
-    display_name: &'a str,
-    pricing: Option<ModelPricing>,
-    attempt: u32,
 }
 
 fn hashed_content(content_key: &'static str, hash_key: &'static str, content: String, text: &str) -> [KeyValue; 2] {
@@ -379,20 +330,15 @@ fn hashed_content(content_key: &'static str, hash_key: &'static str, content: St
 }
 
 fn pricing_attributes(pricing: ModelPricing) -> Vec<KeyValue> {
-    let mut attributes = vec![
-        KeyValue::new(semconv::AI_INPUT_TOKEN_PRICE, pricing.input_per_million / TOKENS_PER_MILLION),
-        KeyValue::new(semconv::AI_OUTPUT_TOKEN_PRICE, pricing.output_per_million / TOKENS_PER_MILLION),
-    ];
-
-    if let Some(price) = pricing.cache_read_per_million {
-        attributes.push(KeyValue::new(semconv::AI_CACHE_READ_TOKEN_PRICE, price / TOKENS_PER_MILLION));
-    }
-
-    if let Some(price) = pricing.cache_write_per_million {
-        attributes.push(KeyValue::new(semconv::AI_CACHE_WRITE_TOKEN_PRICE, price / TOKENS_PER_MILLION));
-    }
-
-    attributes
+    [
+        (semconv::AI_INPUT_TOKEN_PRICE, Some(pricing.input_per_million)),
+        (semconv::AI_OUTPUT_TOKEN_PRICE, Some(pricing.output_per_million)),
+        (semconv::AI_CACHE_READ_TOKEN_PRICE, pricing.cache_read_per_million),
+        (semconv::AI_CACHE_WRITE_TOKEN_PRICE, pricing.cache_write_per_million),
+    ]
+    .into_iter()
+    .filter_map(|(key, per_million)| per_million.map(|price| KeyValue::new(key, price / TOKENS_PER_MILLION)))
+    .collect()
 }
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;

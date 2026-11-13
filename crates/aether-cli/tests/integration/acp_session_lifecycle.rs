@@ -1,15 +1,17 @@
 use aether_cli::acp::testing::AcpTestHarness;
-use aether_core::core::agent;
 use agent_client_protocol::Error;
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::v2::schema::{
     AbsolutePath, CloseSessionRequest, CloseSessionResponse, ContentBlock, ListSessionsRequest, ListSessionsResponse,
-    PromptRequest, ReplayFrom, ReplayFromStart, ResumeSessionRequest, SessionId, SessionUpdate, StopReason,
-    TextContent,
+    NewSessionRequest, ReplayFrom, ReplayFromStart, ResumeSessionRequest, SessionId, SessionUpdate, StopReason,
+    ToolCallStatus,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use llm::LlmResponse;
-use llm::testing::FakeLlmProvider;
+use llm::testing::{FakeLlmProvider, llm_response};
+use serde_json::json;
+use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -67,7 +69,7 @@ async fn terminal_list_cursor_returns_an_empty_page() {
             .to_string(),
         );
         let response = list(&harness, ListSessionsRequest::new().cursor(cursor)).await;
-        assert!(response.sessions.is_empty());
+        assert_eq!(response.sessions.len(), 0);
         assert!(response.next_cursor.is_none());
     })
     .await;
@@ -87,14 +89,7 @@ async fn close_removes_idle_session_but_preserves_persisted_log() {
         assert_eq!(stored.sessions.len(), 1);
         assert_eq!(stored.sessions[0].session_id.0.as_ref(), "agent-switching-session");
 
-        let prompt = harness
-            .client_cx
-            .send_request(PromptRequest::new(
-                fake.session_id().clone(),
-                vec![ContentBlock::Text(TextContent::new("after close"))],
-            ))
-            .block_task()
-            .await;
+        let prompt = harness.prompt(fake.session_id(), "after close").await;
         assert!(prompt.is_err(), "a closed session must no longer accept prompts");
     })
     .await;
@@ -104,17 +99,11 @@ async fn close_removes_idle_session_but_preserves_persisted_log() {
 async fn close_cancels_prompt_before_returning() {
     AcpTestHarness::run(|mut harness| async move {
         let release = Arc::new(Notify::new());
-        let llm = FakeLlmProvider::new(vec![vec![LlmResponse::Start, LlmResponse::text("hello"), LlmResponse::done()]])
-            .pause_turn_after(0, 1, Arc::clone(&release));
-        let (agent_tx, agent_rx, agent_handle) = agent(llm).spawn().await.expect("agent spawns");
-        let session_id = SessionId::new("prompting-session");
-        harness.insert_stub_session(agent_tx, agent_rx, agent_handle, session_id.clone(), "fake:fake").await;
+        let llm =
+            FakeLlmProvider::new(vec![llm_response().text(&["hello"]).build()]).pause_turn_after(0, 1, release.clone());
+        let session_id = harness.session("prompting-session", llm).insert().await;
 
-        let prompt = harness
-            .client_cx
-            .send_request(PromptRequest::new(session_id.clone(), vec![ContentBlock::Text(TextContent::new("hi"))]))
-            .block_task();
-        prompt.await.expect("prompt accepted");
+        harness.prompt(&session_id, "hi").await.expect("prompt accepted");
         loop {
             let notification = harness.peer.next_session_notification().await;
             if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
@@ -135,8 +124,11 @@ async fn close_cancels_prompt_before_returning() {
 async fn resume_replays_persisted_transcript_over_the_server_connection() {
     AcpTestHarness::run(|mut harness| async move {
         let session_id = "replay-session";
+        let arguments = json!({ "command": "python3 - <<'PY'\nprint('hi')\nPY" });
         harness.append_stored_session(session_id, "2026-05-01T00:00:00Z");
         harness.append_stored_prompt(session_id, "prior user");
+        harness.append_stored_tool_call(session_id, "bash", "coding__bash", &arguments.to_string());
+        harness.append_stored_tool_result(session_id, "bash", "coding__bash", "hi");
         harness.append_stored_agent_turn(session_id, "prior assistant");
 
         harness
@@ -149,11 +141,19 @@ async fn resume_replays_persisted_transcript_over_the_server_connection() {
             .await
             .expect("resume succeeds");
 
-        let first = next_history(&mut harness).await;
-        let second = next_history(&mut harness).await;
-        let SessionUpdate::UserMessage(user) = first else { panic!("user history first") };
+        let SessionUpdate::UserMessage(user) = next_history(&mut harness).await else { panic!("user history first") };
         assert!(matches!(&user.content.value().unwrap()[0], ContentBlock::Text(text) if text.text == "prior user"));
-        let SessionUpdate::AgentMessage(agent) = second else { panic!("agent history second") };
+        let SessionUpdate::ToolCallUpdate(mut tool) = next_history(&mut harness).await else {
+            panic!("tool call next")
+        };
+        let SessionUpdate::ToolCallUpdate(result) = next_history(&mut harness).await else {
+            panic!("tool result next")
+        };
+        tool.apply_update(result);
+        assert_eq!(tool.raw_input, MaybeUndefined::Value(arguments), "the resumed tool keeps its complete input");
+        assert_eq!(tool.title.value().map(String::as_str), Some("Bash"));
+        assert_eq!(tool.status, MaybeUndefined::Value(ToolCallStatus::Completed));
+        let SessionUpdate::AgentMessage(agent) = next_history(&mut harness).await else { panic!("agent history last") };
         assert!(
             matches!(&agent.content.value().unwrap()[0], ContentBlock::Text(text) if text.text == "prior assistant")
         );
@@ -174,17 +174,12 @@ async fn resume_restores_transcript_without_replay_and_replaces_active_session()
         let resume = harness.client_cx.send_request(ResumeSessionRequest::new(session_id.clone(), AbsolutePath::new("/tmp"))).block_task();
         resume.await.expect("resume succeeds");
 
-        let prompt = harness
-            .client_cx
-            .send_request(PromptRequest::new(session_id.clone(), vec![ContentBlock::Text(TextContent::new("next prompt"))]))
-            .block_task()
-            .await
-            .expect("prompt on resumed session succeeds");
-        assert_eq!(serde_json::to_value(prompt).unwrap(), serde_json::json!({}));
+        let prompt = harness.prompt(&session_id, "next prompt").await.expect("prompt on resumed session succeeds");
         loop {
             let notification = harness.peer.next_session_notification().await;
             match notification.update {
                 SessionUpdate::UserMessage(message) => {
+                    assert_eq!(message.message_id, prompt.message_id);
                     assert!(matches!(&message.content.value().unwrap()[0], ContentBlock::Text(text) if text.text == "next prompt"));
                     break;
                 }
@@ -195,6 +190,21 @@ async fn resume_restores_transcript_without_replay_and_replaces_active_session()
         harness.expect_idle(&session_id, StopReason::EndTurn).await;
         harness.resume_agent().assert_saw(&["prior user", "prior assistant", "next prompt"]);
         active.planner().assert_never_ran();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commands_are_advertised_while_another_mcp_server_is_still_connecting() {
+    AcpTestHarness::run(|mut harness| async move {
+        harness.add_stalled_mcp_server();
+        let session = harness.insert_agent_switching_session().await;
+
+        let advertises_plan = |update: &SessionUpdate| {
+            matches!(update, SessionUpdate::AvailableCommandsUpdate(commands)
+                if commands.available_commands.iter().any(|command| command.name() == "plan"))
+        };
+        harness.updates_until(session.session_id(), advertises_plan).await;
     })
     .await;
 }
@@ -235,10 +245,57 @@ async fn disconnect_during_startup_leaves_no_detached_runtime() {
     .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_new_sessions_leave_one_live_session() {
+    AcpTestHarness::run(|harness| async move {
+        let new_session =
+            || harness.client_cx.send_request(NewSessionRequest::new(AbsolutePath::new("/tmp"))).block_task();
+
+        let results = start_twice_concurrently(&harness, new_session).await;
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(harness.live_runtime_count(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_resumes_of_one_session_share_one_actor() {
+    AcpTestHarness::run(|harness| async move {
+        harness.append_stored_session("stored", "2026-05-01T00:00:00Z");
+        let resume = || {
+            harness.client_cx.send_request(ResumeSessionRequest::new("stored", AbsolutePath::new("/tmp"))).block_task()
+        };
+
+        let results = start_twice_concurrently(&harness, resume).await;
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(harness.live_runtime_count(), 1);
+    })
+    .await;
+}
+
+async fn start_twice_concurrently<T: Debug, F: Future<Output = Result<T, Error>>>(
+    harness: &AcpTestHarness,
+    start: impl Fn() -> F,
+) -> [Result<T, Error>; 2] {
+    let mut startup = harness.pause_next_runtime();
+    let first = start();
+    startup.wait_until_started().await;
+    let second = start();
+    let _ = list(harness, ListSessionsRequest::new()).await;
+    startup.finish(true);
+    let (first, second) = tokio::join!(first, second);
+    [first, second]
+}
+
 async fn next_history(harness: &mut AcpTestHarness) -> SessionUpdate {
     loop {
         let update = harness.peer.next_session_notification().await.update;
-        if matches!(update, SessionUpdate::UserMessage(_) | SessionUpdate::AgentMessage(_)) {
+        if matches!(
+            update,
+            SessionUpdate::UserMessage(_) | SessionUpdate::AgentMessage(_) | SessionUpdate::ToolCallUpdate(_)
+        ) {
             return update;
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "aether-telemetry"
-version = "0.3.4"
+version = "0.3.19"
 edition = "2024"
 description = "OpenTelemetry support for Aether GenAI calls"
 license = "MIT"
@@ -13,26 +13,26 @@ dist = false
 workspace = true
 
 [dependencies]
-aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.8.4" }
-llm = { package = "aether-llm", path = "../llm", version = "0.9.4" }
-opentelemetry = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
-opentelemetry-semantic-conventions = { version = "0.32.1", features = ["semconv_experimental"] }
+aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.9.10" }
+llm = { package = "aether-llm", path = "../llm", version = "0.9.19" }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = { version = "0.33.0", features = ["semconv_experimental"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-utils = { package = "aether-utils", path = "../utils", version = "0.2.16" }
+utils = { package = "aether-utils", path = "../utils", version = "0.3.1" }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 base16ct = { workspace = true }
 
 [dev-dependencies]
-aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.8.4", features = ["testing"] }
+aether-core = { package = "aether-agent-core", path = "../aether-core", version = "0.9.10", features = ["testing"] }
 axum = { workspace = true }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "rt-tokio", "testing"] }
+opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "metrics", "rt-tokio", "testing"] }
 prost = "0.14"
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
