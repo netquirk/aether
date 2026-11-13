@@ -183,13 +183,17 @@ pub fn scan_crate_private(crate_root: &Path) -> PrivateReport {
         }
         let mut index = CrateIndex::new(library_name.clone());
         match index.read_root(&root_file) {
-            Ok(()) => scan_unit_tests(&index, &mut report),
+            Ok(()) => {
+                index.attach_pending_methods();
+                scan_unit_tests(&index, &mut report);
+            }
             Err(problem) => report.problems.push(problem),
         }
     }
 
     if have_library {
         library_index.read_sources(&crate_root.join("src"));
+        library_index.attach_pending_methods();
         scan_unit_tests(&library_index, &mut report);
         for file in test_files(crate_root, &value) {
             scan_integration_tests(&library_index, &file, &mut report);

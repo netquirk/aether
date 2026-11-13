@@ -1,0 +1,17 @@
+# A fixture crate for the private-item lint: its type is declared in a module
+# the index reads after the module that holds the `impl` block of the type, and
+# the crate re-exports the type under its root.
+#
+# The lint must leave the crate alone: the type is public, and the module that
+# holds its `impl` block says nothing about the visibility of the type.
+#
+# The fixture is never compiled: some of its reaches the compiler would
+# refuse. The lint reads it as text.
+[package]
+name = "reexport-crate-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, so the fixture stays out of the Aether workspace.
+[workspace]

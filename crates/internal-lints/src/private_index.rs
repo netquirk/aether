@@ -145,6 +145,8 @@ pub(crate) struct CrateIndex {
     pub(crate) types: Vec<TypeItem>,
     /// The source of every file the index read, to quote the offending expression.
     pub(crate) sources: BTreeMap<PathBuf, String>,
+    /// The methods an `impl` block declares for a type the index has not read yet.
+    pending_methods: Vec<(String, Item, Vec<String>)>,
     /// The files the index read, with the module path it read them under.
     indexed: BTreeSet<(PathBuf, Vec<String>)>,
 }
@@ -152,7 +154,14 @@ pub(crate) struct CrateIndex {
 impl CrateIndex {
     /// An index of the crate the users of it reach under `name`.
     pub(crate) fn new(name: String) -> Self {
-        Self { name, modules: Vec::new(), types: Vec::new(), sources: BTreeMap::new(), indexed: BTreeSet::new() }
+        Self {
+            name,
+            modules: Vec::new(),
+            types: Vec::new(),
+            sources: BTreeMap::new(),
+            pending_methods: Vec::new(),
+            indexed: BTreeSet::new(),
+        }
     }
 
     /// The module the crate declares at `path`.
@@ -262,7 +271,7 @@ impl CrateIndex {
                             if let ImplItem::Fn(method) = impl_item {
                                 let visibility = ItemVisibility::of(&method.vis, path);
                                 let method = Item { name: method.sig.ident.to_string(), visibility };
-                                self.declare_method(&type_name, method);
+                                self.declare_method(&type_name, method, path.to_vec());
                             }
                         }
                     }
@@ -302,17 +311,32 @@ impl CrateIndex {
     }
 
     /// Record an inherent method of a type the crate declares.
-    fn declare_method(&mut self, type_name: &str, method: Item) {
-        let entry = self.types.iter_mut().find(|item| item.name == type_name);
-        match entry {
+    ///
+    /// The module that declares the type may be one the index reads later, so a method whose type
+    /// the index has not read yet waits for it instead of declaring a type of its own.
+    fn declare_method(&mut self, type_name: &str, method: Item, module: Vec<String>) {
+        match self.types.iter_mut().find(|item| item.name == type_name) {
             Some(entry) => entry.methods.push(method),
-            None => self.types.push(TypeItem {
-                name: type_name.to_string(),
-                visibility: ItemVisibility::Crate,
-                module: Vec::new(),
-                fields: Vec::new(),
-                methods: vec![method],
-            }),
+            None => self.pending_methods.push((type_name.to_string(), method, module)),
+        }
+    }
+
+    /// Attach the methods that waited for their type to the type the crate declares.
+    ///
+    /// A method whose type the crate declares nowhere stays with the module its `impl` block is
+    /// written in, so the lint never reports a type the crate does not declare.
+    pub(crate) fn attach_pending_methods(&mut self) {
+        for (type_name, method, module) in std::mem::take(&mut self.pending_methods) {
+            match self.types.iter_mut().find(|item| item.name == type_name) {
+                Some(entry) => entry.methods.push(method),
+                None => self.types.push(TypeItem {
+                    name: type_name,
+                    visibility: ItemVisibility::Crate,
+                    module,
+                    fields: Vec::new(),
+                    methods: vec![method],
+                }),
+            }
         }
     }
 }

@@ -38,6 +38,10 @@ fn importing_fixture_root() -> PathBuf {
     crate_root().join("tests/fixtures/importing-crate")
 }
 
+fn reexport_fixture_root() -> PathBuf {
+    crate_root().join("tests/fixtures/reexport-crate")
+}
+
 fn lint() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_private-lint"));
     command.current_dir(repo_root());
@@ -205,6 +209,15 @@ fn public_fixture_is_clean() {
     assert!(report.findings.is_empty(), "the lint must leave the public fixture alone: {:?}", report.findings);
     assert!(report.problems.is_empty(), "every file of the fixture must parse: {:?}", report.problems);
     assert_eq!(report.tests_scanned, 3, "the fixture holds three test functions");
+    assert_eq!(report.tests_flagged, 0, "the fixture holds no test the lint reports");
+}
+
+#[test]
+fn a_type_declared_in_a_module_the_index_reads_later_is_not_reported_as_private() {
+    let report = scan_workspace_private(&reexport_fixture_root());
+    assert!(report.findings.is_empty(), "the lint must leave the re-exported type alone: {:?}", report.findings);
+    assert!(report.problems.is_empty(), "every file of the fixture must parse: {:?}", report.problems);
+    assert_eq!(report.tests_scanned, 1, "the fixture holds one test function");
     assert_eq!(report.tests_flagged, 0, "the fixture holds no test the lint reports");
 }
 
