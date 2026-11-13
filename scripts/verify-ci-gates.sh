@@ -50,12 +50,15 @@ GATES=(
 )
 
 # The environment-dependent targets of the task: the ones that need a container
-# engine or a language server. They are run by the same script, each one as its
-# own gate, so every one of them has a log and an exit code of its own.
+# engine. They are run by the same script, each one as its own gate, so every
+# one of them has a log and an exit code of its own.
+#
+# The two gates that ran the language-server cases of `crates/aether-mcp-servers`
+# are gone: upstream replaced the daemon this repository held (`crates/aether-lspd`)
+# with the external `clankerdiff-lspd` crate, so the `lsp_diagnostics_e2e` and
+# `lsp_operations_e2e` targets no longer exist.
 GATES+=(
     "cli-integration-trace-context|cargo test -p aether-agent-cli --test integration trace_context::headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled"
-    "mcp-lsp-diagnostics|cargo test -p aether-mcp-servers --test integration lsp_diagnostics_e2e"
-    "mcp-lsp-hover|cargo test -p aether-mcp-servers --test integration lsp_operations_e2e::test_hover_falls_back_from_stale_line_hint"
     "evals-docker-agent|cargo test -p aether-evals --test docker_agent_tests"
 )
 
