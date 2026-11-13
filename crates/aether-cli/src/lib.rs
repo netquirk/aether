@@ -21,6 +21,6 @@ pub mod settings_args;
 pub mod show_prompt;
 pub(crate) mod slash_commands;
 pub(crate) mod telemetry;
+pub(crate) mod working_directory;
 pub mod workspace;
 pub(crate) mod workspace_boundary;
-pub(crate) mod working_directory;

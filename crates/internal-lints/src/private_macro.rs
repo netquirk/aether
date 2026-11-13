@@ -24,7 +24,7 @@ pub(crate) fn expressions(tokens: &TokenStream) -> Vec<Expr> {
         return vec![expression];
     }
     let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
-    parser.parse2(tokens.clone()).map(|expressions| expressions.into_iter().collect()).unwrap_or_default()
+    parser.parse2(tokens.clone()).map_or_default(|expressions| expressions.into_iter().collect())
 }
 
 /// The calls a macro invocation holds: every name a parenthesis group follows.

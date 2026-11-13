@@ -87,8 +87,7 @@ pub fn refusal_context_message(request: &ToolCallRequest, reason: &str) -> ChatM
         escape_xml(reason),
         escape_xml(reason),
     );
-    let message_id =
-        if request.id.is_empty() { MessageId::new() } else { MessageId::tool_result(&request.id) };
+    let message_id = if request.id.is_empty() { MessageId::new() } else { MessageId::tool_result(&request.id) };
     ChatMessage::user_with_id(message_id, vec![ContentBlock::text(content)])
 }
 

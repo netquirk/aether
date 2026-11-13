@@ -92,14 +92,14 @@ pub(crate) fn map_agent_event_to_notification(msg: &AgentEvent, mode: Notificati
             Some(map_tool_error_to_notification(error))
         }
 
-        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => Some(map_tool_error_to_notification(
-            &ToolCallError {
+        AgentEvent::Tool(ToolEvent::Refused { request, reason }) => {
+            Some(map_tool_error_to_notification(&ToolCallError {
                 id: request.id.clone(),
                 name: request.name.clone(),
                 arguments: Some(request.arguments.clone()),
                 error: reason.clone(),
-            },
-        )),
+            }))
+        }
 
         AgentEvent::Tool(ToolEvent::TaskCreated { request, status_message, .. }) => {
             Some(SessionUpdate::ToolCallUpdate(

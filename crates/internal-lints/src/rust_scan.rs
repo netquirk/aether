@@ -16,7 +16,7 @@ const BANNED_CRATES: [(&str, ForbiddenKind); 2] =
     [("anyhow", ForbiddenKind::AnyhowCrate), ("color_eyre", ForbiddenKind::ColorEyreCrate)];
 
 /// Scan one Rust file for the banned crates.
-pub fn scan_rust_file(path: &Path) -> (Vec<Finding>, Vec<String>) {
+pub(crate) fn scan_rust_file(path: &Path) -> (Vec<Finding>, Vec<String>) {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
@@ -35,7 +35,7 @@ pub fn scan_rust_file(path: &Path) -> (Vec<Finding>, Vec<String>) {
 }
 
 /// Scan the public API of a crate for boxed errors a caller cannot match on.
-pub fn scan_public_surface(crate_root: &Path) -> Vec<Finding> {
+pub(crate) fn scan_public_surface(crate_root: &Path) -> Vec<Finding> {
     let src = crate_root.join("src");
     let mut findings = Vec::new();
     let lib = src.join("lib.rs");
@@ -350,7 +350,7 @@ fn boxed_error_detail(ty: &Type, context: &ModuleContext) -> Option<String> {
     for extra in object.bounds.iter().skip(1) {
         let text = match extra {
             syn::TypeParamBound::Trait(trait_bound) => {
-                trait_bound.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default()
+                trait_bound.path.segments.last().map_or_default(|s| s.ident.to_string())
             }
             syn::TypeParamBound::Lifetime(lifetime) => format!("'{}", lifetime.ident),
             _ => String::new(),
@@ -413,11 +413,11 @@ fn is_public(visibility: &Visibility) -> bool {
 
 fn module_children_dir(file: &Path) -> PathBuf {
     let parent = file.parent().unwrap_or_else(|| Path::new(""));
-    let name = file.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+    let name = file.file_name().map_or_default(|name| name.to_string_lossy().to_string());
     if name == "lib.rs" || name == "main.rs" || name == "mod.rs" {
         parent.to_path_buf()
     } else {
-        let stem = file.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_default();
+        let stem = file.file_stem().map_or_default(|stem| stem.to_string_lossy().to_string());
         parent.join(stem)
     }
 }

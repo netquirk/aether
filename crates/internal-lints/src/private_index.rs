@@ -341,7 +341,7 @@ fn named_fields(fields: &syn::FieldsNamed, module: &[String]) -> Vec<Item> {
         .named
         .iter()
         .map(|field| Item {
-            name: field.ident.as_ref().map(ToString::to_string).unwrap_or_default(),
+            name: field.ident.as_ref().map_or_default(ToString::to_string),
             visibility: ItemVisibility::of(&field.vis, module),
         })
         .collect()
@@ -358,9 +358,7 @@ fn fields_of(fields: &Fields, module: &[String]) -> Vec<Item> {
 /// The name of the type an implementation is for.
 fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Path(type_path) => {
-            type_path.path.segments.last().map(|segment| segment.ident.to_string()).unwrap_or_default()
-        }
+        Type::Path(type_path) => type_path.path.segments.last().map_or_default(|segment| segment.ident.to_string()),
         _ => String::new(),
     }
 }
@@ -411,7 +409,7 @@ pub(crate) fn is_test_function(attrs: &[syn::Attribute]) -> bool {
 /// of `src/foo/mod.rs`, `src/lib.rs` and `src/main.rs` in the directory of the file.
 pub(crate) fn module_directory(file: &Path) -> PathBuf {
     let directory = file.parent().unwrap_or_else(|| Path::new("."));
-    let stem = file.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = file.file_stem().map_or_default(|stem| stem.to_string_lossy().to_string());
     if stem == "mod" || stem == "lib" || stem == "main" {
         return directory.to_path_buf();
     }
@@ -464,7 +462,7 @@ fn collect_sources(directory: &Path, files: &mut Vec<PathBuf>) {
     let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
     paths.sort();
     for path in paths {
-        let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        let name = path.file_name().map_or_default(|name| name.to_string_lossy().to_string());
         if name.starts_with('.') || name == "target" || name == "bin" {
             continue;
         }

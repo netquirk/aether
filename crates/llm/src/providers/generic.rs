@@ -29,6 +29,10 @@ use crate::{
 
 pub use crate::providers::openai::responses::mappers::ResponsesRequestPolicy;
 
+/// The headers a provider adds to every request, produced fresh for each
+/// provider instance.
+pub type ExtraHeaders = fn() -> Vec<(&'static str, String)>;
+
 pub struct ProviderConfig {
     pub provider: Provider,
     pub api_base: Option<&'static str>,
@@ -41,7 +45,7 @@ pub struct ProviderConfig {
     /// provider instance - opencode-go rejects a request without
     /// `x-opencode-session` (it uses the value for upstream routing), and a
     /// value shared by every run would defeat that routing.
-    pub extra_headers: Option<fn() -> Vec<(&'static str, String)>>,
+    pub extra_headers: Option<ExtraHeaders>,
 }
 
 pub enum Api {
@@ -427,8 +431,7 @@ mod tests {
         let second = GenericProvider::new("key", &OPENCODE_GO).unwrap();
 
         let first_session = first.headers.get("x-opencode-session").map(|value| value.to_str().unwrap().to_string());
-        let second_session =
-            second.headers.get("x-opencode-session").map(|value| value.to_str().unwrap().to_string());
+        let second_session = second.headers.get("x-opencode-session").map(|value| value.to_str().unwrap().to_string());
 
         assert!(first_session.is_some(), "the provider must carry the routing session header");
         assert_ne!(first_session, second_session, "each provider instance needs its own routing session");

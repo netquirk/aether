@@ -44,8 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Tool '{}' was refused: {reason}", request.name);
             }
             Some(AgentEvent::Tool(ToolEvent::Progress { request, progress, total, message })) => {
-                let msg = message.as_ref().map(|m| format!("{m} ")).unwrap_or_default();
-                let total_str = total.map(|t| format!("/{t}")).unwrap_or_default();
+                let msg = message.as_ref().map_or_default(|m| format!("{m} "));
+                let total_str = total.map_or_default(|t| format!("/{t}"));
                 println!("Tool '{}' progress: {}{}{}", request.name, msg, progress, total_str);
             }
             Some(AgentEvent::Tool(ToolEvent::TaskStatus { request, status, status_message, .. })) => {

@@ -87,7 +87,9 @@ async fn run_agent(
     let prompt = expand_slash_command_text(&agent.mcp, config.prompt).await;
 
     let outcome = match agent.agent_tx.send(Command::text(&prompt)).await {
-        Ok(()) => Ok(stream_output(&mut agent.agent_rx, config.output, &config.events, stdout, stderr, &redactor).await),
+        Ok(()) => {
+            Ok(stream_output(&mut agent.agent_rx, config.output, &config.events, stdout, stderr, &redactor).await)
+        }
         Err(_) => Err(CliError::AgentStopped),
     };
 

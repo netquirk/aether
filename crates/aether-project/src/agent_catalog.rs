@@ -638,5 +638,4 @@ mod tests {
         let spec = catalog.resolve("planner").unwrap();
         assert!(spec.mcp.is_empty());
     }
-
 }

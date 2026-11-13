@@ -10,7 +10,7 @@ const BANNED_CRATES: [(&str, ForbiddenKind); 2] =
     [("anyhow", ForbiddenKind::AnyhowCrate), ("color_eyre", ForbiddenKind::ColorEyreCrate)];
 
 /// Scan one text file for the banned crates and for boxed errors.
-pub fn scan_text_file(path: &Path) -> Vec<Finding> {
+pub(crate) fn scan_text_file(path: &Path) -> Vec<Finding> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };

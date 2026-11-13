@@ -12,9 +12,9 @@ pub mod testing;
 
 pub use aether_core::core::{PromptSource, PromptSourceError};
 pub use aether_settings::{
-    AetherSettings, AetherSettingsSource, CredentialsStoreConfig, OtlpTelemetrySettings, RunSettings, SettingsFileSource,
-    TelemetryContentSettings, TelemetrySettings, project_settings_exist, project_settings_path, user_settings_exist,
-    user_settings_path,
+    AetherSettings, AetherSettingsSource, CredentialsStoreConfig, OtlpTelemetrySettings, RunSettings,
+    SettingsFileSource, TelemetryContentSettings, TelemetrySettings, project_settings_exist, project_settings_path,
+    user_settings_exist, user_settings_path,
 };
 pub use agent_catalog::AgentCatalog;
 pub use agent_config::AgentConfig;

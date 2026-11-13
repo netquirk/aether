@@ -244,7 +244,7 @@ fn expand_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
         if !path.is_dir() {
             continue;
         }
-        let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        let name = path.file_name().map_or_default(|name| name.to_string_lossy().to_string());
         if name.starts_with('.') || (!suffix.is_empty() && !name.ends_with(suffix)) {
             continue;
         }
@@ -273,7 +273,7 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>, keep: &dyn Fn(&Path
     let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
     paths.sort();
     for path in paths {
-        let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        let name = path.file_name().map_or_default(|name| name.to_string_lossy().to_string());
         if name.starts_with('.') || name == "target" || name == "node_modules" {
             continue;
         }

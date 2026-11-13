@@ -435,7 +435,7 @@ fn is_duration(expression: &Expr) -> bool {
 /// The source text the span covers, on one line.
 fn expression_text(source: &str, span: Span) -> String {
     let range = span.byte_range();
-    source.get(range).map(|text| text.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default()
+    source.get(range).map_or_default(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// The test functions the allowlist names, with the file they live in.

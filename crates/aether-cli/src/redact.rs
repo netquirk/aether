@@ -263,8 +263,7 @@ impl SecretRedactor {
 /// The catalog is generated from `models.dev`, so the list is derived from the
 /// models themselves instead of being hand-maintained here.
 fn required_env_vars() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> =
-        LlmModel::all().iter().filter_map(|model| model.required_env_var()).collect();
+    let mut names: Vec<&'static str> = LlmModel::all().iter().filter_map(LlmModel::required_env_var).collect();
     names.sort_unstable();
     names.dedup();
     names

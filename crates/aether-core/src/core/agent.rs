@@ -561,7 +561,7 @@ impl Agent {
 
     async fn handle_tool_completion(&mut self, tool_call: ToolCallRequest, state: &mut IterationState) {
         if let Some(reason) = self.tool_policy.refuse(&tool_call) {
-            self.record_tool_refusal(&tool_call, &reason).await;
+            self.record_tool_refusal(&tool_call, &reason);
             self.emit(AgentEvent::Tool(ToolEvent::Refused { request: tool_call, reason })).await;
             return;
         }
@@ -589,7 +589,7 @@ impl Agent {
         }
     }
 
-    async fn record_tool_refusal(&mut self, request: &ToolCallRequest, reason: &str) {
+    fn record_tool_refusal(&mut self, request: &ToolCallRequest, reason: &str) {
         let refusal_text = format!("Tool call `{}` was refused by policy: {reason}", request.name);
         tracing::debug!("Tool call refused by policy: {refusal_text}");
         self.context.add_message(refusal_context_message(request, reason));
@@ -649,7 +649,9 @@ impl Agent {
             self.emit_session_usage(LlmCallPurpose::Compaction, usage).await;
         }
         let outcome = match &result {
-            Ok(result) => LlmCallOutcome::Completed { stop_reason: None, usage: result.usage, provider_request_id: None },
+            Ok(result) => {
+                LlmCallOutcome::Completed { stop_reason: None, usage: result.usage, provider_request_id: None }
+            }
             Err(e) => LlmCallOutcome::failed(e.to_string(), false),
         };
         self.emit(AgentEvent::Turn(TurnEvent::LlmCallEnded { purpose: LlmCallPurpose::Compaction, outcome })).await;

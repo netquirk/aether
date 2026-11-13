@@ -16,11 +16,7 @@ pub enum OutputFormat {
     Json,
 }
 
-pub(crate) fn print_message(
-    format: OutputFormat,
-    message: &AgentEvent,
-    redactor: &SecretRedactor,
-) -> io::Result<()> {
+pub(crate) fn print_message(format: OutputFormat, message: &AgentEvent, redactor: &SecretRedactor) -> io::Result<()> {
     write_message(format, message, &mut io::stdout(), &mut io::stderr(), redactor)
 }
 
@@ -46,11 +42,11 @@ pub(crate) fn write_message(
         }
         OutputFormat::Pretty => {
             let line = serde_json::to_string_pretty(message)?;
-            writeln!(stdout, "{}", redactor.redact(&line))?
+            writeln!(stdout, "{}", redactor.redact(&line))?;
         }
         OutputFormat::Json => {
             let line = serde_json::to_string(message)?;
-            writeln!(stdout, "{}", redactor.redact(&line))?
+            writeln!(stdout, "{}", redactor.redact(&line))?;
         }
     }
     Ok(())
@@ -79,7 +75,7 @@ fn format_text(message: &AgentEvent) -> Option<String> {
             request.name,
             task_id,
             status,
-            status_message.as_deref().map(|message| format!(" - {message}")).unwrap_or_default()
+            status_message.as_deref().map_or_default(|message| format!(" - {message}"))
         )),
         AgentEvent::Tool(ToolEvent::TaskCreated { request, task_id, .. }) => {
             Some(format!("Tool deferred [{}]: task {}", request.name, task_id))
@@ -113,7 +109,7 @@ fn format_text(message: &AgentEvent) -> Option<String> {
         }
         AgentEvent::Tool(ToolEvent::Progress { request, progress, total, message }) => {
             let bar = total.map_or_else(|| progress.to_string(), |total| format!("{progress}/{total}"));
-            let suffix = message.as_deref().map(|message| format!(" - {message}")).unwrap_or_default();
+            let suffix = message.as_deref().map_or_default(|message| format!(" - {message}"));
             Some(format!("Tool progress [{}]: {bar}{suffix}", request.name))
         }
         AgentEvent::Tool(ToolEvent::DisplayUpdate { request, meta }) => {

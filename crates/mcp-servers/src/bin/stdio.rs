@@ -36,13 +36,12 @@ fn main() -> Result<ExitCode, StdioError> {
 
 #[tokio::main]
 async fn serve(server: Builtin, args: Vec<String>) -> Result<(), StdioError> {
-    let services =
-        RuntimeServices {
-            root_dir: current_dir(),
-            agent_deps: AgentDeps::default(),
-            deferred_tools_socket: None,
-            shell_command_timeout: None,
-        };
+    let services = RuntimeServices {
+        root_dir: current_dir(),
+        agent_deps: AgentDeps::default(),
+        deferred_tools_socket: None,
+        shell_command_timeout: None,
+    };
     let server: McpServer = match server {
         Builtin::Subagents => {
             let args = SubAgentsMcpArgs::try_parse_from(args).unwrap_or_else(|error| error.exit());

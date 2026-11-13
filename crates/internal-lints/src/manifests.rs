@@ -14,7 +14,7 @@ const PACKAGE_DEPENDENCY_TABLES: [&str; 4] =
     ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
 
 /// Scan a `Cargo.toml` for a dependency on a banned crate.
-pub fn scan_cargo_manifest(path: &Path) -> Vec<Finding> {
+pub(crate) fn scan_cargo_manifest(path: &Path) -> Vec<Finding> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -36,7 +36,7 @@ pub fn scan_cargo_manifest(path: &Path) -> Vec<Finding> {
 }
 
 /// Scan a `package.json` for a dependency on a banned crate.
-pub fn scan_package_manifest(path: &Path) -> Vec<Finding> {
+pub(crate) fn scan_package_manifest(path: &Path) -> Vec<Finding> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
