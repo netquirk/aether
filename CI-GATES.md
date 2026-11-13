@@ -50,8 +50,9 @@ The project source has moved on since; see "The current source of the project" b
 ## The verdicts, machine-readable
 
 This is the block `scripts/verify-ci-gates.sh --check` reads. Every gate the task named has a
-verdict: `green`, or `red-pre-existing` - the gate fails, and it fails the same way at the base
-commit `e8d10e9f`, which the evidence in the sections below shows.
+verdict: `green`, `red-pre-existing` - the gate fails, and it fails the same way at the base
+commit `e8d10e9f`, which the evidence in the sections below shows - or `red-environment` - the
+gate cannot run here because the sandbox lacks the tool it needs.
 
 <!-- ci-gates:begin -->
 doc-check                    green
@@ -61,10 +62,41 @@ pnpm-fmt-check               green
 pnpm-sdk-typecheck           green
 pnpm-sdk-test                green
 cli-integration-trace-context green
-mcp-lsp-diagnostics          red-pre-existing
-mcp-lsp-hover                red-pre-existing
-evals-docker-agent           red-pre-existing
+evals-docker-agent           red-environment
 <!-- ci-gates:end -->
+
+## The verdicts on the tree this task delivers
+
+The tree this block describes is the tree of the upstream upgrade: upstream `aether main`
+(`ff9b9dac`, which holds the tag `aether-agent-cli-v0.9.21`) merged into the local line, plus
+the ports of the local-only patches. The gates were run on it on 2026-11-13 with `rustc 1.100.0`,
+`just 1.59.0`, `sqlx-cli 0.9.0`, `node v24.21.0` and `pnpm 12.16.1`.
+
+| Gate | Command | Verdict |
+|------|---------|---------|
+| `doc-check` | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --all-features --workspace --examples` | **green** (exit 0) |
+| `doc-test` | `cargo test --doc --workspace --exclude internal-evals` | **green** (exit 0) |
+| `sqlx-check` | `cargo sqlx migrate run` + `cargo sqlx prepare --check -- --features analytics` | **green** (exit 0) |
+| `pnpm-fmt-check` | `prettier --check "packages/**/*.{ts,mts,cts,mjs,cjs,js,jsx,json,astro,css}"` | **green** (exit 0) |
+| `pnpm-sdk-typecheck` | `pnpm --filter @aether-agent/sdk typecheck` | **green** (exit 0) |
+| `pnpm-sdk-test` | `pnpm --filter @aether-agent/sdk test` | **green** (exit 0, `AETHER_BIN` pointing at the release build of `-p aether-agent-cli`) |
+| `cli-integration-trace-context` | `cargo test -p aether-agent-cli --test integration trace_context::headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled` | **green** (exit 0) |
+| `evals-docker-agent` | `cargo test -p aether-evals --test docker_agent_tests` | **red - environment** (exit 101) |
+
+The docker gate is red for the same reason it was red when this record was first written: the
+sandbox has no container engine, so every case of the target fails before it touches the code
+under test.
+
+```
+Error: Container(Testcontainers(Client(Init(SocketNotFoundError("/run/prairie-engine/containers.sock")))))
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The two language-server gates of the earlier record are gone: upstream replaced the daemon this
+repository held (`crates/aether-lspd`) with the external `clankerdiff-lspd` crate, so the
+`lsp_diagnostics_e2e` and `lsp_operations_e2e` targets of `crates/mcp-servers` no longer exist and
+`scripts/verify-ci-gates.sh` no longer names them. The cases they ran are the ones of the external
+daemon now, and they are out of this repository's reach.
 
 ## Gates 1 to 4: green
 

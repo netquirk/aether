@@ -14,6 +14,7 @@ patch is listed below with the upstream state, the outcome and the evidence.
 | `83371aa3` (run.lock handling; headless `--cwd` honouring) | upstream's headless has `--cwd`; upstream has no `run.lock` | **ported** - the headless runner takes an exclusive `.aether/run.lock` before it starts and the `--cwd` flag is resolved through `resolve_run_cwd`; a second run on the same directory fails with `CliError::RunLocked` | `crates/aether-cli/src/run_lock.rs`, `crates/aether-cli/src/working_directory.rs`, `crates/aether-cli/src/headless/run.rs`, `crates/aether-cli/src/error.rs` (`RunLocked`), `crates/aether-cli/tests/integration/run_lock.rs`, `.gitignore` (`**/.aether/run.lock`) |
 | `750c3575` (opencode-go provider, reasoning-off group derived from the provider table) | upstream main registers no OpenCode provider at all | **ported** - `opencode-go` is registered in the provider table and served by the generic provider with the `x-opencode-session` header and the extra header set the provider needs | `crates/llm-codegen/src/lib.rs` (`PROVIDERS`), `crates/llm/src/providers/generic.rs` (`OPENCODE_GO`, `opencode_go_headers`), `crates/llm/src/provider_connection.rs` (`headers`), `crates/llm/src/parser.rs` (`opencode_go_is_a_registered_provider`), `crates/llm/src/providers/generic.rs` tests |
 | `e8d10e9f`, `d80d2f18`, `0ec8a0ee`, `40f5a10f`, `0ab9e154`, `0b9c4739` (private-lint, error-lint, wait-lint, README provider check, SDK version check, rustdoc fixes, CI wiring) | upstream has none of these recipes | **ported** - kept; the private-item lint reads a type whose `impl` block it meets before the module that declares it (`bb4ff3b2`), so it no longer reports a public re-export as a private item | `crates/internal-lints/`, `crates/internal-readme-check/`, `crates/internal-sdk-version-check/`, `justfile`, `.github/workflows/ci.yml` |
+| `fec825ea` (the CI-gate verification script of TASK-2K-503) | upstream has no such script; upstream replaced `crates/aether-lspd` with the external `clankerdiff-lspd` (#633), so the `lsp_diagnostics_e2e` and `lsp_operations_e2e` targets the script gated no longer exist | **ported** - kept, with the two language-server gates dropped because their targets are gone upstream (`f5dabbed`); the eight remaining gates ran on the upgraded tree and their verdicts are recorded in `CI-GATES.md` | `scripts/verify-ci-gates.sh`, `CI-GATES.md` |
 
 ## Local-only behaviour dropped with upstream's rewrite of the same area
 
@@ -33,6 +34,11 @@ code upstream rewrote. They are listed here so no drop is silent.
 - The settings-driven `custom` provider (the table above covers `opencode-go` only).
 - The local ACP extras: `--cwd`, `--log-level`, the ACP message log, the health
   endpoint and the detached arguments (upstream's ACP 5.0 implementation replaces them).
+- The two language-server gates of `scripts/verify-ci-gates.sh` (`mcp-lsp-diagnostics`
+  and `mcp-lsp-hover`): they ran the `lsp_diagnostics_e2e` and `lsp_operations_e2e`
+  targets of `crates/mcp-servers`, and upstream replaced the daemon this repository
+  held (`crates/aether-lspd`) with the external `clankerdiff-lspd` crate, so both
+  targets are gone. The script names the eight gates that still exist.
 
 ## Upstream fixes this upgrade now delivers
 
