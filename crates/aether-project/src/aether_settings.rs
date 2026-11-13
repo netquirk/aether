@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use utils::variables::{VarError, Vars};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -82,9 +83,35 @@ pub struct AetherSettings {
     /// OpenTelemetry `GenAI` telemetry configuration. Its presence enables telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetrySettings>,
+    /// Run-time behaviour shared by every agent in this settings layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSettings>,
     /// The agents defined for this project. At least one agent is required.
     #[schemars(length(min = 1))]
     pub agents: Vec<AgentConfig>,
+}
+
+/// Run-time settings that apply to every agent in a settings layer.
+///
+/// Every field is optional; an unset field leaves the corresponding behaviour
+/// disabled, so an absent `run` block changes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunSettings {
+    /// Wall-clock ceiling, in seconds, for every shell command a run starts
+    /// (the `bash` tool of the built-in `coding` MCP server). A command that
+    /// runs past the ceiling is killed and the run continues. `0` or an unset
+    /// value disables the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub shell_command_timeout_seconds: Option<u64>,
+}
+
+impl RunSettings {
+    /// The resolved shell-command ceiling. `None` means unbounded.
+    pub fn shell_command_timeout(&self) -> Option<Duration> {
+        self.shell_command_timeout_seconds.filter(|seconds| *seconds > 0).map(Duration::from_secs)
+    }
 }
 
 /// One settings layer's OpenTelemetry configuration. Every field is optional:

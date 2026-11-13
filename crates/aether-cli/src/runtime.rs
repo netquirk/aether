@@ -8,6 +8,7 @@ use mcp_utils::client::ElicitationSink;
 use mcp_utils::gateway::ServerSpec;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -22,6 +23,7 @@ pub(crate) struct RuntimeBuilder {
     wait_for_mcp: bool,
     agent_deps: AgentDeps,
     usage_seed: Option<SessionUsageEvent>,
+    shell_command_timeout: Option<Duration>,
 }
 
 pub(crate) struct Runtime {
@@ -55,6 +57,7 @@ impl RuntimeBuilder {
             wait_for_mcp: false,
             agent_deps: AgentDeps::default(),
             usage_seed: None,
+            shell_command_timeout: None,
         }
     }
 
@@ -93,6 +96,13 @@ impl RuntimeBuilder {
 
     pub(crate) fn wait_for_mcp(mut self) -> Self {
         self.wait_for_mcp = true;
+        self
+    }
+
+    /// Bound every shell command a run starts (the `bash` tool of the
+    /// built-in `coding` MCP server). `None` keeps the unbounded behaviour.
+    pub(crate) fn shell_command_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.shell_command_timeout = timeout;
         self
     }
 
@@ -135,7 +145,8 @@ impl RuntimeBuilder {
     fn spawn_mcp(&self) -> Result<McpCatalog, RuntimeError> {
         let mut builder = agent_mcp(&self.cwd, self.agent_deps.clone(), self.spec.tools.clone())
             .with_servers(self.extra_mcp_servers.clone())
-            .with_config(self.spec.mcp.clone());
+            .with_config(self.spec.mcp.clone())
+            .with_shell_command_timeout(self.shell_command_timeout);
         if let Some(sink) = self.elicitation.clone() {
             builder = builder.with_elicitation(sink);
         }

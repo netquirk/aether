@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::credentials::oauth_credential_store_from_config;
 use crate::mcp_config_args::McpConfigArgs;
@@ -61,6 +62,8 @@ pub struct RunConfig {
     pub oauth_credential_store: Arc<dyn OAuthCredentialStorage>,
     pub telemetry: Option<TelemetrySettings>,
     pub trace_context: Option<AgentTraceContext>,
+    /// Wall-clock ceiling for every shell command the run starts.
+    pub shell_command_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -201,6 +204,7 @@ impl HeadlessInputs {
         let oauth_credential_store = oauth_credential_store_from_config(settings.credentials_store.clone())?;
         let telemetry = settings.telemetry.clone();
         let selection = InitialSessionSelection::from_flags(self.agent, self.model, None)?;
+        let shell_command_timeout = settings.run.as_ref().and_then(aether_project::RunSettings::shell_command_timeout);
         let resolved = resolve_agent_from_settings(&self.cwd, settings, self.provider_connections, &selection)?;
 
         Ok(RunConfig {
@@ -216,6 +220,7 @@ impl HeadlessInputs {
             oauth_credential_store,
             telemetry,
             trace_context: self.trace_context,
+            shell_command_timeout,
         })
     }
 }

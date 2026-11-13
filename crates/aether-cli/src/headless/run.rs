@@ -66,6 +66,7 @@ async fn run_agent(
     let mut builder = RuntimeBuilder::from_spec(config.cwd.clone(), spec)
         .mcp_config(config.mcp_config)
         .agent_deps(deps)
+        .shell_command_timeout(config.shell_command_timeout)
         .wait_for_mcp();
     if let Some(provider) = provider {
         builder = builder.provider(provider);

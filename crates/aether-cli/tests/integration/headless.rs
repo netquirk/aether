@@ -139,6 +139,7 @@ impl HeadlessTest {
                 oauth_credential_store: Arc::new(MemoryCredentialStore::new()),
                 telemetry: None,
                 trace_context: None,
+                shell_command_timeout: None,
             },
             provider: FakeLlmProvider::with_single_response(
                 llm_response().reasoning(&["thinking", " hard"]).text(&["hello", " world"]).build(),
