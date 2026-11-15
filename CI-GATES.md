@@ -351,3 +351,23 @@ read-only):
 The `doc-check`, `doc-test`, `sqlx-check` and `pnpm-*` gates were not re-run here; the verdicts
 above stand for the tree they were recorded on, and `TASK-33-6` re-establishes them on the final
 tree.
+
+### The two ports an operator asked to see proven, re-run live (2026-11-15, run `70f2cf95`)
+
+The review asked for the bash-timeout port (`5117463d`: `RunSettings::shell_command_timeout` /
+`with_shell_command_timeout` / `bash_environment`) and the credential-redaction port
+(`cd6752fc`) to be proven by the tests that actually cover them, or to be named as gaps. Both
+are covered, and both were re-run on this delivered tree in this run with
+`RUSTUP_TOOLCHAIN=stable`:
+
+| port | command | result |
+|---|---|---|
+| `5117463d` (bash timeout) | `cargo test --locked -p aether-project --test run_settings` | 2 passed (`the_shell_command_timeout_is_read_from_the_run_settings`, `an_unset_or_zero_shell_command_timeout_leaves_commands_unbounded`) |
+| `5117463d` (bash timeout) | `cargo test --locked -p aether-agent-core --lib shell_command_timeout` | 2 passed (`the_shell_command_timeout_reaches_the_runtime_services`, `an_unset_shell_command_timeout_leaves_the_runtime_services_unbounded`) |
+| `5117463d` (bash timeout) | `cargo test --locked -p aether-mcp-servers --lib shell_command_timeout` | 2 passed (`the_shell_command_timeout_bounds_the_bash_tool`, `an_unset_shell_command_timeout_leaves_the_bash_tool_unbounded`) |
+| `cd6752fc` (credential redaction) | `cargo test --locked -p aether-agent-cli --lib redact` | 15 passed, 0 failed |
+| `e934b222`, `efee510e` (`ToolPolicy` refusal) | `cargo test --locked -p aether-agent-core --test agent refusal` | 3 passed (`refused_tool_call_emits_refused_event_with_reason`, `refused_tool_call_records_refusal_in_context_for_next_turn`, `tool_policy_that_returns_none_lets_the_call_proceed`) |
+
+So neither of the two ports is an unproven port: both are green on the delivered tree. The only
+port still without a test of its own is `bc9a40c3`'s MCP bootstrap wait, which stays named as a
+gap for `TASK-33-6`.
