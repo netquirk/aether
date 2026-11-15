@@ -324,3 +324,30 @@ a person will file it."), so a person has to file it. The prompt of that follow-
 > which is what this run recorded (see 5c). The run must end with
 > `test result: ok. 2 passed; 0 failed`. `crates/aether-evals` is unchanged since `e8d10e9f`, so
 > nothing in the change under test can make it fail.
+
+## The re-verification of the delivered tree (2026-11-15)
+
+The upstream upgrade landed on this branch after the verdicts above were recorded, and this run
+re-checked the cheap part of the matrix on the delivered tree rather than re-running the whole
+matrix (the sweep is `TASK-33-6`'s scope). What it ran, with `RUSTUP_TOOLCHAIN=stable`
+(rustc 1.100.0; the pinned `1.99` cannot sync in this sandbox because the rustup home is
+read-only):
+
+| check | result |
+|---|---|
+| `cargo check --locked -p aether-agent-cli -p aether-agent-core -p aether-llm -p aether-mcp-servers` | exit 0 |
+| `cargo test --locked -p aether-agent-core` | 94 + 92 + 2 + 81 + 4 passed, 0 failed |
+| `cargo test --locked -p aether-agent-cli --lib` | 136 passed, 0 failed |
+| `cargo test --locked -p aether-agent-cli --test integration run_lock` | 2 passed, 0 failed |
+| `cargo test --locked -p aether-project --test run_settings` | 2 passed, 0 failed |
+| `cargo test --locked -p aether-agent-core --lib shell_command_timeout` | 2 passed, 0 failed |
+| `cargo test --locked -p aether-mcp-servers --lib shell_command_timeout` | 2 passed, 0 failed |
+| `cargo test --locked -p aether-agent-cli --lib redact` | 15 passed, 0 failed |
+| `cargo test --locked -p aether-llm opencode` | 3 passed, 0 failed |
+| `cargo fmt --all --check` | exit 0 |
+| `cargo run -q -p internal-lints --bin private-lint` / `internal-lints` / `wait-lint`, `cargo run -q -p internal-readme-check`, `cargo run -q -p internal-sdk-version-check` | all exit 0 |
+| `bash scripts/verify-ci-gates.sh --check` | exit 0 (the eight verdicts above agree with the script's gate list) |
+
+The `doc-check`, `doc-test`, `sqlx-check` and `pnpm-*` gates were not re-run here; the verdicts
+above stand for the tree they were recorded on, and `TASK-33-6` re-establishes them on the final
+tree.

@@ -592,6 +592,9 @@ impl Agent {
     fn record_tool_refusal(&mut self, request: &ToolCallRequest, reason: &str) {
         let refusal_text = format!("Tool call `{}` was refused by policy: {reason}", request.name);
         tracing::debug!("Tool call refused by policy: {refusal_text}");
+        // The refusal is a completed tool call, so the turn continues and the
+        // model reads why the call did not run.
+        self.recorder.record_refusal(request, reason);
         self.context.add_message(refusal_context_message(request, reason));
     }
 

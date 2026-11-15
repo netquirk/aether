@@ -250,6 +250,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_shell_command_timeout_reaches_the_runtime_services() {
+        let received = Arc::new(Mutex::new(None::<RuntimeServices>));
+        let factory_received = Arc::clone(&received);
+
+        let builder = McpBuilder::new("/workspace")
+            .with_shell_command_timeout(Some(Duration::from_secs(7)))
+            .register_in_memory_server("test", move |_, services| {
+                *factory_received.lock().unwrap() = Some(services.clone());
+                Ok(FakeMcpServer::new().into())
+            })
+            .with_config(config(r#"{"servers":{"test":{"type":"in-memory","args":["--root","${WORKSPACE}/tools"]}}}"#));
+
+        let _spawned = builder.spawn().unwrap();
+        let services = received.lock().unwrap().clone().expect("factory received runtime services");
+        assert_eq!(services.shell_command_timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn an_unset_shell_command_timeout_leaves_the_runtime_services_unbounded() {
+        let received = Arc::new(Mutex::new(None::<RuntimeServices>));
+        let factory_received = Arc::clone(&received);
+
+        let builder = McpBuilder::new("/workspace")
+            .register_in_memory_server("test", move |_, services| {
+                *factory_received.lock().unwrap() = Some(services.clone());
+                Ok(FakeMcpServer::new().into())
+            })
+            .with_config(config(r#"{"servers":{"test":{"type":"in-memory","args":["--root","${WORKSPACE}/tools"]}}}"#));
+
+        let _spawned = builder.spawn().unwrap();
+        let services = received.lock().unwrap().clone().expect("factory received runtime services");
+        assert_eq!(services.shell_command_timeout, None);
+    }
+
+    #[tokio::test]
     async fn deferred_gateway_is_bound_before_in_memory_factories_run() {
         let received = Arc::new(Mutex::new(None::<RuntimeServices>));
         let factory_received = Arc::clone(&received);

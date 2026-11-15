@@ -1,5 +1,8 @@
 use crate::events::{AgentEvent, ContextEvent, ToolEvent, TurnEvent, task_created_result};
-use llm::{AssistantReply, ChatMessage, ContentBlock, Context, LlmModel, MessageId, ToolCallError, ToolCallResult};
+use llm::{
+    AssistantReply, ChatMessage, ContentBlock, Context, LlmModel, MessageId, ToolCallError, ToolCallRequest,
+    ToolCallResult,
+};
 
 #[derive(Debug, Default)]
 pub struct ContextRecorder {
@@ -14,6 +17,20 @@ impl ContextRecorder {
 
     pub fn reply(&self, message_id: MessageId, model: Option<LlmModel>, content: AssistantReply) -> ChatMessage {
         ChatMessage::assistant_reply(message_id, model, content, &self.tool_results)
+    }
+
+    /// Records a tool call the policy refused as a completed tool call.
+    ///
+    /// The refusal carries no tool result event - the tool never ran - but the
+    /// turn continues and the model sees why the call did not happen, which is
+    /// what the local policy did before the upgrade.
+    pub fn record_refusal(&mut self, request: &ToolCallRequest, reason: &str) {
+        self.tool_results.push(Ok(ToolCallResult {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            arguments: request.arguments.clone(),
+            result: format!("Tool call `{}` was refused by policy: {reason}", request.name),
+        }));
     }
 
     pub fn record(&mut self, context: &mut Context, event: &AgentEvent) {

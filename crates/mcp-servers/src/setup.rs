@@ -71,3 +71,32 @@ fn bash_environment(services: &RuntimeServices) -> BashEnvironment {
         None => environment,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether_core::core::AgentDeps;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn services(shell_command_timeout: Option<Duration>) -> RuntimeServices {
+        RuntimeServices {
+            root_dir: PathBuf::from("/workspace"),
+            agent_deps: AgentDeps::default(),
+            deferred_tools_socket: None,
+            shell_command_timeout,
+        }
+    }
+
+    #[test]
+    fn the_shell_command_timeout_bounds_the_bash_tool() {
+        let environment = bash_environment(&services(Some(Duration::from_secs(7))));
+        assert_eq!(environment.command_timeout(), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn an_unset_shell_command_timeout_leaves_the_bash_tool_unbounded() {
+        let environment = bash_environment(&services(None));
+        assert_eq!(environment.command_timeout(), None);
+    }
+}
