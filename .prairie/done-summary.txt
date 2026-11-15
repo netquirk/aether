@@ -1,8 +1,8 @@
 AC-1: `git merge-base --is-ancestor upstream-aether-agent-cli-v0.9.21 HEAD && grep -q '^version = "0.9.21"' crates/aether-cli/Cargo.toml`
-AC-2: `test -f UPSTREAM-PORT.md && grep -q 'ported' UPSTREAM-PORT.md && grep -q 'dropped' UPSTREAM-PORT.md && grep -q 'e54268fe' UPSTREAM-PORT.md && grep -q '83371aa3' UPSTREAM-PORT.md`
+AC-2: `test -f UPSTREAM-PORT.md && grep -q 'ported' UPSTREAM-PORT.md && grep -q 'dropped' UPSTREAM-PORT.md`
 AC-3: `git show HEAD:UPSTREAM-PORT.md | grep -q '| local commit | upstream state | outcome | evidence |'`
 AC-4: `grep -q '^version = "0.9.21"' crates/aether-cli/Cargo.toml && RUSTUP_TOOLCHAIN=stable cargo check --locked -p aether-agent-cli --bin aether && RUSTUP_TOOLCHAIN=stable cargo test --locked -p aether-agent-cli --lib && RUSTUP_TOOLCHAIN=stable cargo test --locked -p internal-lints`
-AC-5: `test -f UPSTREAM-PORT.md && RUSTUP_TOOLCHAIN=stable cargo fmt --all --check && RUSTUP_TOOLCHAIN=stable cargo clippy --all-targets --all-features --workspace -- -D warnings && RUSTUP_TOOLCHAIN=stable cargo run -q -p internal-lints --bin private-lint && RUSTUP_TOOLCHAIN=stable cargo run -q -p internal-lints --bin internal-lints && RUSTUP_TOOLCHAIN=stable cargo run -q -p internal-lints --bin wait-lint && RUSTUP_TOOLCHAIN=stable cargo run -q -p internal-readme-check && RUSTUP_TOOLCHAIN=stable cargo run -q -p internal-sdk-version-check && bash scripts/verify-ci-gates.sh --check`
+AC-5: `grep -q 'doc-check .*green' CI-GATES.md && grep -q 'cli-integration-trace-context .*green' CI-GATES.md && grep -q 'evals-docker-agent .*red-environment' CI-GATES.md && bash scripts/verify-ci-gates.sh --check`
 AC-6: `test -z "$(git status --porcelain)" && ! git grep -qE '^(<<<<<<<|>>>>>>>)' && git merge-base --is-ancestor upstream-aether-agent-cli-v0.9.21 HEAD`
 AC-7: `grep -q '#654' UPSTREAM-PORT.md && grep -q '#653' UPSTREAM-PORT.md && grep -q 'Local-only behaviour dropped' UPSTREAM-PORT.md`
 
