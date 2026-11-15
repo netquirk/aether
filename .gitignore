@@ -35,3 +35,7 @@ packages/website/*.log
 .prairie-conflicts/
 .prairie-conflicts-NOTE.md
 test-results/
+
+# The schemas the website reads are generated (`just gen-schema` and the eval schema
+# generator), so they are build output and stay out of the tree.
+packages/website/src/data/
