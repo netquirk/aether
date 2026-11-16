@@ -64,6 +64,9 @@ jobs:
       - name: Desktop style check
         run: just desktop-style-check
 
+      - name: Deploy contract check
+        run: just deploy-contract-check
+
   test:
     name: Test
     runs-on: ubuntu-latest

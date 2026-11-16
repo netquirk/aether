@@ -62,6 +62,7 @@ pnpm-fmt-check               green
 pnpm-sdk-typecheck           green
 pnpm-sdk-test                green
 desktop-style-check          green
+deploy-contract-check        green
 wasm-check                  green
 wasm-test                   green
 cli-integration-trace-context green
@@ -86,6 +87,7 @@ three recipes upstream added were run on the delivered tip `f3a4882c` on 2026-11
 | `pnpm-sdk-typecheck` | `pnpm --filter @aether-agent/sdk typecheck` | **green** (exit 0) |
 | `pnpm-sdk-test` | `pnpm --filter @aether-agent/sdk test` | **green** (exit 0, `AETHER_BIN` pointing at the release build of `-p aether-agent-cli`) |
 | `desktop-style-check` | `just desktop-style-check` (`scripts/desktop-style-check`) | **green** (exit 0; log: `test-results/ci-gates/desktop-style-check.log`) |
+| `deploy-contract-check` | `just deploy-contract-check` (`scripts/verify-deploy-contract.sh`) | **green** (exit 0; 14 checks passed and 0 failed; the round trip with the live runner binary `aa39f08f148bf807703d9ea328b4b3c14cbdd7cfdabbd8a6c5dac3e605803ec3` passed as well) |
 | `wasm-check` | `just wasm-check` (`cargo clippy -p aether-browser --target wasm32-unknown-unknown -- -D warnings`) | **green** (exit 0; log: `test-results/ci-gates/wasm-check.log`) |
 | `wasm-test` | `just wasm-test` (`cargo run -q -p aether-acp-utils --features testing,websocket --example fake_agent_server -- wasm-pack test --node packages/aether-browser`) | **green** (exit 0, 27 wasm tests passed and 0 failed; log: `test-results/ci-gates/wasm-test.log`) |
 | `cli-integration-trace-context` | `cargo test -p aether-agent-cli --test integration trace_context::headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled` | **green** (exit 0) |
@@ -101,6 +103,15 @@ the delivered tree: that inventory is no longer complete against upstream's `jus
 not supersede the individual outcomes recorded for those eight gates. Only the three new
 recipes and `pnpm fmt-check` (to establish the browser package's scope) were re-run for this
 addition; the other seven existing gates keep their earlier recorded results.
+
+`deploy-contract-check` is a fourth recipe, added with the deploy-contract change: it runs
+`scripts/verify-deploy-contract.sh`, which exercises `.prairie/deploy.sh`,
+`.prairie/deploy-state.sh` and `.prairie/rollback.sh` against a release store -- the round trip
+that preserves the binary a deploy replaces, names it by digest and restores it, plus the
+refusals for a target that is not in the store, an entry that does not match its digest and a
+deploy with no running binary to preserve. It ran on the delivered tree on 2026-11-16 and is
+green (14 checks passed, 0 failed); where the live runner binary is readable it also runs the
+round trip with that binary, so the store holds the artifact that is actually deployed.
 
 The docker gate is red for the same reason it was red when this record was first written: the
 sandbox has no container engine, so every case of the target fails before it touches the code

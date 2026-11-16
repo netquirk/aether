@@ -51,6 +51,10 @@ lint *PKGS:
 desktop-style-check:
     scripts/desktop-style-check
 
+# Check the deploy contract: the release store, the state script and the rollback
+deploy-contract-check:
+    scripts/verify-deploy-contract.sh
+
 # Verify checked SQL queries match the session-index schema
 sqlx-check:
     #!/usr/bin/env bash

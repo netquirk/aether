@@ -52,6 +52,7 @@ GATES=(
     "pnpm-sdk-typecheck|pnpm sdk:typecheck"
     "pnpm-sdk-test|pnpm sdk:test"
     "desktop-style-check|just desktop-style-check"
+    "deploy-contract-check|just deploy-contract-check"
     "wasm-check|just wasm-check"
     "wasm-test|just wasm-test"
 )
