@@ -116,7 +116,7 @@ ssh -N -L 8765:127.0.0.1:8765 user@agent-machine
 aether client
 ```
 
-Exit and run `aether client` again to reattach; accepted work continues on the server. See [remote usage and deployment boundaries](https://aether-agent.io/aether/running/remote/). The raw server is unauthenticated—use a tunnel, private network, or authenticating TLS proxy.
+Exit and run `aether client` again to reattach; accepted work continues on the server. See [remote usage and deployment boundaries](https://aether-agent.io/aether/running/remote/). The raw server is unauthenticated—use a tunnel, private network, or authenticating TLS proxy. A `--listen` address other than loopback is refused unless `--allow-unauthenticated-bind` acknowledges the risk; with the flag, the server says on stderr that anyone who can reach the address owns the session.
 
 ## Using Aether as a library
 

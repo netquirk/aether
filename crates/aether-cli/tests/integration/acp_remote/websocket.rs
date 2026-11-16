@@ -31,6 +31,7 @@ struct ServerCli {
 fn server_args_defaults_and_overrides() {
     let defaults = ServerCli::parse_from(["server"]).args;
     assert_eq!(defaults.listen, "127.0.0.1:8765".parse().unwrap());
+    assert!(!defaults.allow_unauthenticated_bind);
     assert_eq!(defaults.cwd, PathBuf::from("."));
     assert!(defaults.prompt.is_none());
     assert_eq!(defaults.output, OutputFormat::Text);
@@ -57,6 +58,7 @@ fn server_args_defaults_and_overrides() {
     ])
     .args;
     assert_eq!(args.listen, "0.0.0.0:9000".parse().unwrap());
+    assert!(!args.allow_unauthenticated_bind);
     assert_eq!(args.cwd, PathBuf::from("/workspace"));
     assert_eq!(args.acp.agent.as_deref(), Some("Build"));
     assert_eq!(args.acp.log_dir, Some(PathBuf::from("/logs")));
@@ -65,6 +67,7 @@ fn server_args_defaults_and_overrides() {
     assert_eq!(args.idle_after, Some(300));
     assert_eq!(args.on_idle.as_deref(), Some("echo idle"));
     assert_eq!(ServerCli::parse_from(["server", "--cwd", "/other"]).args.cwd, PathBuf::from("/other"));
+    assert!(ServerCli::parse_from(["server", "--allow-unauthenticated-bind"]).args.allow_unauthenticated_bind);
 }
 
 #[test]

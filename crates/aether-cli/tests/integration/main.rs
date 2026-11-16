@@ -17,6 +17,7 @@ mod headless;
 mod mcp_command;
 mod run_init;
 mod run_lock;
+mod server_bind;
 mod trace_context;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

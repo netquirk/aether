@@ -28,6 +28,10 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub listen: SocketAddr,
 
+    /// Acknowledge that the unauthenticated server may listen on an address other hosts can reach.
+    #[arg(long)]
+    pub allow_unauthenticated_bind: bool,
+
     /// Server workspace used to resolve settings and as the default session directory.
     #[arg(short = 'C', long, default_value = ".")]
     pub cwd: PathBuf,
@@ -68,9 +72,41 @@ pub enum ServerRunError {
     PromptStdin(#[source] io::Error),
     #[error("Failed to start the initial session: {0}")]
     InitialSession(#[source] agent_client_protocol::Error),
+    #[error(
+        "Refusing to bind {address}: the raw aether server is unauthenticated, so anyone who can reach it can drive the agent session. Listen on a loopback address, put the server behind an SSH tunnel, a private network or an authenticating TLS proxy, or pass --allow-unauthenticated-bind to acknowledge the risk"
+    )]
+    UnauthenticatedBind { address: SocketAddr },
+}
+
+/// Warning printed when the server listens on an address other hosts can reach.
+///
+/// The raw server carries no authentication of its own, so the operator has to
+/// put it behind a tunnel, a private network or an authenticating TLS proxy.
+pub fn unauthenticated_bind_warning(address: SocketAddr) -> String {
+    format!(
+        "WARNING: the aether server is unauthenticated and is listening on {address}.\n\
+         Anyone who can reach {address} can drive this agent session.\n\
+         Keep it behind an SSH tunnel, a private network or an authenticating TLS proxy."
+    )
+}
+
+/// Refuse a bind on an address other hosts can reach unless the operator acknowledged it.
+///
+/// A loopback listener is the default and needs no acknowledgement; every wider
+/// address exposes the unauthenticated session to the network.
+pub fn check_unauthenticated_bind(address: SocketAddr, acknowledged: bool) -> Result<(), ServerRunError> {
+    if address.ip().is_loopback() || acknowledged {
+        return Ok(());
+    }
+    Err(ServerRunError::UnauthenticatedBind { address })
 }
 
 pub async fn run_server(args: ServerArgs) -> Result<(), ServerRunError> {
+    check_unauthenticated_bind(args.listen, args.allow_unauthenticated_bind)?;
+    if !args.listen.ip().is_loopback() {
+        let warning = unauthenticated_bind_warning(args.listen);
+        eprintln!("{warning}");
+    }
     let cwd = canonicalize(&args.cwd)
         .and_then(|cwd| {
             if cwd.is_dir() {
