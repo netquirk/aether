@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Run (or check) the CI gates the TASK-2K-259 run could not run.
+# Run (or check) the CI gates recorded in CI-GATES.md.
 #
 # TASK-2K-259 changed only crates/internal-lints and AGENTS.md, but its sandbox had
 # neither `just`, `cargo nextest`, `cargo sqlx` nor a populated node_modules, so five
 # CI gates were never executed there. This script runs each of them and writes one
 # log per gate under test-results/ci-gates/, then prints a verdict table.
+#
+# The 0.9.21 upgrade later added desktop-style-check, wasm-check and wasm-test.
+# They are part of the delivered-tree record now, so --check requires their
+# verdicts too.
 #
 # The verdict of every gate is recorded in CI-GATES.md, in a machine-readable block
 # that `--check` reads back:
@@ -47,6 +51,9 @@ GATES=(
     "pnpm-fmt-check|pnpm fmt-check"
     "pnpm-sdk-typecheck|pnpm sdk:typecheck"
     "pnpm-sdk-test|pnpm sdk:test"
+    "desktop-style-check|just desktop-style-check"
+    "wasm-check|just wasm-check"
+    "wasm-test|just wasm-test"
 )
 
 # The environment-dependent targets of the task: the ones that need a container
@@ -197,6 +204,7 @@ echo "cargo-nextest: $(version_of cargo nextest --version)"
 echo "cargo-sqlx: $(version_of cargo sqlx --version)"
 echo "node: $(version_of node --version)"
 echo "pnpm: $(version_of pnpm --version)"
+echo "wasm-pack: $(version_of wasm-pack --version)"
 echo "container engine: $(docker info >/dev/null 2>&1 && echo available || echo 'not available')"
 echo
 

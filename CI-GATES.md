@@ -49,7 +49,7 @@ The project source has moved on since; see "The current source of the project" b
 
 ## The verdicts, machine-readable
 
-This is the block `scripts/verify-ci-gates.sh --check` reads. Every gate the task named has a
+This is the block `scripts/verify-ci-gates.sh --check` reads. Every gate in this record has a
 verdict: `green`, `red-pre-existing` - the gate fails, and it fails the same way at the base
 commit `e8d10e9f`, which the evidence in the sections below shows - or `red-environment` - the
 gate cannot run here because the sandbox lacks the tool it needs.
@@ -61,6 +61,9 @@ sqlx-check                   green
 pnpm-fmt-check               green
 pnpm-sdk-typecheck           green
 pnpm-sdk-test                green
+desktop-style-check          green
+wasm-check                  green
+wasm-test                   green
 cli-integration-trace-context green
 evals-docker-agent           red-environment
 <!-- ci-gates:end -->
@@ -69,19 +72,35 @@ evals-docker-agent           red-environment
 
 The tree this block describes is the tree of the upstream upgrade: upstream `aether main`
 (`ff9b9dac`, which holds the tag `aether-agent-cli-v0.9.21`) merged into the local line, plus
-the ports of the local-only patches. The gates were run on it on 2026-11-13 with `rustc 1.100.0`,
-`just 1.59.0`, `sqlx-cli 0.9.0`, `node v24.21.0` and `pnpm 12.16.1`.
+the ports of the local-only patches. The first eight gates were run on it on 2026-11-13 with
+`rustc 1.100.0`, `just 1.59.0`, `sqlx-cli 0.9.0`, `node v24.21.0` and `pnpm 12.16.1`. The
+three recipes upstream added were run on the delivered tip `f3a4882c` on 2026-11-16 with
+`rustc 1.99.1`, `just 1.59.0`, `wasm-pack 0.13.1`, `node v24.21.0` and `pnpm 12.16.1`.
 
 | Gate | Command | Verdict |
 |------|---------|---------|
 | `doc-check` | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --all-features --workspace --examples` | **green** (exit 0) |
 | `doc-test` | `cargo test --doc --workspace --exclude internal-evals` | **green** (exit 0) |
 | `sqlx-check` | `cargo sqlx migrate run` + `cargo sqlx prepare --check -- --features analytics` | **green** (exit 0) |
-| `pnpm-fmt-check` | `prettier --check "packages/**/*.{ts,mts,cts,mjs,cjs,js,jsx,json,astro,css}"` | **green** (exit 0) |
+| `pnpm-fmt-check` | `prettier --check "packages/**/*.{ts,mts,cts,mjs,cjs,js,jsx,json,astro,css}"` | **green** (exit 0; `packages/aether-browser` **is in scope**: the `packages/**/*` Prettier glob matches its `package.json`, `scripts/generate-types.mjs`, `tests/usage.ts` and `tsconfig.json`, and `pnpm-workspace.yaml`'s `packages/*` list includes it as `@aether-agent/browser`; log: `test-results/ci-gates/pnpm-fmt-check.log`) |
 | `pnpm-sdk-typecheck` | `pnpm --filter @aether-agent/sdk typecheck` | **green** (exit 0) |
 | `pnpm-sdk-test` | `pnpm --filter @aether-agent/sdk test` | **green** (exit 0, `AETHER_BIN` pointing at the release build of `-p aether-agent-cli`) |
+| `desktop-style-check` | `just desktop-style-check` (`scripts/desktop-style-check`) | **green** (exit 0; log: `test-results/ci-gates/desktop-style-check.log`) |
+| `wasm-check` | `just wasm-check` (`cargo clippy -p aether-browser --target wasm32-unknown-unknown -- -D warnings`) | **green** (exit 0; log: `test-results/ci-gates/wasm-check.log`) |
+| `wasm-test` | `just wasm-test` (`cargo run -q -p aether-acp-utils --features testing,websocket --example fake_agent_server -- wasm-pack test --node packages/aether-browser`) | **green** (exit 0, 27 wasm tests passed and 0 failed; log: `test-results/ci-gates/wasm-test.log`) |
 | `cli-integration-trace-context` | `cargo test -p aether-agent-cli --test integration trace_context::headless_rejects_an_invalid_tracestate_when_telemetry_is_enabled` | **green** (exit 0) |
 | `evals-docker-agent` | `cargo test -p aether-evals --test docker_agent_tests` | **red - environment** (exit 101) |
+
+The upstream `justfile` added `desktop-style-check`, `wasm-check` and `wasm-test`, and
+`.github/workflows/ci.yml` runs the first in the lint job and the latter two together in the
+wasm job. All three ran on the delivered tree and are green; none is not-run. The wasm tests
+used the Node target and the fake ACP agent, so neither a browser nor Deno was needed.
+
+This addition supersedes the completeness of `TASK-2K-503`'s earlier eight-gate inventory for
+the delivered tree: that inventory is no longer complete against upstream's `justfile`. It does
+not supersede the individual outcomes recorded for those eight gates. Only the three new
+recipes and `pnpm fmt-check` (to establish the browser package's scope) were re-run for this
+addition; the other seven existing gates keep their earlier recorded results.
 
 The docker gate is red for the same reason it was red when this record was first written: the
 sandbox has no container engine, so every case of the target fails before it touches the code
@@ -346,7 +365,7 @@ read-only):
 | `cargo test --locked -p aether-llm opencode` | 3 passed, 0 failed |
 | `cargo fmt --all --check` | exit 0 |
 | `cargo run -q -p internal-lints --bin private-lint` / `internal-lints` / `wait-lint`, `cargo run -q -p internal-readme-check`, `cargo run -q -p internal-sdk-version-check` | all exit 0 |
-| `bash scripts/verify-ci-gates.sh --check` | exit 0 (the eight verdicts above agree with the script's gate list) |
+| `bash scripts/verify-ci-gates.sh --check` | exit 0 (the recorded verdicts agree with the script's gate list) |
 
 The `doc-check`, `doc-test`, `sqlx-check` and `pnpm-*` gates were not re-run here; the verdicts
 above stand for the tree they were recorded on, and `TASK-33-6` re-establishes them on the final
